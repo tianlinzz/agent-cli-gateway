@@ -1,0 +1,9 @@
+{
+  "hasCompletedOnboarding": true,
+  "numStartups": 1,
+  "installMethod": "npm",
+  "autoUpdates": false,
+  "autoUpdatesProtectedForNative": true,
+  "firstStartTime": "2026-07-02T00:00:00.000Z",
+  "migrationVersion": 13
+}
