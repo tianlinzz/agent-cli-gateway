@@ -450,6 +450,17 @@ func (s *SessionStore) ListAgents() []string {
 	return names
 }
 
+// Agent returns the singleton agent instance registered under name, plus an
+// ok flag. Used by management handlers to reach agent capability interfaces
+// (core.HistoryProvider, core.SessionDeleter, etc.) without going through a
+// live ManagedSession.
+func (s *SessionStore) Agent(name string) (core.Agent, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	a, ok := s.agents[name]
+	return a, ok
+}
+
 // resolveWorkDir anchors the client-provided workDir under the gateway process's
 // working directory (os.Getwd — /workspace in the container).
 //

@@ -26,6 +26,7 @@ func NewServer(cfg config.GatewayConfig, store *SessionStore) *Server {
 
 	mux := http.NewServeMux()
 	handlers := &Handlers{Store: store}
+	admin := &AdminHandlers{Store: store}
 
 	// Register routes using Go 1.22+ pattern routing.
 	identityMw := withUserIdentity(cfg.UserIDHeader, cfg.IdentityMode)
@@ -40,6 +41,31 @@ func NewServer(cfg config.GatewayConfig, store *SessionStore) *Server {
 		chain(http.HandlerFunc(handlers.HandleAbort), s.withAuth, identityMw))
 	mux.Handle("GET /config/providers",
 		chain(http.HandlerFunc(handlers.HandleConfigProviders), s.withAuth, identityMw))
+
+	// Management endpoints (PR1: session browsing/history/delete/resume).
+	// Same auth + identity chain as live-session routes.
+	mux.Handle("GET /sessions",
+		chain(http.HandlerFunc(admin.HandleListSessions), s.withAuth, identityMw))
+	mux.Handle("GET /sessions/{agent}/{id}/history",
+		chain(http.HandlerFunc(admin.HandleSessionHistory), s.withAuth, identityMw))
+	mux.Handle("DELETE /sessions/{agent}/{id}",
+		chain(http.HandlerFunc(admin.HandleDeleteSession), s.withAuth, identityMw))
+	mux.Handle("GET /sessions/{agent}/{id}/resume",
+		chain(http.HandlerFunc(admin.HandleSessionResume), s.withAuth, identityMw))
+
+	// Management endpoints (PR2: provider live config).
+	mux.Handle("GET /config/agents/{agent}/provider",
+		chain(http.HandlerFunc(admin.HandleReadLiveProvider), s.withAuth, identityMw))
+	mux.Handle("PUT /config/agents/{agent}/provider",
+		chain(http.HandlerFunc(admin.HandleWriteLiveProvider), s.withAuth, identityMw))
+
+	// Management endpoints (PR3: MCP servers).
+	mux.Handle("GET /config/agents/{agent}/mcp",
+		chain(http.HandlerFunc(admin.HandleListMcpServers), s.withAuth, identityMw))
+	mux.Handle("PUT /config/agents/{agent}/mcp/{name}",
+		chain(http.HandlerFunc(admin.HandleSaveMcpServer), s.withAuth, identityMw))
+	mux.Handle("DELETE /config/agents/{agent}/mcp/{name}",
+		chain(http.HandlerFunc(admin.HandleDeleteMcpServer), s.withAuth, identityMw))
 
 	s.server = &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.Port),

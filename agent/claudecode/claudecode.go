@@ -609,6 +609,16 @@ func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
 	return os.Remove(path)
 }
 
+// ResumeCommand returns the native Claude Code resume command for a session ID.
+// Implements core.ResumeCommander. The gateway never shells out to this — it
+// is used only for display/reference in management endpoints.
+func (a *Agent) ResumeCommand(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	return "claude --resume " + sessionID
+}
+
 // extractStringContent attempts to extract a plain string from a json.RawMessage.
 // Returns empty string if the raw message is not a JSON string.
 func extractStringContent(raw json.RawMessage) string {
