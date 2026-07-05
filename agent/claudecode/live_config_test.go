@@ -12,19 +12,40 @@ import (
 
 // withTempHome runs fn with HOME (and therefore ~/.claude) pointed at a fresh
 // temp dir. The original HOME is restored afterwards.
+// withTempHome runs fn with HOME (Unix) and USERPROFILE (Windows) both pointed
+// at a fresh temp dir, so os.UserHomeDir() resolves under it on every platform.
+// The original values are restored afterwards. This matters because the tests
+// must NOT read or write the developer's real ~/.claude/settings.json.
 func withTempHome(t *testing.T, fn func(homeDir string)) {
 	t.Helper()
 	dir := t.TempDir()
-	prev, hadPrev := os.LookupEnv("HOME")
-	os.Setenv("HOME", dir)
-	t.Cleanup(func() {
-		if hadPrev {
-			os.Setenv("HOME", prev)
-		} else {
-			os.Unsetenv("HOME")
-		}
-	})
+	t.Cleanup(setHomeEnvForTest(t, dir))
 	fn(dir)
+}
+
+// setHomeEnvForTest points both HOME and USERPROFILE at dir and returns a
+// cleanup that restores the prior values. Setting both is required because
+// os.UserHomeDir() reads USERPROFILE on Windows but HOME on Unix.
+func setHomeEnvForTest(t *testing.T, dir string) func() {
+	t.Helper()
+	var cleanups []func()
+	for _, key := range []string{"HOME", "USERPROFILE"} {
+		prev, had := os.LookupEnv(key)
+		os.Setenv(key, dir)
+		k, p, h := key, prev, had
+		cleanups = append(cleanups, func() {
+			if h {
+				os.Setenv(k, p)
+			} else {
+				os.Unsetenv(k)
+			}
+		})
+	}
+	return func() {
+		for _, c := range cleanups {
+			c()
+		}
+	}
 }
 
 // writeSettings writes a JSON object to ~/.claude/settings.json inside homeDir.

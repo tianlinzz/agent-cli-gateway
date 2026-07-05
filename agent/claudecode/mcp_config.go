@@ -51,14 +51,19 @@ func claudeMcpPath() (string, error) {
 
 // commandStem extracts the bare command name (no path, no .cmd/.exe/.bat
 // suffix) from a command string, for matching against windowsWrapCommands.
+// Suffix matching is case-insensitive because Windows filesystems are —
+// "yarn.CMD", "npx.Exe" etc. are all the same binary.
 func commandStem(cmd string) string {
 	if cmd == "" {
 		return ""
 	}
 	base := filepath.Base(cmd)
-	// Strip Windows executable extensions.
-	for _, suf := range []string{".cmd", ".exe", ".bat", ".COM", ".EXE", ".BAT"} {
-		base = strings.TrimSuffix(base, suf)
+	// Strip Windows executable extensions, case-insensitively.
+	for _, suf := range []string{".cmd", ".exe", ".bat", ".com"} {
+		if len(base) > len(suf) && strings.EqualFold(base[len(base)-len(suf):], suf) {
+			base = base[:len(base)-len(suf)]
+			break
+		}
 	}
 	return strings.ToLower(base)
 }
