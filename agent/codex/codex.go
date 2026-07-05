@@ -494,6 +494,16 @@ func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
 	return os.Remove(path)
 }
 
+// ResumeCommand returns the native Codex resume command for a session ID.
+// Implements core.ResumeCommander. The gateway never shells out to this — it
+// is used only for display/reference in management endpoints.
+func (a *Agent) ResumeCommand(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	return "codex resume " + sessionID
+}
+
 func (a *Agent) Stop() error { return nil }
 
 // SetMode changes the approval mode for future sessions.

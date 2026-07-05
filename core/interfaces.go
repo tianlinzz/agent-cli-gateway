@@ -556,6 +556,68 @@ type SessionDeleter interface {
 	DeleteSession(ctx context.Context, sessionID string) error
 }
 
+// LiveProviderConfig describes the active provider written to an agent's
+// underlying CLI live config files (e.g. ~/.claude/settings.json,
+// ~/.codex/auth.json + config.toml). Only the "basic triple" is managed here
+// (apiKey / baseURL / model); advanced per-agent fields (Codex bearer token,
+// model catalog, etc.) are intentionally out of scope for the first cut.
+type LiveProviderConfig struct {
+	APIKey  string            `json:"apiKey,omitempty"`
+	BaseURL string            `json:"baseUrl,omitempty"`
+	Model   string            `json:"model,omitempty"`
+	Env     map[string]string `json:"env,omitempty"` // passthrough env (e.g. CLAUDE_CODE_USE_BEDROCK=1)
+}
+
+// LiveConfigProvider is an optional interface for agents whose backing CLI
+// stores its active provider in writable live config files. The management API
+// uses this to read/modify the on-disk config directly (cc-switch style) —
+// the gateway never injects these into the running subprocess; the CLI reads
+// them itself on the next session start.
+type LiveConfigProvider interface {
+	// ReadLiveProvider reads the currently-active provider from the CLI's
+	// live config files. Returns a zero value (no error) when nothing is
+	// configured yet.
+	ReadLiveProvider(ctx context.Context) (LiveProviderConfig, error)
+	// WriteLiveProvider atomically writes the provider to the CLI's live
+	// config files, preserving all other fields. Implementations must be
+	// safe to call concurrently with session creation.
+	WriteLiveProvider(ctx context.Context, cfg LiveProviderConfig) error
+}
+
+// McpServerConfig describes one MCP server entry in the CLI's live config.
+// stdio servers use Command/Args/Env; remote servers (SSE/HTTP) use URL.
+type McpServerConfig struct {
+	Type    string            `json:"type,omitempty"`    // "stdio" | "sse" | "http"; empty defaults to stdio
+	Command string            `json:"command,omitempty"` // stdio: required
+	Args    []string          `json:"args,omitempty"`    // stdio: optional
+	Env     map[string]string `json:"env,omitempty"`     // stdio: optional
+	URL     string            `json:"url,omitempty"`     // sse/http: required
+}
+
+// McpConfigManager is an optional interface for agents whose backing CLI
+// persists MCP server definitions to a writable live config file (e.g.
+// ~/.claude.json for Claude Code, ~/.codex/config.toml for Codex). The
+// management API edits these files in place; the gateway does not interpret
+// MCP config itself.
+type McpConfigManager interface {
+	// ListMcpServers returns all configured MCP servers keyed by name.
+	ListMcpServers(ctx context.Context) (map[string]McpServerConfig, error)
+	// SaveMcpServer upserts a single MCP server by name, leaving all other
+	// entries and unrelated config fields intact.
+	SaveMcpServer(ctx context.Context, name string, cfg McpServerConfig) error
+	// DeleteMcpServer removes a single MCP server by name. Missing names are
+	// treated as success (idempotent).
+	DeleteMcpServer(ctx context.Context, name string) error
+}
+
+// ResumeCommander returns the native CLI resume command for a given session ID,
+// used for display/reference in management UIs (e.g. "claude --resume <id>").
+// The gateway itself never shells out to this — resumption is driven by
+// StartSession(sessionID). Returning "" means the agent has no resume command.
+type ResumeCommander interface {
+	ResumeCommand(sessionID string) string
+}
+
 type SessionTitleProvider interface {
 	GetSessionTitle(sessionID string) string
 }

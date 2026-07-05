@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -589,6 +590,14 @@ func TestWriteTempAppendPromptFile_UniquePerCall(t *testing.T) {
 // access path the spawned agent uses when it calls os.Open on the
 // file path passed via --append-system-prompt-file.
 func TestWriteTempAppendPromptFile_ReadableByOtherUser(t *testing.T) {
+	// The regression this guards (run_as_user target user getting EACCES on a
+	// 0600 file) is a Unix permission-model concern. Windows has neither
+	// run_as_user (core/runas_windows.go makes IsolationMode() always false)
+	// nor Unix mode bits — NTFS files always report 0666 via os.Stat — so the
+	// assertion cannot hold and the scenario is moot there.
+	if runtime.GOOS == "windows" {
+		t.Skip("run_as_user cross-user file permission is a Unix-only concern")
+	}
 	dir := t.TempDir()
 	path, err := writeTempAppendPromptFile(dir, "session X")
 	if err != nil {

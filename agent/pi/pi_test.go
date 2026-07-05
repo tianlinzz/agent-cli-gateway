@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -329,8 +330,11 @@ func TestSettingsPath(t *testing.T) {
 	}()
 
 	t.Setenv("PI_CODING_AGENT_DIR", "/custom")
-	if p := settingsPath(); p != "/custom/settings.json" {
-		t.Errorf("settingsPath() = %q, want /custom/settings.json", p)
+	// Use filepath.Join so the expected path uses the host's separator
+	// ("/custom/settings.json" on Unix, "\custom\settings.json" on Windows).
+	want := filepath.Join("/custom", "settings.json")
+	if p := settingsPath(); p != want {
+		t.Errorf("settingsPath() = %q, want %q", p, want)
 	}
 }
 
@@ -345,6 +349,13 @@ func TestAgent_SetSessionEnv(t *testing.T) {
 }
 
 func TestAgent_ListSessions(t *testing.T) {
+	// Point HOME/USERPROFILE at a temp dir so piSessionDir resolves under it
+	// instead of the developer's real ~/.pi. The temp dir has no .pi/agent/
+	// sessions subdir, so ListSessions returns (nil, nil).
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
 	a := &Agent{}
 	sessions, err := a.ListSessions(context.Background())
 	if err != nil {
@@ -1351,6 +1362,13 @@ func TestHandleEvent_FullConversation(t *testing.T) {
 // ── readLoop with real process ───────────────────────────────
 
 func TestPiSession_ReadLoopWithEcho(t *testing.T) {
+	// This test spawns `sh -c '...'` with cmd.Dir = "/tmp" to exercise readLoop
+	// against a real subprocess emitting JSON lines. Both sh and /tmp are Unix
+	// assumptions — there is no equivalent on Windows, so skip there. The
+	// readLoop logic itself is platform-neutral and covered by other tests.
+	if runtime.GOOS == "windows" {
+		t.Skip("sh-based subprocess echo test is Unix-only")
+	}
 	// Use sh -c to simulate pi JSON output on stdout.
 	sessionEvent := map[string]any{"type": "session", "id": "echo-sess"}
 	textEvent := map[string]any{

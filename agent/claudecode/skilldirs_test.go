@@ -13,8 +13,10 @@ func TestSkillDirs_UsesClaudeConfigDirAndProjectParents(t *testing.T) {
 	repo := filepath.Join(tmp, "repo")
 	workDir := filepath.Join(repo, "nested", "pkg")
 
-	t.Setenv("HOME", home)
 	t.Setenv("CLAUDE_CONFIG_DIR", configHome)
+	// Set HOME (Unix) and USERPROFILE (Windows) so os.UserHomeDir() resolves
+	// under the temp dir on every platform.
+	defer setHomeEnvForTest(t, home)()
 
 	for _, dir := range []string{
 		filepath.Join(repo, "nested", "pkg"),
@@ -55,8 +57,8 @@ func TestSkillDirs_FallsBackToHomeClaudeDir(t *testing.T) {
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		t.Fatalf("mkdir workdir: %v", err)
 	}
-	t.Setenv("HOME", home)
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	defer setHomeEnvForTest(t, home)()
 
 	a := &Agent{workDir: workDir}
 	got := a.SkillDirs()

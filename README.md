@@ -27,6 +27,28 @@ go build -o bin/acg ./cmd/gateway/
 
 All endpoints except `/health` require `Authorization: Bearer <token>`.
 
+### Management API
+
+A second surface exposes read/write access to the underlying CLIs' config and
+on-disk sessions — manage providers, MCP servers, and session history without
+redeploying or hand-editing files. Mirrors [cc-switch](https://github.com/farion1231/cc-switch)
+over HTTP.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/sessions?agent={name}` | List an agent's sessions (transcript scan) |
+| GET | `/sessions/{agent}/{id}/history?limit=N` | Read a session's user/assistant turns |
+| DELETE | `/sessions/{agent}/{id}` | Delete a session transcript file |
+| GET | `/sessions/{agent}/{id}/resume` | Native resume command + gateway hint |
+| GET | `/config/agents/{agent}/provider` | Read active provider (live config) |
+| PUT | `/config/agents/{agent}/provider` | Write active provider (atomic, file-preserving) |
+| GET | `/config/agents/{agent}/mcp` | List MCP servers |
+| PUT | `/config/agents/{agent}/mcp/{name}` | Upsert an MCP server |
+| DELETE | `/config/agents/{agent}/mcp/{name}` | Delete an MCP server |
+
+Full request/response shapes, field reference, and per-agent capability matrix:
+[`docs/management-api.md`](docs/management-api.md).
+
 ### SSE Event Types
 
 Each `data:` line is a JSON object:

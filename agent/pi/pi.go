@@ -455,8 +455,15 @@ func findSessionFile(sessDir, sessionID string) string {
 }
 
 // piSessionDir returns the pi session directory for the given workDir.
-// Pi encodes the absolute path as: replace "/" with "-", wrap with "--".
-// e.g. /home/user/project → --home-user-project--
+// piSessionDir encodes the absolute workDir into a single directory name the
+// way the real `pi` CLI does: replace each path separator with "-", strip the
+// leading separator, and wrap with "--".
+//
+//   /home/user/project  →  --home-user-project--        (Unix)
+//   C:\Users\me\project →  --C-Users-me-project--       (Windows)
+//
+// On Windows the volume label's trailing ":" is also turned into "-" so the
+// resulting name is a legal Windows filename (":" is forbidden in paths).
 func piSessionDir(workDir string) string {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -466,7 +473,14 @@ func piSessionDir(workDir string) string {
 	if err != nil {
 		return ""
 	}
-	encoded := "--" + strings.ReplaceAll(strings.TrimPrefix(absDir, "/"), "/", "-") + "--"
+	// Normalise to the host separator, then strip one leading separator and
+	// replace every remaining separator with "-". On Windows absDir looks like
+	// "C:\path\to\dir": the leading "C:" keeps its colon, which we also map to
+	// "-" below so the encoded name is filesystem-safe on Windows.
+	trimmed := strings.TrimPrefix(absDir, string(filepath.Separator))
+	encoded := "--" + strings.ReplaceAll(trimmed, string(filepath.Separator), "-") + "--"
+	// Windows: replace ":" (volume label) and any stray "/" so the name is legal.
+	encoded = strings.NewReplacer(":", "-", "/", "-").Replace(encoded)
 	return filepath.Join(homeDir, ".pi", "agent", "sessions", encoded)
 }
 
