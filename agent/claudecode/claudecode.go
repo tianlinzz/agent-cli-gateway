@@ -543,47 +543,157 @@ func (a *Agent) ListSessions(ctx context.Context) ([]core.AgentSessionInfo, erro
 		return nil, fmt.Errorf("claudecode: resolve work_dir: %w", err)
 	}
 
+	// If the agent has a bound workDir that resolves to a real project dir,
+	// return only that project's sessions (preserves single-workspace behaviour).
+	if projectDir := findProjectDir(homeDir, absWorkDir); projectDir != "" {
+		return listSessionsInProject(projectDir), nil
+	}
+
+	// No bound workDir matches an on-disk project (the gateway-singleton case):
+	// scan every project directory under ~/.claude/projects and aggregate.
+	return listAllSessions(homeDir), nil
+}
+
+// ListSessionsInWorkDir implements core.SessionListerByWorkDir. It lists
+// sessions whose cwd matches workDir without mutating the agent singleton's
+// configured workDir. Used by the management API's ?workDir= filter.
+func (a *Agent) ListSessionsInWorkDir(_ context.Context, workDir string) ([]core.AgentSessionInfo, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("claudecode: cannot determine home dir: %w", err)
+	}
+	absWorkDir, err := filepath.Abs(workDir)
+	if err != nil {
+		return nil, fmt.Errorf("claudecode: resolve work_dir: %w", err)
+	}
 	projectDir := findProjectDir(homeDir, absWorkDir)
 	if projectDir == "" {
 		return nil, nil
 	}
+	return listSessionsInProject(projectDir), nil
+}
 
-	entries, err := os.ReadDir(projectDir)
+// ListWorkspaces implements core.WorkspaceLister. It scans ~/.claude/projects/*
+// and aggregates distinct cwds (read from each session file's first cwd field)
+// into workspace summaries.
+func (a *Agent) ListWorkspaces(_ context.Context) ([]core.AgentWorkspaceInfo, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("claudecode: cannot determine home dir: %w", err)
+	}
+	projectsBase := filepath.Join(homeDir, ".claude", "projects")
+	projectDirs, err := os.ReadDir(projectsBase)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("claudecode: read project dir: %w", err)
+		return nil, fmt.Errorf("claudecode: read projects dir: %w", err)
 	}
 
+	type ws struct {
+		count      int
+		lastActive time.Time
+	}
+	byPath := make(map[string]*ws)
+	for _, pd := range projectDirs {
+		if !pd.IsDir() {
+			continue
+		}
+		projectDir := filepath.Join(projectsBase, pd.Name())
+		entries, err := os.ReadDir(projectDir)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if entry.IsDir() || !strings.HasSuffix(name, ".jsonl") {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			_, _, cwd := scanSessionMeta(filepath.Join(projectDir, name))
+			if cwd == "" {
+				continue
+			}
+			w := byPath[cwd]
+			if w == nil {
+				w = &ws{}
+				byPath[cwd] = w
+			}
+			w.count++
+			if info.ModTime().After(w.lastActive) {
+				w.lastActive = info.ModTime()
+			}
+		}
+	}
+
+	out := make([]core.AgentWorkspaceInfo, 0, len(byPath))
+	for path, w := range byPath {
+		out = append(out, core.AgentWorkspaceInfo{
+			Path:         path,
+			SessionCount: w.count,
+			LastActive:   w.lastActive,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].LastActive.After(out[j].LastActive)
+	})
+	return out, nil
+}
+
+// listSessionsInProject reads .jsonl session files from a single project dir.
+func listSessionsInProject(projectDir string) []core.AgentSessionInfo {
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		return nil
+	}
 	var sessions []core.AgentSessionInfo
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasSuffix(name, ".jsonl") {
 			continue
 		}
-
 		sessionID := strings.TrimSuffix(name, ".jsonl")
 		info, err := entry.Info()
 		if err != nil {
 			continue
 		}
-
-		summary, msgCount := scanSessionMeta(filepath.Join(projectDir, name))
-
+		summary, msgCount, cwd := scanSessionMeta(filepath.Join(projectDir, name))
 		sessions = append(sessions, core.AgentSessionInfo{
 			ID:           sessionID,
 			Summary:      summary,
 			MessageCount: msgCount,
 			ModifiedAt:   info.ModTime(),
+			Cwd:          cwd,
 		})
 	}
-
 	sort.Slice(sessions, func(i, j int) bool {
 		return sessions[i].ModifiedAt.After(sessions[j].ModifiedAt)
 	})
+	return sessions
+}
 
-	return sessions, nil
+// listAllSessions scans every project dir under ~/.claude/projects and
+// aggregates all sessions. Used when the agent singleton has no bound workDir.
+func listAllSessions(homeDir string) []core.AgentSessionInfo {
+	projectsBase := filepath.Join(homeDir, ".claude", "projects")
+	projectDirs, err := os.ReadDir(projectsBase)
+	if err != nil {
+		return nil
+	}
+	var sessions []core.AgentSessionInfo
+	for _, pd := range projectDirs {
+		if !pd.IsDir() {
+			continue
+		}
+		sessions = append(sessions, listSessionsInProject(filepath.Join(projectsBase, pd.Name()))...)
+	}
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].ModifiedAt.After(sessions[j].ModifiedAt)
+	})
+	return sessions
 }
 
 func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
@@ -594,16 +704,9 @@ func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
 	a.mu.RLock()
 	workDir := a.workDir
 	a.mu.RUnlock()
-	absWorkDir, err := filepath.Abs(workDir)
-	if err != nil {
-		return fmt.Errorf("claudecode: resolve work_dir: %w", err)
-	}
-	projectDir := findProjectDir(homeDir, absWorkDir)
-	if projectDir == "" {
-		return fmt.Errorf("session not found")
-	}
-	path := filepath.Join(projectDir, sessionID+".jsonl")
-	if _, err := os.Stat(path); os.IsNotExist(err) {
+
+	path := findSessionFileAcrossProjects(homeDir, workDir, sessionID)
+	if path == "" {
 		return fmt.Errorf("session file not found: %s", sessionID)
 	}
 	return os.Remove(path)
@@ -632,18 +735,15 @@ func extractStringContent(raw json.RawMessage) string {
 	return s
 }
 
-func scanSessionMeta(path string) (string, int) {
+func scanSessionMeta(path string) (summary string, count int, cwd string) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", 0
+		return "", 0, ""
 	}
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 256*1024), 256*1024)
-
-	var summary string
-	var count int
 
 	for scanner.Scan() {
 		var entry struct {
@@ -651,9 +751,13 @@ func scanSessionMeta(path string) (string, int) {
 			Message struct {
 				Content json.RawMessage `json:"content"`
 			} `json:"message"`
+			Cwd string `json:"cwd"`
 		}
 		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
 			continue
+		}
+		if entry.Cwd != "" && cwd == "" {
+			cwd = entry.Cwd
 		}
 		if entry.Type == "user" || entry.Type == "assistant" {
 			count++
@@ -669,13 +773,50 @@ func scanSessionMeta(path string) (string, int) {
 	if utf8.RuneCountInString(summary) > 40 {
 		summary = string([]rune(summary)[:40]) + "..."
 	}
-	return summary, count
+	return summary, count, cwd
 }
 
 var xmlTagRe = regexp.MustCompile(`<[^>]+>`)
 
 func stripXMLTags(s string) string {
 	return xmlTagRe.ReplaceAllString(s, "")
+}
+
+// findSessionFileAcrossProjects locates the transcript file for sessionID by
+// scanning every project dir under ~/.claude/projects. It tries the agent's
+// bound workDir first (fast path when a project dir matches), then falls back
+// to a full scan so history/delete work for any session regardless of which
+// workspace it belongs to — the gateway singleton has no bound workDir.
+func findSessionFileAcrossProjects(homeDir, workDir, sessionID string) string {
+	// Fast path: bound workDir resolves to a real project dir.
+	if workDir != "" {
+		absWorkDir, err := filepath.Abs(workDir)
+		if err == nil {
+			if projectDir := findProjectDir(homeDir, absWorkDir); projectDir != "" {
+				p := filepath.Join(projectDir, sessionID+".jsonl")
+				if _, err := os.Stat(p); err == nil {
+					return p
+				}
+			}
+		}
+	}
+
+	// Fallback: scan all project dirs.
+	projectsBase := filepath.Join(homeDir, ".claude", "projects")
+	projectDirs, err := os.ReadDir(projectsBase)
+	if err != nil {
+		return ""
+	}
+	for _, pd := range projectDirs {
+		if !pd.IsDir() {
+			continue
+		}
+		p := filepath.Join(projectsBase, pd.Name(), sessionID+".jsonl")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
 }
 
 // GetSessionHistory reads the Claude Code JSONL transcript and returns user/assistant messages.
@@ -687,13 +828,11 @@ func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int
 	a.mu.RLock()
 	workDir := a.workDir
 	a.mu.RUnlock()
-	absWorkDir, _ := filepath.Abs(workDir)
-	projectDir := findProjectDir(homeDir, absWorkDir)
-	if projectDir == "" {
-		return nil, fmt.Errorf("claudecode: project dir not found")
-	}
 
-	path := filepath.Join(projectDir, sessionID+".jsonl")
+	path := findSessionFileAcrossProjects(homeDir, workDir, sessionID)
+	if path == "" {
+		return nil, fmt.Errorf("claudecode: session file not found: %s", sessionID)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("claudecode: open session file: %w", err)

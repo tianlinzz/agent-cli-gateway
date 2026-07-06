@@ -104,12 +104,27 @@ type SessionListItem struct {
 	MessageCount int    `json:"messageCount,omitempty"`
 	ModifiedAt   int64  `json:"modifiedAt,omitempty"` // Unix seconds
 	GitBranch    string `json:"gitBranch,omitempty"`
+	WorkDir      string `json:"workDir,omitempty"` // absolute cwd the session ran in
 }
 
 // SessionListResponse is the body of GET /sessions?agent={name}.
 type SessionListResponse struct {
 	Agent    string            `json:"agent"`
 	Sessions []SessionListItem `json:"sessions"`
+}
+
+// WorkspaceListItem is one entry in the GET /workspaces response.
+type WorkspaceListItem struct {
+	Agent        string `json:"agent"`
+	Path         string `json:"path"`
+	SessionCount int    `json:"sessionCount"`
+	LastActive   int64  `json:"lastActive,omitempty"` // Unix seconds
+}
+
+// WorkspaceListResponse is the body of GET /workspaces?agent={name}.
+type WorkspaceListResponse struct {
+	Agent      string              `json:"agent"`
+	Workspaces []WorkspaceListItem `json:"workspaces"`
 }
 
 // SessionHistoryResponse is the body of GET /sessions/{agent}/{id}/history.

@@ -44,6 +44,12 @@ type adminStubAgent struct {
 		cfg  core.McpServerConfig
 	}
 	mcpDeleteCalls []string
+
+	// WorkspaceLister / SessionListerByWorkDir state
+	workspaces         []core.AgentWorkspaceInfo
+	workspaceListErr   error
+	sessionsByWorkDir  map[string][]core.AgentSessionInfo // workDir → sessions
+	listInWorkDirCalls []string
 }
 
 func newAdminStubAgent(name string) *adminStubAgent {
@@ -150,6 +156,23 @@ func (a *adminStubAgent) DeleteMcpServer(ctx context.Context, name string) error
 	return nil
 }
 
+// Optional: WorkspaceLister
+func (a *adminStubAgent) ListWorkspaces(ctx context.Context) ([]core.AgentWorkspaceInfo, error) {
+	if a.workspaceListErr != nil {
+		return nil, a.workspaceListErr
+	}
+	return a.workspaces, nil
+}
+
+// Optional: SessionListerByWorkDir
+func (a *adminStubAgent) ListSessionsInWorkDir(ctx context.Context, workDir string) ([]core.AgentSessionInfo, error) {
+	a.listInWorkDirCalls = append(a.listInWorkDirCalls, workDir)
+	if a.sessionsByWorkDir == nil {
+		return nil, nil
+	}
+	return a.sessionsByWorkDir[workDir], nil
+}
+
 // adminStubAgentWithoutCapabilities implements only the required Agent
 // interface — no HistoryProvider / SessionDeleter / ResumeCommander — to
 // exercise the 501 Not Implemented path.
@@ -241,6 +264,140 @@ func TestHandleListSessions_AgentError(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/sessions?agent=claudecode", nil)
 	w := httptest.NewRecorder()
 	h.HandleListSessions(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", w.Code)
+	}
+}
+
+func TestHandleListSessions_ByWorkDir(t *testing.T) {
+	agent := newAdminStubAgent("claudecode")
+	agent.sessionsByWorkDir = map[string][]core.AgentSessionInfo{
+		"/workspace/f1-web": {
+			{ID: "sess-a", Summary: "fix bug", Cwd: "/workspace/f1-web"},
+		},
+	}
+	store := setupAdminStore(agent)
+	h := &AdminHandlers{Store: store}
+
+	req := httptest.NewRequest(http.MethodGet, "/sessions?agent=claudecode&workDir=/workspace/f1-web", nil)
+	w := httptest.NewRecorder()
+	h.HandleListSessions(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body: %s", w.Code, w.Body.String())
+	}
+	var resp SessionListResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Sessions) != 1 || resp.Sessions[0].ID != "sess-a" {
+		t.Fatalf("sessions = %+v, want [sess-a]", resp.Sessions)
+	}
+	if resp.Sessions[0].WorkDir != "/workspace/f1-web" {
+		t.Errorf("workDir = %q, want /workspace/f1-web", resp.Sessions[0].WorkDir)
+	}
+	if len(agent.listInWorkDirCalls) != 1 || agent.listInWorkDirCalls[0] != "/workspace/f1-web" {
+		t.Errorf("ListSessionsInWorkDir calls = %v, want [/workspace/f1-web]", agent.listInWorkDirCalls)
+	}
+}
+
+func TestHandleListSessions_WorkDirFieldPropagated(t *testing.T) {
+	agent := newAdminStubAgent("codex")
+	agent.sessions = []core.AgentSessionInfo{
+		{ID: "sess-1", Summary: "hi", Cwd: "/Users/tl/workspace/f1-web"},
+	}
+	store := setupAdminStore(agent)
+	h := &AdminHandlers{Store: store}
+
+	req := httptest.NewRequest(http.MethodGet, "/sessions?agent=codex", nil)
+	w := httptest.NewRecorder()
+	h.HandleListSessions(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp SessionListResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Sessions[0].WorkDir != "/Users/tl/workspace/f1-web" {
+		t.Errorf("workDir = %q, want /Users/tl/workspace/f1-web", resp.Sessions[0].WorkDir)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// GET /workspaces
+// -----------------------------------------------------------------------------
+
+func TestHandleListWorkspaces_OK(t *testing.T) {
+	agent := newAdminStubAgent("claudecode")
+	agent.workspaces = []core.AgentWorkspaceInfo{
+		{Path: "/workspace/f1-web", SessionCount: 38, LastActive: time.Unix(1750000100, 0)},
+		{Path: "/workspace/ibrain", SessionCount: 5, LastActive: time.Unix(1750000000, 0)},
+	}
+	store := setupAdminStore(agent)
+	h := &AdminHandlers{Store: store}
+
+	req := httptest.NewRequest(http.MethodGet, "/workspaces?agent=claudecode", nil)
+	w := httptest.NewRecorder()
+	h.HandleListWorkspaces(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body: %s", w.Code, w.Body.String())
+	}
+	var resp WorkspaceListResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Agent != "claudecode" {
+		t.Errorf("agent = %q, want claudecode", resp.Agent)
+	}
+	if len(resp.Workspaces) != 2 {
+		t.Fatalf("workspaces len = %d, want 2", len(resp.Workspaces))
+	}
+	if resp.Workspaces[0].Path != "/workspace/f1-web" {
+		t.Errorf("workspaces[0].path = %q, want /workspace/f1-web", resp.Workspaces[0].Path)
+	}
+	if resp.Workspaces[0].SessionCount != 38 {
+		t.Errorf("workspaces[0].sessionCount = %d, want 38", resp.Workspaces[0].SessionCount)
+	}
+	if resp.Workspaces[0].LastActive != 1750000100 {
+		t.Errorf("workspaces[0].lastActive = %d, want 1750000100", resp.Workspaces[0].LastActive)
+	}
+}
+
+func TestHandleListWorkspaces_MissingAgentParam(t *testing.T) {
+	h := &AdminHandlers{Store: setupAdminStore(newAdminStubAgent("claudecode"))}
+	req := httptest.NewRequest(http.MethodGet, "/workspaces", nil)
+	w := httptest.NewRecorder()
+	h.HandleListWorkspaces(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestHandleListWorkspaces_NotImplemented(t *testing.T) {
+	// adminStubAgentBare implements only core.Agent, not WorkspaceLister.
+	h := &AdminHandlers{Store: setupAdminStore(&adminStubAgentBare{name: "gemini"})}
+	req := httptest.NewRequest(http.MethodGet, "/workspaces?agent=gemini", nil)
+	w := httptest.NewRecorder()
+	h.HandleListWorkspaces(w, req)
+
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501, got %d", w.Code)
+	}
+}
+
+func TestHandleListWorkspaces_AgentError(t *testing.T) {
+	agent := newAdminStubAgent("claudecode")
+	agent.workspaceListErr = errors.New("scan failed")
+	h := &AdminHandlers{Store: setupAdminStore(agent)}
+
+	req := httptest.NewRequest(http.MethodGet, "/workspaces?agent=claudecode", nil)
+	w := httptest.NewRecorder()
+	h.HandleListWorkspaces(w, req)
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500, got %d", w.Code)

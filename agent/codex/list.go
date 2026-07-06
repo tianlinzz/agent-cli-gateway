@@ -31,11 +31,17 @@ func resolveCodexHomeDir(explicit string) string {
 }
 
 // listCodexSessions scans the codex sessions directory for JSONL transcript
-// files whose cwd matches workDir.
+// files whose cwd matches workDir. When workDir is empty or "." (the
+// gateway-singleton default), no cwd filter is applied and all sessions are
+// returned.
 func listCodexSessions(workDir, codexHome string) ([]core.AgentSessionInfo, error) {
-	absWorkDir, err := filepath.Abs(workDir)
-	if err != nil {
-		absWorkDir = workDir
+	filterCwd := ""
+	if workDir != "" && workDir != "." {
+		absWorkDir, err := filepath.Abs(workDir)
+		if err != nil {
+			absWorkDir = workDir
+		}
+		filterCwd = absWorkDir
 	}
 
 	sessionsDir := filepath.Join(resolveCodexHomeDir(codexHome), "sessions")
@@ -57,7 +63,7 @@ func listCodexSessions(workDir, codexHome string) ([]core.AgentSessionInfo, erro
 
 	var sessions []core.AgentSessionInfo
 	for _, f := range files {
-		info := parseCodexSessionFile(f, absWorkDir)
+		info := parseCodexSessionFile(f, filterCwd)
 		if info != nil {
 			patchSessionSource(info.ID, codexHome)
 			sessions = append(sessions, *info)
@@ -69,6 +75,61 @@ func listCodexSessions(workDir, codexHome string) ([]core.AgentSessionInfo, erro
 	})
 
 	return sessions, nil
+}
+
+// listCodexWorkspaces scans all codex sessions and aggregates distinct cwds
+// into workspace summaries. Used by core.WorkspaceLister.
+func listCodexWorkspaces(codexHome string) ([]core.AgentWorkspaceInfo, error) {
+	sessionsDir := filepath.Join(resolveCodexHomeDir(codexHome), "sessions")
+
+	var files []string
+	_ = filepath.Walk(sessionsDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(path, ".jsonl") {
+			files = append(files, path)
+		}
+		return nil
+	})
+
+	if len(files) == 0 {
+		return nil, nil
+	}
+
+	type ws struct {
+		count      int
+		lastActive time.Time
+	}
+	byPath := make(map[string]*ws)
+	for _, f := range files {
+		info := parseCodexSessionFile(f, "") // no filter; collect all
+		if info == nil || info.Cwd == "" {
+			continue
+		}
+		w := byPath[info.Cwd]
+		if w == nil {
+			w = &ws{}
+			byPath[info.Cwd] = w
+		}
+		w.count++
+		if info.ModifiedAt.After(w.lastActive) {
+			w.lastActive = info.ModifiedAt
+		}
+	}
+
+	out := make([]core.AgentWorkspaceInfo, 0, len(byPath))
+	for path, w := range byPath {
+		out = append(out, core.AgentWorkspaceInfo{
+			Path:         path,
+			SessionCount: w.count,
+			LastActive:   w.lastActive,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].LastActive.After(out[j].LastActive)
+	})
+	return out, nil
 }
 
 // parseCodexSessionFile reads a Codex JSONL transcript.
@@ -164,6 +225,7 @@ func parseCodexSessionFile(path, filterCwd string) *core.AgentSessionInfo {
 		Summary:      summary,
 		MessageCount: msgCount,
 		ModifiedAt:   stat.ModTime(),
+		Cwd:          sessionCwd,
 	}
 }
 

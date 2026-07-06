@@ -701,7 +701,7 @@ func TestScanSessionMeta_ArrayContent(t *testing.T) {
 		t.Fatalf("write test jsonl: %v", err)
 	}
 
-	summary, count := scanSessionMeta(path)
+	summary, count, _ := scanSessionMeta(path)
 
 	// Expected: 2 user + 2 assistant = 4 messages
 	if count != 4 {
@@ -733,7 +733,7 @@ func TestScanSessionMeta_AllArrayContent(t *testing.T) {
 		t.Fatalf("write test jsonl: %v", err)
 	}
 
-	summary, count := scanSessionMeta(path)
+	summary, count, _ := scanSessionMeta(path)
 
 	if count != 2 {
 		t.Errorf("scanSessionMeta count = %d, want 2", count)
@@ -873,4 +873,225 @@ func TestValidateSessionIDInProject_CrossProjectLeak(t *testing.T) {
 // regression can ship.
 func TestAgent_ImplementsSessionIDValidator(t *testing.T) {
 	var _ core.SessionIDValidator = (*Agent)(nil)
+}
+
+// TestAgent_ImplementsWorkspaceLister is a compile-time check that *Agent
+// satisfies the new optional interfaces for workspace discovery and scoped
+// session listing.
+func TestAgent_ImplementsWorkspaceLister(t *testing.T) {
+	var _ core.WorkspaceLister = (*Agent)(nil)
+	var _ core.SessionListerByWorkDir = (*Agent)(nil)
+}
+
+// writeClaudeSessionFile writes a minimal JSONL transcript with a cwd field
+// into projectDir under the given homeDir.
+func writeClaudeSessionFile(t *testing.T, homeDir, workDir, sessionID, firstUserMsg string) {
+	t.Helper()
+	projectsBase := filepath.Join(homeDir, ".claude", "projects")
+	projectDir := filepath.Join(projectsBase, encodeClaudeProjectKey(workDir))
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	path := filepath.Join(projectDir, sessionID+".jsonl")
+	content := `{"type":"user","cwd":"` + workDir + `","message":{"role":"user","content":"` + firstUserMsg + `"}}` + "\n" +
+		`{"type":"assistant","message":{"role":"assistant","content":"ok"}}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+}
+
+// TestListSessions_AllWhenNoBoundWorkDir verifies the gateway-singleton fix:
+// when the agent's workDir does not resolve to any on-disk project, ListSessions
+// scans ALL project dirs instead of returning empty.
+func TestListSessions_AllWhenNoBoundWorkDir(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", homeDir)
+	}
+
+	writeClaudeSessionFile(t, homeDir, "/workspace/f1-web", "sess-a", "fix bug")
+	writeClaudeSessionFile(t, homeDir, "/workspace/ibrain", "sess-b", "add tests")
+
+	// Agent with a workDir that matches NO on-disk project (singleton case).
+	agent, err := New(map[string]any{"work_dir": "/nonexistent/path"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	sessions, err := agent.ListSessions(nil)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("sessions len = %d, want 2 (singleton should scan all projects)", len(sessions))
+	}
+	// Each session should carry its cwd.
+	cwds := map[string]string{}
+	for _, s := range sessions {
+		cwds[s.ID] = s.Cwd
+	}
+	if cwds["sess-a"] != "/workspace/f1-web" {
+		t.Errorf("sess-a cwd = %q, want /workspace/f1-web", cwds["sess-a"])
+	}
+	if cwds["sess-b"] != "/workspace/ibrain" {
+		t.Errorf("sess-b cwd = %q, want /workspace/ibrain", cwds["sess-b"])
+	}
+}
+
+// TestListSessions_ScopedWhenWorkDirMatches is the single-workspace
+// preservation test: a bound workDir that resolves to a real project dir
+// returns ONLY that project's sessions.
+func TestListSessions_ScopedWhenWorkDirMatches(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", homeDir)
+	}
+
+	writeClaudeSessionFile(t, homeDir, "/workspace/f1-web", "sess-a", "fix bug")
+	writeClaudeSessionFile(t, homeDir, "/workspace/ibrain", "sess-b", "add tests")
+
+	agent, err := New(map[string]any{"work_dir": "/workspace/f1-web"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	sessions, err := agent.ListSessions(nil)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("sessions len = %d, want 1 (scoped to f1-web)", len(sessions))
+	}
+	if sessions[0].ID != "sess-a" {
+		t.Errorf("sessions[0].ID = %q, want sess-a", sessions[0].ID)
+	}
+}
+
+// TestListWorkspaces is the core new-feature test: distinct cwds are
+// aggregated into workspace summaries with correct counts and last-active.
+func TestListWorkspaces(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", homeDir)
+	}
+
+	writeClaudeSessionFile(t, homeDir, "/workspace/f1-web", "sess-a", "fix bug")
+	// Second session in the same workspace (different project dir encoding
+	// would not normally happen, but same workDir + different session id).
+	writeClaudeSessionFile(t, homeDir, "/workspace/f1-web", "sess-c", "more work")
+	writeClaudeSessionFile(t, homeDir, "/workspace/ibrain", "sess-b", "add tests")
+
+	agent, err := New(map[string]any{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	a := agent.(*Agent)
+	ws, err := a.ListWorkspaces(nil)
+	if err != nil {
+		t.Fatalf("ListWorkspaces: %v", err)
+	}
+	if len(ws) != 2 {
+		t.Fatalf("workspaces len = %d, want 2", len(ws))
+	}
+	// Both sessions for f1-web land in the same workspace bucket.
+	byPath := map[string]core.AgentWorkspaceInfo{}
+	for _, w := range ws {
+		byPath[w.Path] = w
+	}
+	if byPath["/workspace/f1-web"].SessionCount != 2 {
+		t.Errorf("f1-web count = %d, want 2", byPath["/workspace/f1-web"].SessionCount)
+	}
+	if byPath["/workspace/ibrain"].SessionCount != 1 {
+		t.Errorf("ibrain count = %d, want 1", byPath["/workspace/ibrain"].SessionCount)
+	}
+}
+
+// TestGetSessionHistory_AcrossProjects is the regression test for the bug
+// where GetSessionHistory depended on a.workDir + findProjectDir and failed
+// for any session not in the bound workspace. Now it scans all projects.
+func TestGetSessionHistory_AcrossProjects(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", homeDir)
+	}
+
+	writeClaudeSessionFile(t, homeDir, "/workspace/f1-web", "sess-a", "fix bug")
+	writeClaudeSessionFile(t, homeDir, "/workspace/ibrain", "sess-b", "add tests")
+
+	// Agent bound to a workDir that matches NO project — must still find
+	// sess-b's history by scanning all projects.
+	agent, err := New(map[string]any{"work_dir": "/nonexistent/path"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	a := agent.(*Agent)
+	entries, err := a.GetSessionHistory(nil, "sess-b", 0)
+	if err != nil {
+		t.Fatalf("GetSessionHistory: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entries len = %d, want 2 (1 user + 1 assistant)", len(entries))
+	}
+	if entries[0].Role != "user" || entries[0].Content != "add tests" {
+		t.Errorf("entries[0] = %+v, want user/add tests", entries[0])
+	}
+}
+
+// TestDeleteSession_AcrossProjects is the regression test for DeleteSession
+// failing on sessions outside the bound workDir.
+func TestDeleteSession_AcrossProjects(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", homeDir)
+	}
+
+	writeClaudeSessionFile(t, homeDir, "/workspace/ibrain", "sess-b", "add tests")
+
+	agent, err := New(map[string]any{"work_dir": "/nonexistent/path"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	a := agent.(*Agent)
+	if err := a.DeleteSession(nil, "sess-b"); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+	// Confirm the file is gone.
+	if _, err := os.Stat(filepath.Join(homeDir, ".claude", "projects",
+		encodeClaudeProjectKey("/workspace/ibrain"), "sess-b.jsonl")); !os.IsNotExist(err) {
+		t.Errorf("session file still exists after delete: %v", err)
+	}
+}
+
+// TestListSessionsInWorkDir verifies the SessionListerByWorkDir impl scopes
+// to the requested workDir without mutating the agent singleton.
+func TestListSessionsInWorkDir(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", homeDir)
+	}
+
+	writeClaudeSessionFile(t, homeDir, "/workspace/f1-web", "sess-a", "fix bug")
+	writeClaudeSessionFile(t, homeDir, "/workspace/ibrain", "sess-b", "add tests")
+
+	agent, err := New(map[string]any{"work_dir": "/nonexistent/path"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	a := agent.(*Agent)
+	// Scoped listing for ibrain only.
+	sessions, err := a.ListSessionsInWorkDir(nil, "/workspace/ibrain")
+	if err != nil {
+		t.Fatalf("ListSessionsInWorkDir: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != "sess-b" {
+		t.Fatalf("sessions = %+v, want [sess-b]", sessions)
+	}
+	// Singleton's own workDir must be untouched.
+	if got := a.GetWorkDir(); got != "/nonexistent/path" {
+		t.Errorf("singleton workDir mutated to %q", got)
+	}
 }

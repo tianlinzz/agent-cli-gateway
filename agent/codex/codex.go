@@ -476,6 +476,25 @@ func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error)
 	return listCodexSessions(workDir, codexHome)
 }
 
+// ListSessionsInWorkDir implements core.SessionListerByWorkDir. It lists
+// sessions scoped to workDir without mutating the agent singleton's configured
+// workDir. Used by the management API's ?workDir= filter.
+func (a *Agent) ListSessionsInWorkDir(_ context.Context, workDir string) ([]core.AgentSessionInfo, error) {
+	a.mu.RLock()
+	codexHome := a.codexHome
+	a.mu.RUnlock()
+	return listCodexSessions(workDir, codexHome)
+}
+
+// ListWorkspaces implements core.WorkspaceLister. It scans all codex sessions
+// and aggregates distinct cwds into workspace summaries.
+func (a *Agent) ListWorkspaces(_ context.Context) ([]core.AgentWorkspaceInfo, error) {
+	a.mu.RLock()
+	codexHome := a.codexHome
+	a.mu.RUnlock()
+	return listCodexWorkspaces(codexHome)
+}
+
 func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int) ([]core.HistoryEntry, error) {
 	a.mu.RLock()
 	codexHome := a.codexHome

@@ -630,6 +630,32 @@ type WorkDirSwitcher interface {
 	GetWorkDir() string
 }
 
+// AgentWorkspaceInfo describes one working directory that has on-disk sessions.
+type AgentWorkspaceInfo struct {
+	Path         string    // absolute working directory (cwd), e.g. /Users/tl/workspace/f1-web
+	SessionCount int       // number of sessions in this workspace
+	LastActive   time.Time // most recent session mtime
+}
+
+// WorkspaceLister is an optional interface for agents that can enumerate the
+// distinct working directories that have on-disk sessions. Used by the
+// gateway's management API to discover workspaces before listing sessions.
+// Agents that do not persist sessions grouped by workdir should not implement
+// this; the handler returns 501 for them.
+type WorkspaceLister interface {
+	ListWorkspaces(ctx context.Context) ([]AgentWorkspaceInfo, error)
+}
+
+// SessionListerByWorkDir is an optional interface for agents that can list
+// sessions scoped to an explicit working directory without mutating the agent
+// singleton's configured workDir. The gateway's management API calls this when
+// the caller supplies a workDir filter; agents that don't implement it fall
+// back to the unscoped Agent.ListSessions (which returns all sessions when the
+// agent singleton has no bound workDir).
+type SessionListerByWorkDir interface {
+	ListSessionsInWorkDir(ctx context.Context, workDir string) ([]AgentSessionInfo, error)
+}
+
 // AgentOptsProvider is an optional interface for agents that need to carry
 // their full configuration options when the engine clones a per-workspace
 // agent instance in multi-workspace mode. The engine merges the returned map

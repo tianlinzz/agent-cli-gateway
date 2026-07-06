@@ -46,6 +46,8 @@ func NewServer(cfg config.GatewayConfig, store *SessionStore) *Server {
 	// Same auth + identity chain as live-session routes.
 	mux.Handle("GET /sessions",
 		chain(http.HandlerFunc(admin.HandleListSessions), s.withAuth, identityMw))
+	mux.Handle("GET /workspaces",
+		chain(http.HandlerFunc(admin.HandleListWorkspaces), s.withAuth, identityMw))
 	mux.Handle("GET /sessions/{agent}/{id}/history",
 		chain(http.HandlerFunc(admin.HandleSessionHistory), s.withAuth, identityMw))
 	mux.Handle("DELETE /sessions/{agent}/{id}",

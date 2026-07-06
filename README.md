@@ -36,7 +36,8 @@ over HTTP.
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/sessions?agent={name}` | List an agent's sessions (transcript scan) |
+| GET | `/workspaces?agent={name}` | List workspaces that have on-disk sessions |
+| GET | `/sessions?agent={name}&workDir={path}` | List an agent's sessions (transcript scan); `workDir` optional |
 | GET | `/sessions/{agent}/{id}/history?limit=N` | Read a session's user/assistant turns |
 | DELETE | `/sessions/{agent}/{id}` | Delete a session transcript file |
 | GET | `/sessions/{agent}/{id}/resume` | Native resume command + gateway hint |

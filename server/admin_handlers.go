@@ -21,9 +21,11 @@ type AdminHandlers struct {
 	Store *SessionStore
 }
 
-// HandleListSessions responds to GET /sessions?agent={name}.
+// HandleListSessions responds to GET /sessions?agent={name}&workDir={path}.
 // Returns sessions known to the agent backend (e.g. ~/.claude/projects/*,
-// ~/.codex/sessions/*). agent is required.
+// ~/.codex/sessions/*). agent is required. workDir is optional: when provided,
+// sessions are scoped to that working directory via SessionListerByWorkDir;
+// when omitted, the agent returns all sessions (gateway-singleton behaviour).
 func (h *AdminHandlers) HandleListSessions(w http.ResponseWriter, r *http.Request) {
 	agentName := r.URL.Query().Get("agent")
 	if agentName == "" {
@@ -36,7 +38,19 @@ func (h *AdminHandlers) HandleListSessions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	sessions, err := agent.ListSessions(r.Context())
+	workDir := r.URL.Query().Get("workDir")
+	var sessions []core.AgentSessionInfo
+	var err error
+	if workDir != "" {
+		// Scoped listing: prefer SessionListerByWorkDir (no singleton mutation).
+		if lw, ok := agent.(core.SessionListerByWorkDir); ok {
+			sessions, err = lw.ListSessionsInWorkDir(r.Context(), workDir)
+		} else {
+			sessions, err = agent.ListSessions(r.Context())
+		}
+	} else {
+		sessions, err = agent.ListSessions(r.Context())
+	}
 	if err != nil {
 		slog.Warn("list sessions failed", "agent", agentName, "error", err)
 		writeError(w, http.StatusInternalServerError, "list sessions failed: "+err.Error())
@@ -52,9 +66,49 @@ func (h *AdminHandlers) HandleListSessions(w http.ResponseWriter, r *http.Reques
 			MessageCount: s.MessageCount,
 			ModifiedAt:   s.ModifiedAt.Unix(),
 			GitBranch:    s.GitBranch,
+			WorkDir:      s.Cwd,
 		})
 	}
 	writeJSON(w, http.StatusOK, SessionListResponse{Agent: agentName, Sessions: items})
+}
+
+// HandleListWorkspaces responds to GET /workspaces?agent={name}.
+// Returns the distinct working directories that have on-disk sessions.
+// Requires the agent to implement core.WorkspaceLister; otherwise 501.
+func (h *AdminHandlers) HandleListWorkspaces(w http.ResponseWriter, r *http.Request) {
+	agentName := r.URL.Query().Get("agent")
+	if agentName == "" {
+		writeError(w, http.StatusBadRequest, "agent query parameter is required")
+		return
+	}
+	agent, ok := h.Store.Agent(agentName)
+	if !ok {
+		writeError(w, http.StatusNotFound, "agent not found: "+agentName)
+		return
+	}
+	wl, ok := agent.(core.WorkspaceLister)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "agent does not expose workspaces: "+agentName)
+		return
+	}
+
+	workspaces, err := wl.ListWorkspaces(r.Context())
+	if err != nil {
+		slog.Warn("list workspaces failed", "agent", agentName, "error", err)
+		writeError(w, http.StatusInternalServerError, "list workspaces failed: "+err.Error())
+		return
+	}
+
+	items := make([]WorkspaceListItem, 0, len(workspaces))
+	for _, ws := range workspaces {
+		items = append(items, WorkspaceListItem{
+			Agent:        agentName,
+			Path:         ws.Path,
+			SessionCount: ws.SessionCount,
+			LastActive:   ws.LastActive.Unix(),
+		})
+	}
+	writeJSON(w, http.StatusOK, WorkspaceListResponse{Agent: agentName, Workspaces: items})
 }
 
 // HandleSessionHistory responds to GET /sessions/{agent}/{id}/history?limit=N.

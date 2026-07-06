@@ -21,6 +21,8 @@ session API. They are safe to call while sessions are running.
 
 - [Authentication](#authentication)
 - [Conventions](#conventions)
+- [Workspaces](#workspaces)
+  - [List workspaces](#list-workspaces)
 - [Session Management](#session-management)
   - [List sessions](#list-sessions)
   - [Session history](#session-history)
@@ -65,6 +67,53 @@ token does not match. With `-token ""` (dev mode) auth is skipped.
 
 ---
 
+## Workspaces
+
+Both Claude Code and Codex persist sessions grouped by the working directory
+(cwd) the CLI was launched in. The workspace-discovery endpoint lets a caller
+enumerate those directories before drilling into a specific workspace's
+sessions — the recommended flow is **list workspaces → list sessions (scoped)
+→ read history**.
+
+### List workspaces
+
+```
+GET /workspaces?agent={name}
+```
+
+Returns the distinct working directories that have on-disk sessions, each with
+a session count and last-active timestamp. `agent` is required.
+
+**Example**
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:4096/workspaces?agent=claudecode"
+```
+
+**200 —** `application/json`
+
+```jsonc
+{
+  "agent": "claudecode",
+  "workspaces": [
+    { "agent": "claudecode", "path": "/Users/tl/workspace/f1-web", "sessionCount": 38, "lastActive": 1750000100 },
+    { "agent": "claudecode", "path": "/Users/tl/workspace/ibrain", "sessionCount": 5,  "lastActive": 1750000000 }
+  ]
+}
+```
+
+**Errors**
+
+| Status | When |
+|---|---|
+| `400` | missing `agent` query param |
+| `404` | unknown agent name |
+| `500` | agent backend scan error |
+| `501` | agent does not expose workspace listing |
+
+---
+
 ## Session Management
 
 These endpoints read the on-disk session transcripts that the underlying CLIs
@@ -74,16 +123,29 @@ They do **not** create or touch live gateway sessions.
 ### List sessions
 
 ```
-GET /sessions?agent={name}
+GET /sessions?agent={name}&workDir={path}
 ```
 
-Lists sessions known to the agent backend. `agent` is required.
+Lists sessions known to the agent backend. `agent` is required. `workDir` is
+optional:
+
+- **Omitted** — returns sessions across **all** workspaces (the
+  gateway-singleton behaviour). Each session's `workDir` field identifies which
+  workspace it belongs to.
+- **Provided** — scopes the listing to that working directory via the agent's
+  `SessionListerByWorkDir` implementation. Use a path returned by
+  `GET /workspaces` for an exact match.
 
 **Example**
 
 ```bash
+# all sessions
 curl -H "Authorization: Bearer $TOKEN" \
   "http://localhost:4096/sessions?agent=claudecode"
+
+# scoped to one workspace
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:4096/sessions?agent=claudecode&workDir=/Users/tl/workspace/f1-web"
 ```
 
 **200 —** `application/json`
@@ -98,7 +160,8 @@ curl -H "Authorization: Bearer $TOKEN" \
       "summary": "fix bug in main.go",
       "messageCount": 12,
       "modifiedAt": 1750000100,
-      "gitBranch": "main"
+      "gitBranch": "main",
+      "workDir": "/Users/tl/workspace/f1-web"
     }
   ]
 }
@@ -427,6 +490,8 @@ calling an unsupported one returns `501 Not Implemented`.
 | Capability | Interface | claudecode | codex | others |
 |---|---|---|---|---|
 | List sessions | `core.Agent` (required) | ✅ | ✅ | per agent |
+| List workspaces | `WorkspaceLister` | ✅ | ✅ | optional |
+| Scoped session listing | `SessionListerByWorkDir` | ✅ | ✅ | optional |
 | Read history | `HistoryProvider` | ✅ | ✅ | per agent |
 | Delete session | `SessionDeleter` | ✅ | ✅ | per agent |
 | Resume info | `ResumeCommander` | ✅ | ✅ | optional |
@@ -469,6 +534,16 @@ interface(s) on that agent type — no changes to `server/` or `core/` are neede
 | `messageCount` | int | User + assistant turns |
 | `modifiedAt` | int64 | Unix seconds, transcript mtime |
 | `gitBranch` | string | Optional |
+| `workDir` | string | Absolute cwd the session ran in (omitted when unknown) |
+
+### `WorkspaceListItem`
+
+| Field | Type | Notes |
+|---|---|---|
+| `agent` | string | Echoes the queried agent name |
+| `path` | string | Absolute working directory (cwd) |
+| `sessionCount` | int | Number of sessions in this workspace |
+| `lastActive` | int64 | Unix seconds, most recent session mtime |
 
 ### `HistoryEntryDTO`
 
