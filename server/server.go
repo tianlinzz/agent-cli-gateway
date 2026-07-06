@@ -43,31 +43,36 @@ func NewServer(cfg config.GatewayConfig, store *SessionStore) *Server {
 		chain(http.HandlerFunc(handlers.HandleConfigProviders), s.withAuth, identityMw))
 
 	// Management endpoints (PR1: session browsing/history/delete/resume).
-	// Same auth + identity chain as live-session routes.
+	// X-User-Id (identityMw) is a per-caller session-ownership concern for the
+	// live-session routes above. These admin/inspection handlers operate on the
+	// agent singletons directly and never read UserIDFromContext, so they only
+	// need token auth (withAuth) — not a caller identity. Requiring X-User-Id
+	// here would only block legitimate ops callers (e.g. NocoBase gateway
+	// management page) with a 401 without adding any isolation.
 	mux.Handle("GET /sessions",
-		chain(http.HandlerFunc(admin.HandleListSessions), s.withAuth, identityMw))
+		chain(http.HandlerFunc(admin.HandleListSessions), s.withAuth))
 	mux.Handle("GET /workspaces",
-		chain(http.HandlerFunc(admin.HandleListWorkspaces), s.withAuth, identityMw))
+		chain(http.HandlerFunc(admin.HandleListWorkspaces), s.withAuth))
 	mux.Handle("GET /sessions/{agent}/{id}/history",
-		chain(http.HandlerFunc(admin.HandleSessionHistory), s.withAuth, identityMw))
+		chain(http.HandlerFunc(admin.HandleSessionHistory), s.withAuth))
 	mux.Handle("DELETE /sessions/{agent}/{id}",
-		chain(http.HandlerFunc(admin.HandleDeleteSession), s.withAuth, identityMw))
+		chain(http.HandlerFunc(admin.HandleDeleteSession), s.withAuth))
 	mux.Handle("GET /sessions/{agent}/{id}/resume",
-		chain(http.HandlerFunc(admin.HandleSessionResume), s.withAuth, identityMw))
+		chain(http.HandlerFunc(admin.HandleSessionResume), s.withAuth))
 
 	// Management endpoints (PR2: provider live config).
 	mux.Handle("GET /config/agents/{agent}/provider",
-		chain(http.HandlerFunc(admin.HandleReadLiveProvider), s.withAuth, identityMw))
+		chain(http.HandlerFunc(admin.HandleReadLiveProvider), s.withAuth))
 	mux.Handle("PUT /config/agents/{agent}/provider",
-		chain(http.HandlerFunc(admin.HandleWriteLiveProvider), s.withAuth, identityMw))
+		chain(http.HandlerFunc(admin.HandleWriteLiveProvider), s.withAuth))
 
 	// Management endpoints (PR3: MCP servers).
 	mux.Handle("GET /config/agents/{agent}/mcp",
-		chain(http.HandlerFunc(admin.HandleListMcpServers), s.withAuth, identityMw))
+		chain(http.HandlerFunc(admin.HandleListMcpServers), s.withAuth))
 	mux.Handle("PUT /config/agents/{agent}/mcp/{name}",
-		chain(http.HandlerFunc(admin.HandleSaveMcpServer), s.withAuth, identityMw))
+		chain(http.HandlerFunc(admin.HandleSaveMcpServer), s.withAuth))
 	mux.Handle("DELETE /config/agents/{agent}/mcp/{name}",
-		chain(http.HandlerFunc(admin.HandleDeleteMcpServer), s.withAuth, identityMw))
+		chain(http.HandlerFunc(admin.HandleDeleteMcpServer), s.withAuth))
 
 	s.server = &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.Port),
@@ -108,7 +113,7 @@ func (s *Server) withCORS(next http.Handler) http.Handler {
 		origin := r.Header.Get("Origin")
 		if origin != "" && s.isAllowedOrigin(origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key, X-User-Id")
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 		}
