@@ -543,7 +543,7 @@ func TestWorkspaceAgentOptions_FullSnapshot(t *testing.T) {
 	// PATH. WorkspaceAgentOptions only reads fields that the production
 	// New() also writes; this just verifies the snapshot shape.
 	a := &Agent{
-		cmd:           "my-cli",
+		cmd:              "my-cli",
 		cliExtraArgs:     []string{"--add-dir", "/parent"},
 		cmdArgsFlag:      "-a",
 		model:            "claude-opus-4-7",
@@ -559,7 +559,7 @@ func TestWorkspaceAgentOptions_FullSnapshot(t *testing.T) {
 
 	want := map[string]any{
 		"mode":               "acceptEdits",
-		"cmd":           "my-cli --add-dir /parent",
+		"cmd":                "my-cli --add-dir /parent",
 		"cmd_args_flag":      "-a",
 		"model":              "claude-opus-4-7",
 		"reasoning_effort":   "high",
@@ -621,7 +621,7 @@ func TestWorkspaceAgentOptions_RoundTripsThroughNew(t *testing.T) {
 		t.Skip("run_as_user-based LookPath bypass is Unix-only")
 	}
 	parent := &Agent{
-		cmd:           "my-cli",
+		cmd:              "my-cli",
 		cliExtraArgs:     []string{"code", "--add-dir", "/parent"},
 		cmdArgsFlag:      "-a",
 		model:            "claude-opus-4-7",
@@ -900,6 +900,19 @@ func writeClaudeSessionFile(t *testing.T, homeDir, workDir, sessionID, firstUser
 	}
 }
 
+func writeClaudeSessionTranscript(t *testing.T, homeDir, workDir, sessionID, content string) {
+	t.Helper()
+	projectsBase := filepath.Join(homeDir, ".claude", "projects")
+	projectDir := filepath.Join(projectsBase, encodeClaudeProjectKey(workDir))
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	path := filepath.Join(projectDir, sessionID+".jsonl")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+}
+
 // TestListSessions_AllWhenNoBoundWorkDir verifies the gateway-singleton fix:
 // when the agent's workDir does not resolve to any on-disk project, ListSessions
 // scans ALL project dirs instead of returning empty.
@@ -1036,6 +1049,42 @@ func TestGetSessionHistory_AcrossProjects(t *testing.T) {
 	}
 	if entries[0].Role != "user" || entries[0].Content != "add tests" {
 		t.Errorf("entries[0] = %+v, want user/add tests", entries[0])
+	}
+}
+
+func TestGetSessionHistory_ClassifiesMetaSkillInputAsTool(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", homeDir)
+	}
+
+	writeClaudeSessionTranscript(t, homeDir, "/workspace/f1-web", "sess-meta", ""+
+		`{"type":"user","timestamp":"2026-07-06T12:00:00Z","cwd":"/workspace/f1-web","message":{"role":"user","content":"real user prompt"}}`+"\n"+
+		`{"type":"user","timestamp":"2026-07-06T12:00:01Z","isMeta":true,"sourceToolUseID":"call_123","message":{"role":"user","content":[{"type":"text","text":"Base directory for this skill: /Users/tl/.claude/skills/nocobase-workflow-manage\n\n# Goal\n\nUse the nb api workflow command surface."}]}}`+"\n"+
+		`{"type":"assistant","timestamp":"2026-07-06T12:00:02Z","message":{"role":"assistant","content":"assistant reply"}}`+"\n",
+	)
+
+	agent, err := New(map[string]any{"work_dir": "/workspace/f1-web"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	a := agent.(*Agent)
+	entries, err := a.GetSessionHistory(nil, "sess-meta", 0)
+	if err != nil {
+		t.Fatalf("GetSessionHistory: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("entries len = %d, want 3", len(entries))
+	}
+	if entries[0].Role != "user" || entries[0].Content != "real user prompt" {
+		t.Fatalf("entries[0] = %+v, want real user prompt", entries[0])
+	}
+	if entries[1].Role != "tool" {
+		t.Fatalf("entries[1].Role = %q, want tool", entries[1].Role)
+	}
+	if entries[2].Role != "assistant" || entries[2].Content != "assistant reply" {
+		t.Fatalf("entries[2] = %+v, want assistant reply", entries[2])
 	}
 }
 

@@ -48,9 +48,9 @@ type Agent struct {
 	providers        []core.ProviderConfig
 	activeIdx        int // -1 = no provider set
 	sessionEnv       []string
-	routerURL        string // Claude Code Router URL (e.g., "http://127.0.0.1:3456")
-	routerAPIKey     string // Claude Code Router API key (optional)
-	systemPrompt     string // Custom system prompt to pass to Claude CLI
+	routerURL        string   // Claude Code Router URL (e.g., "http://127.0.0.1:3456")
+	routerAPIKey     string   // Claude Code Router API key (optional)
+	systemPrompt     string   // Custom system prompt to pass to Claude CLI
 	pluginDirs       []string // Plugin directories to load via --plugin-dir (repeatable)
 
 	appendSystemPrompt string // Custom text appended to the system prompt (keeps Claude's default)
@@ -76,41 +76,41 @@ type Agent struct {
 }
 
 var claudeProviderManagedEnvVars = map[string]struct{}{
-	"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST":                  {},
-	"CLAUDE_CODE_USE_BEDROCK":                               {},
-	"CLAUDE_CODE_USE_VERTEX":                                {},
-	"CLAUDE_CODE_USE_FOUNDRY":                               {},
-	"ANTHROPIC_BASE_URL":                                    {},
-	"ANTHROPIC_BEDROCK_BASE_URL":                            {},
-	"ANTHROPIC_VERTEX_BASE_URL":                             {},
-	"ANTHROPIC_FOUNDRY_BASE_URL":                            {},
-	"ANTHROPIC_FOUNDRY_RESOURCE":                            {},
-	"ANTHROPIC_VERTEX_PROJECT_ID":                           {},
-	"CLOUD_ML_REGION":                                       {},
-	"ANTHROPIC_API_KEY":                                     {},
-	"ANTHROPIC_AUTH_TOKEN":                                  {},
-	"CLAUDE_CODE_OAUTH_TOKEN":                               {},
-	"AWS_BEARER_TOKEN_BEDROCK":                              {},
-	"ANTHROPIC_FOUNDRY_API_KEY":                             {},
-	"CLAUDE_CODE_SKIP_BEDROCK_AUTH":                         {},
-	"CLAUDE_CODE_SKIP_VERTEX_AUTH":                          {},
-	"CLAUDE_CODE_SKIP_FOUNDRY_AUTH":                         {},
-	"ANTHROPIC_MODEL":                                       {},
-	"ANTHROPIC_DEFAULT_HAIKU_MODEL":                         {},
-	"ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION":             {},
-	"ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME":                    {},
-	"ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES":  {},
-	"ANTHROPIC_DEFAULT_OPUS_MODEL":                          {},
-	"ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION":              {},
-	"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME":                     {},
-	"ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES":   {},
+	"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST":                 {},
+	"CLAUDE_CODE_USE_BEDROCK":                              {},
+	"CLAUDE_CODE_USE_VERTEX":                               {},
+	"CLAUDE_CODE_USE_FOUNDRY":                              {},
+	"ANTHROPIC_BASE_URL":                                   {},
+	"ANTHROPIC_BEDROCK_BASE_URL":                           {},
+	"ANTHROPIC_VERTEX_BASE_URL":                            {},
+	"ANTHROPIC_FOUNDRY_BASE_URL":                           {},
+	"ANTHROPIC_FOUNDRY_RESOURCE":                           {},
+	"ANTHROPIC_VERTEX_PROJECT_ID":                          {},
+	"CLOUD_ML_REGION":                                      {},
+	"ANTHROPIC_API_KEY":                                    {},
+	"ANTHROPIC_AUTH_TOKEN":                                 {},
+	"CLAUDE_CODE_OAUTH_TOKEN":                              {},
+	"AWS_BEARER_TOKEN_BEDROCK":                             {},
+	"ANTHROPIC_FOUNDRY_API_KEY":                            {},
+	"CLAUDE_CODE_SKIP_BEDROCK_AUTH":                        {},
+	"CLAUDE_CODE_SKIP_VERTEX_AUTH":                         {},
+	"CLAUDE_CODE_SKIP_FOUNDRY_AUTH":                        {},
+	"ANTHROPIC_MODEL":                                      {},
+	"ANTHROPIC_DEFAULT_HAIKU_MODEL":                        {},
+	"ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION":            {},
+	"ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME":                   {},
+	"ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES": {},
+	"ANTHROPIC_DEFAULT_OPUS_MODEL":                         {},
+	"ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION":             {},
+	"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME":                    {},
+	"ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES":  {},
 
 	// Provider-specific base URL env vars for thinking rewrite proxy routing.
 	// These are set by cc-connect when thinking override is needed for
 	// Bedrock/Vertex/Foundry providers that don't use base_url config.
-	"ANTHROPIC_BEDROCK_PROXY_BASE_URL": {},
-	"ANTHROPIC_VERTEX_PROXY_BASE_URL":  {},
-	"ANTHROPIC_FOUNDRY_PROXY_BASE_URL": {},
+	"ANTHROPIC_BEDROCK_PROXY_BASE_URL":                      {},
+	"ANTHROPIC_VERTEX_PROXY_BASE_URL":                       {},
+	"ANTHROPIC_FOUNDRY_PROXY_BASE_URL":                      {},
 	"ANTHROPIC_DEFAULT_SONNET_MODEL":                        {},
 	"ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION":            {},
 	"ANTHROPIC_DEFAULT_SONNET_MODEL_NAME":                   {},
@@ -845,9 +845,11 @@ func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int
 
 	for scanner.Scan() {
 		var raw struct {
-			Type      string `json:"type"`
-			Timestamp string `json:"timestamp"`
-			Message   struct {
+			Type            string `json:"type"`
+			Timestamp       string `json:"timestamp"`
+			IsMeta          bool   `json:"isMeta"`
+			SourceToolUseID string `json:"sourceToolUseID"`
+			Message         struct {
 				Role    string          `json:"role"`
 				Content json.RawMessage `json:"content"`
 			} `json:"message"`
@@ -864,9 +866,17 @@ func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int
 		if text == "" {
 			continue
 		}
+		role := raw.Type
+		// Claude skill / tool injections are persisted as top-level "user"
+		// transcript rows with isMeta/sourceToolUseID set. Surface them as tool
+		// messages in the admin history instead of misleadingly rendering them as
+		// real user prompts.
+		if raw.Type == "user" && (raw.IsMeta || raw.SourceToolUseID != "") {
+			role = "tool"
+		}
 
 		entries = append(entries, core.HistoryEntry{
-			Role:      raw.Type,
+			Role:      role,
 			Content:   text,
 			Timestamp: ts,
 		})
