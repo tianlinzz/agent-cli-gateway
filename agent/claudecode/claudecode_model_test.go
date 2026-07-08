@@ -1,6 +1,7 @@
 package claudecode
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/tianlinzz/agent-cli-gateway/core"
@@ -53,5 +54,37 @@ func TestGetModel_PrefersActiveProviderModel(t *testing.T) {
 
 	if got := a.GetModel(); got != "opus" {
 		t.Fatalf("GetModel() = %q, want opus", got)
+	}
+}
+
+// aliasModelsFromEnv parses claude code's ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL
+// env vars into model options. The alias name (opus/sonnet/haiku/fable) is what
+// claude code accepts as --model; the CLI maps it to the real model via these env.
+func TestAliasModelsFromEnv(t *testing.T) {
+	env := map[string]string{
+		"ANTHROPIC_DEFAULT_OPUS_MODEL":        "glm-5.2[1M]",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME":   "Opus",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL":      "claude-opus-4-6[1M]",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "Sonnet",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL":       "claude-sonnet-5",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME":  "Haiku",
+		"ANTHROPIC_DEFAULT_FABLE_MODEL":       "glm-5.2[1M]",
+		// FABLE omits _NAME → falls back to "Fable".
+	}
+	got := aliasModelsFromEnv(env)
+	want := []core.ModelOption{
+		{Name: "opus", Desc: "Opus"},
+		{Name: "sonnet", Desc: "Sonnet"},
+		{Name: "haiku", Desc: "Haiku"},
+		{Name: "fable", Desc: "Fable"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("aliasModelsFromEnv() = %+v, want %+v", got, want)
+	}
+}
+
+func TestAliasModelsFromEnv_EmptyReturnsNil(t *testing.T) {
+	if got := aliasModelsFromEnv(map[string]string{}); got != nil {
+		t.Fatalf("aliasModelsFromEnv(empty) = %+v, want nil", got)
 	}
 }

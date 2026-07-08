@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/tianlinzz/agent-cli-gateway/core"
 )
@@ -201,4 +202,54 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// claudeCodeAliasTiers lists claude code's model alias tiers in display order.
+// Each tier maps to an env var ANTHROPIC_DEFAULT_{TIER}_MODEL (the real model id)
+// and an optional _NAME (display name). The lowercased tier (opus/sonnet/...)
+// is what claude code accepts as --model; the CLI maps it to the real model via
+// these env vars, so AvailableModels must surface the alias, not the real model.
+var claudeCodeAliasTiers = []struct {
+	tier         string
+	fallbackName string
+}{
+	{"OPUS", "Opus"},
+	{"SONNET", "Sonnet"},
+	{"HAIKU", "Haiku"},
+	{"FABLE", "Fable"},
+}
+
+// aliasModelsFromEnv parses claude code's ANTHROPIC_DEFAULT_{TIER}_MODEL env
+// vars into model options. Returns nil when no alias is configured. Used as the
+// AvailableModels fallback so config/providers returns the user's real alias
+// mapping (from ~/.claude/settings.json) instead of the hardcoded default list.
+func aliasModelsFromEnv(env map[string]string) []core.ModelOption {
+	var models []core.ModelOption
+	for _, al := range claudeCodeAliasTiers {
+		modelKey := "ANTHROPIC_DEFAULT_" + al.tier + "_MODEL"
+		m, ok := env[modelKey]
+		if !ok || m == "" {
+			continue
+		}
+		name := env[modelKey+"_NAME"]
+		if name == "" {
+			name = al.fallbackName
+		}
+		models = append(models, core.ModelOption{
+			Name: strings.ToLower(al.tier),
+			Desc: name,
+		})
+	}
+	return models
+}
+
+// modelsFromLiveConfig reads claude code model aliases from ~/.claude/settings.json.
+// Fallback for AvailableModels when no provider is configured in memory and the
+// Anthropic API is unreachable.
+func (a *Agent) modelsFromLiveConfig() []core.ModelOption {
+	cfg, err := a.ReadLiveProvider(context.Background())
+	if err != nil || cfg.Env == nil {
+		return nil
+	}
+	return aliasModelsFromEnv(cfg.Env)
 }

@@ -222,6 +222,9 @@ func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
 	if models := readCodexCachedModels(); len(models) > 0 {
 		return models
 	}
+	if models := a.modelsFromLiveConfig(); len(models) > 0 {
+		return models
+	}
 	return []core.ModelOption{
 		{Name: "o4-mini", Desc: "O4 Mini (fast reasoning)"},
 		{Name: "o3", Desc: "O3 (most capable reasoning)"},

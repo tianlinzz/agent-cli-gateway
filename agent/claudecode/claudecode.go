@@ -366,6 +366,9 @@ func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
 	if models := a.fetchModelsFromAPI(ctx); len(models) > 0 {
 		return models
 	}
+	if models := a.modelsFromLiveConfig(); len(models) > 0 {
+		return models
+	}
 	return []core.ModelOption{
 		{Name: "sonnet", Desc: "Claude Sonnet (balanced)"},
 		{Name: "opus", Desc: "Claude Opus (most capable)"},

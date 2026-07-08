@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/tianlinzz/agent-cli-gateway/core"
@@ -79,5 +80,23 @@ func TestWorkspaceAgentOptions_PreservesStdIOAppServerURL(t *testing.T) {
 	opts := a.WorkspaceAgentOptions()
 	if got := opts["app_server_url"]; got != "stdio://" {
 		t.Fatalf("WorkspaceAgentOptions()[app_server_url] = %#v, want stdio://", got)
+	}
+}
+
+// modelFromLiveConfig surfaces the single model configured in Codex's live config
+// (auth.json + config.toml) as a model option. Used as the AvailableModels
+// fallback so config/providers returns the user's real model instead of the
+// hardcoded OpenAI default list.
+func TestModelFromLiveConfig(t *testing.T) {
+	got := modelFromLiveConfig(core.LiveProviderConfig{Model: "gpt-5.4"})
+	want := []core.ModelOption{{Name: "gpt-5.4", Desc: "gpt-5.4"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("modelFromLiveConfig() = %+v, want %+v", got, want)
+	}
+}
+
+func TestModelFromLiveConfig_EmptyReturnsNil(t *testing.T) {
+	if got := modelFromLiveConfig(core.LiveProviderConfig{}); got != nil {
+		t.Fatalf("modelFromLiveConfig(empty) = %+v, want nil", got)
 	}
 }

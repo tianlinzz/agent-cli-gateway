@@ -195,6 +195,28 @@ func (a *Agent) ReadLiveProvider(_ context.Context) (core.LiveProviderConfig, er
 	}, nil
 }
 
+// modelFromLiveConfig surfaces the single model configured in Codex's live config
+// as a model option. Returns nil when no model is set. Used as the AvailableModels
+// fallback so config/providers returns the user's real model (from auth.json +
+// config.toml) instead of the hardcoded OpenAI default list.
+func modelFromLiveConfig(cfg core.LiveProviderConfig) []core.ModelOption {
+	if cfg.Model == "" {
+		return nil
+	}
+	return []core.ModelOption{{Name: cfg.Model, Desc: cfg.Model}}
+}
+
+// modelsFromLiveConfig reads the active model from Codex's auth.json + config.toml.
+// Fallback for AvailableModels when no provider is configured in memory, the
+// catalog/cached models are empty, and the OpenAI API is unreachable.
+func (a *Agent) modelsFromLiveConfig() []core.ModelOption {
+	cfg, err := a.ReadLiveProvider(context.Background())
+	if err != nil {
+		return nil
+	}
+	return modelFromLiveConfig(cfg)
+}
+
 // WriteLiveProvider writes the provider into Codex's auth.json + config.toml
 // atomically: if the second write (config.toml) fails, auth.json is restored
 // to its previous bytes. Implements core.LiveConfigProvider.
