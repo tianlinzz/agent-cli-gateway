@@ -137,8 +137,10 @@ type SessionHistoryResponse struct {
 // HistoryEntryDTO is one turn in a conversation history.
 type HistoryEntryDTO struct {
 	Role      string `json:"role"`
+	Kind      string `json:"kind"`
+	Phase     string `json:"phase,omitempty"`
 	Content   string `json:"content"`
-	Timestamp int64 `json:"timestamp,omitempty"` // Unix seconds
+	Timestamp int64  `json:"timestamp,omitempty"` // Unix seconds
 }
 
 // SessionResumeResponse is the body of GET /sessions/{agent}/{id}/resume.
@@ -156,7 +158,23 @@ type SessionResumeResponse struct {
 func toHistoryDTO(e core.HistoryEntry) HistoryEntryDTO {
 	return HistoryEntryDTO{
 		Role:      e.Role,
+		Kind:      historyEntryKind(e),
+		Phase:     e.Phase,
 		Content:   e.Content,
 		Timestamp: e.Timestamp.Unix(),
+	}
+}
+
+func historyEntryKind(e core.HistoryEntry) string {
+	if e.Kind != "" {
+		return e.Kind
+	}
+	switch e.Role {
+	case "user":
+		return "user"
+	case "assistant":
+		return "assistant_final"
+	default:
+		return e.Role
 	}
 }

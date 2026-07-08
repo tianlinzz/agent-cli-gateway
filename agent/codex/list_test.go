@@ -124,3 +124,36 @@ func TestListCodexWorkspaces_Empty(t *testing.T) {
 		t.Fatalf("workspaces len = %d, want 0", len(ws))
 	}
 }
+
+func TestGetSessionHistory_MarksCodexCommentarySeparately(t *testing.T) {
+	codexHome := t.TempDir()
+	sessionsDir := filepath.Join(codexHome, "sessions", "2026", "05", "20")
+	if err := os.MkdirAll(sessionsDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	path := filepath.Join(sessionsDir, "rollout-2026-05-20T10-00-00-sess-phase.jsonl")
+	content := `{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"sess-phase","cwd":"/workspace/f1-web"}}` + "\n" +
+		`{"timestamp":"2026-05-20T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}` + "\n" +
+		`{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"checking constraints"}]}}` + "\n" +
+		`{"timestamp":"2026-05-20T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"hi there"}]}}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+
+	entries, err := getSessionHistory("sess-phase", codexHome, 0)
+	if err != nil {
+		t.Fatalf("getSessionHistory: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("entries len = %d, want 3", len(entries))
+	}
+	if entries[0].Kind != "user" {
+		t.Fatalf("entries[0].Kind = %q, want user", entries[0].Kind)
+	}
+	if entries[1].Kind != "assistant_commentary" || entries[1].Phase != "commentary" {
+		t.Fatalf("entries[1] = %+v, want assistant_commentary/commentary", entries[1])
+	}
+	if entries[2].Kind != "assistant_final" || entries[2].Phase != "final_answer" {
+		t.Fatalf("entries[2] = %+v, want assistant_final/final_answer", entries[2])
+	}
+}

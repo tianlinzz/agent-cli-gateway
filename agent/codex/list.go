@@ -285,6 +285,7 @@ func getSessionHistory(sessionID, codexHome string, limit int) ([]core.HistoryEn
 		var item struct {
 			Role    string `json:"role"`
 			Type    string `json:"type"`
+			Phase   string `json:"phase"`
 			Text    string `json:"text"`
 			Content []struct {
 				Type string `json:"type"`
@@ -302,7 +303,7 @@ func getSessionHistory(sessionID, codexHome string, limit int) ([]core.HistoryEn
 			for _, c := range item.Content {
 				if c.Type == "input_text" && c.Text != "" && isUserPrompt(c.Text) {
 					entries = append(entries, core.HistoryEntry{
-						Role: "user", Content: c.Text, Timestamp: ts,
+						Role: "user", Kind: "user", Content: c.Text, Timestamp: ts,
 					})
 				}
 			}
@@ -310,7 +311,11 @@ func getSessionHistory(sessionID, codexHome string, limit int) ([]core.HistoryEn
 			for _, c := range item.Content {
 				if c.Type == "output_text" && c.Text != "" {
 					entries = append(entries, core.HistoryEntry{
-						Role: "assistant", Content: c.Text, Timestamp: ts,
+						Role:      "assistant",
+						Kind:      codexAssistantHistoryKind(item.Phase),
+						Phase:     item.Phase,
+						Content:   c.Text,
+						Timestamp: ts,
 					})
 				}
 			}
@@ -323,6 +328,17 @@ func getSessionHistory(sessionID, codexHome string, limit int) ([]core.HistoryEn
 		entries = entries[len(entries)-limit:]
 	}
 	return entries, nil
+}
+
+func codexAssistantHistoryKind(phase string) string {
+	switch phase {
+	case "", "final_answer":
+		return "assistant_final"
+	case "commentary":
+		return "assistant_commentary"
+	default:
+		return "assistant_" + phase
+	}
 }
 
 // patchSessionSource rewrites the session_meta line in a Codex JSONL transcript

@@ -200,8 +200,9 @@ curl -H "Authorization: Bearer $TOKEN" \
   "agent": "claudecode",
   "id": "a1b2c3",
   "entries": [
-    { "role": "user",      "content": "Fix the bug in main.go", "timestamp": 1750000000 },
-    { "role": "assistant", "content": "I'll start by reading…",  "timestamp": 1750000010 }
+    { "role": "user",      "kind": "user",                  "content": "Fix the bug in main.go", "timestamp": 1750000000 },
+    { "role": "assistant", "kind": "assistant_commentary",  "phase": "commentary",  "content": "I'll start by reading…",  "timestamp": 1750000010 },
+    { "role": "assistant", "kind": "assistant_final",       "phase": "final_answer", "content": "Fixed in main.go",        "timestamp": 1750000020 }
   ]
 }
 ```
@@ -550,5 +551,7 @@ interface(s) on that agent type — no changes to `server/` or `core/` are neede
 | Field | Type | Notes |
 |---|---|---|
 | `role` | string | `"user"` or `"assistant"` |
+| `kind` | string | Display classification, for example `"user"`, `"assistant_final"`, or `"assistant_commentary"` |
+| `phase` | string | Agent-native phase when available, for example Codex `"final_answer"` or `"commentary"` |
 | `content` | string | Text content of the turn |
 | `timestamp` | int64 | Unix seconds, omitted when unknown |

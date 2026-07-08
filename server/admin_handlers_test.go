@@ -29,17 +29,17 @@ type adminStubAgent struct {
 	resumeCmd   string // fixed ResumeCommand output; "" → still implemented, returns ""
 
 	// LiveConfigProvider state
-	liveCfg    core.LiveProviderConfig
+	liveCfg      core.LiveProviderConfig
 	liveReadErr  error
 	liveWriteErr error
 	writeCalls   []core.LiveProviderConfig
 
 	// McpConfigManager state
-	mcpServers    map[string]core.McpServerConfig
-	mcpListErr    error
-	mcpSaveErr    error
-	mcpDeleteErr  error
-	mcpSaveCalls  []struct {
+	mcpServers   map[string]core.McpServerConfig
+	mcpListErr   error
+	mcpSaveErr   error
+	mcpDeleteErr error
+	mcpSaveCalls []struct {
 		name string
 		cfg  core.McpServerConfig
 	}
@@ -178,8 +178,8 @@ func (a *adminStubAgent) ListSessionsInWorkDir(ctx context.Context, workDir stri
 // exercise the 501 Not Implemented path.
 type adminStubAgentBare struct{ name string }
 
-func (a *adminStubAgentBare) Name() string                                            { return a.name }
-func (a *adminStubAgentBare) Stop() error                                             { return nil }
+func (a *adminStubAgentBare) Name() string { return a.name }
+func (a *adminStubAgentBare) Stop() error  { return nil }
 func (a *adminStubAgentBare) StartSession(context.Context, string) (core.AgentSession, error) {
 	return nil, errors.New("not used")
 }
@@ -412,7 +412,13 @@ func TestHandleSessionHistory_OK(t *testing.T) {
 	agent := newAdminStubAgent("codex")
 	agent.history["sess-1"] = []core.HistoryEntry{
 		{Role: "user", Content: "hello", Timestamp: time.Unix(1750000000, 0)},
-		{Role: "assistant", Content: "hi there", Timestamp: time.Unix(1750000010, 0)},
+		{
+			Role:      "assistant",
+			Kind:      "assistant_commentary",
+			Phase:     "commentary",
+			Content:   "hi there",
+			Timestamp: time.Unix(1750000010, 0),
+		},
 	}
 	store := setupAdminStore(agent)
 	h := &AdminHandlers{Store: store}
@@ -438,6 +444,12 @@ func TestHandleSessionHistory_OK(t *testing.T) {
 	}
 	if resp.Entries[0].Timestamp != 1750000000 {
 		t.Errorf("entries[0].timestamp = %d, want 1750000000", resp.Entries[0].Timestamp)
+	}
+	if resp.Entries[0].Kind != "user" {
+		t.Errorf("entries[0].kind = %q, want user", resp.Entries[0].Kind)
+	}
+	if resp.Entries[1].Kind != "assistant_commentary" || resp.Entries[1].Phase != "commentary" {
+		t.Errorf("entries[1] = %+v, want assistant_commentary/commentary", resp.Entries[1])
 	}
 }
 
@@ -467,6 +479,9 @@ func TestHandleSessionHistory_LimitQuery(t *testing.T) {
 	}
 	if resp.Entries[0].Content != "reply1" {
 		t.Errorf("entries[0].content = %q, want reply1", resp.Entries[0].Content)
+	}
+	if resp.Entries[0].Kind != "assistant_final" {
+		t.Errorf("entries[0].kind = %q, want assistant_final", resp.Entries[0].Kind)
 	}
 }
 
