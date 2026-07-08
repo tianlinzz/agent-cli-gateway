@@ -74,6 +74,12 @@ func NewServer(cfg config.GatewayConfig, store *SessionStore) *Server {
 	mux.Handle("DELETE /config/agents/{agent}/mcp/{name}",
 		chain(http.HandlerFunc(admin.HandleDeleteMcpServer), s.withAuth))
 
+	// Management endpoints (PR4: raw config files — cc-switch whole-file editing).
+	mux.Handle("GET /config/agents/{agent}/files",
+		chain(http.HandlerFunc(admin.HandleListLiveConfigFiles), s.withAuth))
+	mux.Handle("PUT /config/agents/{agent}/files/{name}",
+		chain(http.HandlerFunc(admin.HandleWriteLiveConfigFile), s.withAuth))
+
 	s.server = &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.Port),
 		Handler: s.withCORS(mux),

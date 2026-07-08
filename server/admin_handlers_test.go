@@ -45,6 +45,15 @@ type adminStubAgent struct {
 	}
 	mcpDeleteCalls []string
 
+	// LiveConfigFileProvider state
+	configFiles   []core.LiveConfigFile
+	fileListErr   error
+	fileWriteErr  error
+	fileWriteCalls []struct {
+		name    string
+		content []byte
+	}
+
 	// WorkspaceLister / SessionListerByWorkDir state
 	workspaces         []core.AgentWorkspaceInfo
 	workspaceListErr   error
@@ -153,6 +162,35 @@ func (a *adminStubAgent) DeleteMcpServer(ctx context.Context, name string) error
 	if a.mcpServers != nil {
 		delete(a.mcpServers, name)
 	}
+	return nil
+}
+
+// Optional: LiveConfigFileProvider
+func (a *adminStubAgent) ListLiveConfigFiles(ctx context.Context) ([]core.LiveConfigFile, error) {
+	if a.fileListErr != nil {
+		return nil, a.fileListErr
+	}
+	// Return a copy so tests can mutate without side effects on the stub.
+	out := make([]core.LiveConfigFile, len(a.configFiles))
+	copy(out, a.configFiles)
+	return out, nil
+}
+func (a *adminStubAgent) WriteLiveConfigFile(ctx context.Context, name string, content []byte) error {
+	a.fileWriteCalls = append(a.fileWriteCalls, struct {
+		name    string
+		content []byte
+	}{name, content})
+	if a.fileWriteErr != nil {
+		return a.fileWriteErr
+	}
+	// Reflect the write back into configFiles so the handler's read-back sees it.
+	for i, f := range a.configFiles {
+		if f.Name == name {
+			a.configFiles[i].Content = string(content)
+			return nil
+		}
+	}
+	a.configFiles = append(a.configFiles, core.LiveConfigFile{Name: name, Content: string(content)})
 	return nil
 }
 
@@ -983,7 +1021,153 @@ func TestIsValidationError(t *testing.T) {
 	if !isValidationError(errors.New("mcp server name is required")) {
 		t.Error("expected true for 'is required'")
 	}
+	if !isValidationError(errors.New("codex: invalid toml for config.toml: bad key")) {
+		t.Error("expected true for 'invalid toml'")
+	}
+	if !isValidationError(errors.New("claudecode: invalid json for settings.json: unexpected EOF")) {
+		t.Error("expected true for 'invalid json'")
+	}
 	if isValidationError(errors.New("disk full")) {
 		t.Error("expected false for unrelated error")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Config files (GET /config/agents/{agent}/files, PUT .../files/{name})
+// -----------------------------------------------------------------------------
+
+func TestHandleListLiveConfigFiles_OK(t *testing.T) {
+	agent := newAdminStubAgent("codex")
+	agent.configFiles = []core.LiveConfigFile{
+		{Name: "config.toml", Path: "/home/.codex/config.toml", Content: "model = \"x\"\n"},
+		{Name: "auth.json", Path: "/home/.codex/auth.json", Content: "{}"},
+	}
+	h := &AdminHandlers{Store: setupAdminStore(agent)}
+
+	req := httptest.NewRequest(http.MethodGet, "/config/agents/codex/files", nil)
+	req.SetPathValue("agent", "codex")
+	w := httptest.NewRecorder()
+	h.HandleListLiveConfigFiles(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body: %s", w.Code, w.Body.String())
+	}
+	var resp LiveConfigFileListResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Agent != "codex" {
+		t.Errorf("agent = %q", resp.Agent)
+	}
+	if len(resp.Files) != 2 {
+		t.Fatalf("files len = %d, want 2", len(resp.Files))
+	}
+	if resp.Files[0].Name != "config.toml" || resp.Files[0].Content != "model = \"x\"\n" {
+		t.Errorf("files[0] = %+v", resp.Files[0])
+	}
+}
+
+func TestHandleListLiveConfigFiles_NotImplemented(t *testing.T) {
+	bare := &adminStubAgentBare{name: "bare"}
+	h := &AdminHandlers{Store: setupAdminStore(bare)}
+	req := httptest.NewRequest(http.MethodGet, "/config/agents/bare/files", nil)
+	req.SetPathValue("agent", "bare")
+	w := httptest.NewRecorder()
+	h.HandleListLiveConfigFiles(w, req)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501, got %d", w.Code)
+	}
+}
+
+func TestHandleListLiveConfigFiles_UnknownAgent(t *testing.T) {
+	h := &AdminHandlers{Store: setupAdminStore(newAdminStubAgent("codex"))}
+	req := httptest.NewRequest(http.MethodGet, "/config/agents/ghost/files", nil)
+	req.SetPathValue("agent", "ghost")
+	w := httptest.NewRecorder()
+	h.HandleListLiveConfigFiles(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestHandleWriteLiveConfigFile_OK(t *testing.T) {
+	agent := newAdminStubAgent("codex")
+	agent.configFiles = []core.LiveConfigFile{
+		{Name: "config.toml", Path: "/home/.codex/config.toml", Content: ""},
+	}
+	h := &AdminHandlers{Store: setupAdminStore(agent)}
+
+	body := `{"content":"model = \"deepseek/v4\"\n"}`
+	req := httptest.NewRequest(http.MethodPut, "/config/agents/codex/files/config.toml", strings.NewReader(body))
+	req.SetPathValue("agent", "codex")
+	req.SetPathValue("name", "config.toml")
+	w := httptest.NewRecorder()
+	h.HandleWriteLiveConfigFile(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body: %s", w.Code, w.Body.String())
+	}
+	if len(agent.fileWriteCalls) != 1 || agent.fileWriteCalls[0].name != "config.toml" {
+		t.Errorf("writeCalls = %+v", agent.fileWriteCalls)
+	}
+	// Response echoes back the persisted content (read-back).
+	var resp LiveConfigFileResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Name != "config.toml" || resp.Content != `model = "deepseek/v4"`+"\n" {
+		t.Errorf("response = %+v", resp)
+	}
+}
+
+func TestHandleWriteLiveConfigFile_InvalidJSON(t *testing.T) {
+	h := &AdminHandlers{Store: setupAdminStore(newAdminStubAgent("codex"))}
+	req := httptest.NewRequest(http.MethodPut, "/config/agents/codex/files/config.toml", strings.NewReader("{bad"))
+	req.SetPathValue("agent", "codex")
+	req.SetPathValue("name", "config.toml")
+	w := httptest.NewRecorder()
+	h.HandleWriteLiveConfigFile(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestHandleWriteLiveConfigFile_AgentError(t *testing.T) {
+	agent := newAdminStubAgent("codex")
+	agent.fileWriteErr = errors.New("disk full")
+	h := &AdminHandlers{Store: setupAdminStore(agent)}
+
+	req := httptest.NewRequest(http.MethodPut, "/config/agents/codex/files/config.toml", strings.NewReader(`{"content":"x"}`))
+	req.SetPathValue("agent", "codex")
+	req.SetPathValue("name", "config.toml")
+	w := httptest.NewRecorder()
+	h.HandleWriteLiveConfigFile(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for io error, got %d", w.Code)
+	}
+}
+
+func TestHandleWriteLiveConfigFile_NotImplemented(t *testing.T) {
+	bare := &adminStubAgentBare{name: "bare"}
+	h := &AdminHandlers{Store: setupAdminStore(bare)}
+	req := httptest.NewRequest(http.MethodPut, "/config/agents/bare/files/settings.json", strings.NewReader(`{"content":"{}"}`))
+	req.SetPathValue("agent", "bare")
+	req.SetPathValue("name", "settings.json")
+	w := httptest.NewRecorder()
+	h.HandleWriteLiveConfigFile(w, req)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501, got %d", w.Code)
+	}
+}
+
+func TestHandleWriteLiveConfigFile_UnknownAgent(t *testing.T) {
+	h := &AdminHandlers{Store: setupAdminStore(newAdminStubAgent("codex"))}
+	req := httptest.NewRequest(http.MethodPut, "/config/agents/ghost/files/config.toml", strings.NewReader(`{"content":"x"}`))
+	req.SetPathValue("agent", "ghost")
+	req.SetPathValue("name", "config.toml")
+	w := httptest.NewRecorder()
+	h.HandleWriteLiveConfigFile(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
 	}
 }

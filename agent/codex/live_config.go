@@ -282,3 +282,103 @@ func (a *Agent) WriteLiveProvider(_ context.Context, cfg core.LiveProviderConfig
 	}
 	return nil
 }
+
+// codexLiveConfigFiles is the allowlist of editable config files exposed for
+// whole-file editing. Each entry pairs a caller-facing name with its on-disk
+// filename (relative to $CODEX_HOME) and the permissions to write it with.
+// auth.json holds OPENAI_API_KEY (secret → 0o600); config.toml holds model /
+// provider / advanced tuning (0o644). Keeping this as a table makes adding a
+// future file (e.g. instructions.md) a one-line change.
+var codexLiveConfigFiles = []struct {
+	name string
+	file string
+	perm os.FileMode
+}{
+	{"config.toml", "config.toml", 0o644},
+	{"auth.json", "auth.json", 0o600},
+}
+
+// ListLiveConfigFiles returns every editable codex config file with its current
+// on-disk content. A missing file is surfaced with an empty Content (not an
+// error), so a caller can seed a fresh install. Implements
+// core.LiveConfigFileProvider.
+func (a *Agent) ListLiveConfigFiles(_ context.Context) ([]core.LiveConfigFile, error) {
+	home, err := resolveCodexHomeForConfig(a.codexHome)
+	if err != nil {
+		return nil, fmt.Errorf("codex: resolve codex home: %w", err)
+	}
+	out := make([]core.LiveConfigFile, 0, len(codexLiveConfigFiles))
+	for _, f := range codexLiveConfigFiles {
+		path := filepath.Join(home, f.file)
+		content, _ := os.ReadFile(path) // missing → empty content, not an error
+		out = append(out, core.LiveConfigFile{
+			Name:    f.name,
+			Path:    path,
+			Content: string(content),
+		})
+	}
+	return out, nil
+}
+
+// WriteLiveConfigFile overwrites the named config file's entire content. The
+// content is probe-parsed (TOML for config.toml, JSON for auth.json) before it
+// touches the disk, so a syntactically broken file never reaches the CLI. Unlike
+// WriteLiveProvider there is no two-file rollback — a raw write is a single-file
+// operation and the caller is responsible for cross-file consistency (matching
+// cc-switch's direct file-editing behaviour). Implements
+// core.LiveConfigFileProvider.
+func (a *Agent) WriteLiveConfigFile(_ context.Context, name string, content []byte) error {
+	home, err := resolveCodexHomeForConfig(a.codexHome)
+	if err != nil {
+		return fmt.Errorf("codex: resolve codex home: %w", err)
+	}
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		return fmt.Errorf("codex: mkdir codex home: %w", err)
+	}
+
+	var entry struct {
+		name string
+		file string
+		perm os.FileMode
+	}
+	found := false
+	for _, f := range codexLiveConfigFiles {
+		if f.name == name {
+			entry.name, entry.file, entry.perm = f.name, f.file, f.perm
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("codex: config file %q not found", name)
+	}
+
+	// Probe-parse before persisting so we never leave a broken file for the CLI.
+	switch name {
+	case "config.toml":
+		var probe map[string]any
+		if err := toml.Unmarshal(content, &probe); err != nil {
+			return fmt.Errorf("codex: invalid toml for %s: %w", name, err)
+		}
+	case "auth.json":
+		// Empty content is allowed (clears the file); only validate non-empty
+		// bytes so a caller can blank out a removed credential file.
+		if len(bytes.TrimSpace(content)) > 0 {
+			var probe map[string]any
+			if err := json.Unmarshal(content, &probe); err != nil {
+				return fmt.Errorf("codex: invalid json for %s: %w", name, err)
+			}
+		}
+	}
+
+	path := filepath.Join(home, entry.file)
+	data := content
+	if entry.file == "auth.json" {
+		// Match WriteLiveProvider: auth.json gets a trailing newline + 0o600.
+		data = append(data, '\n')
+	}
+	if err := core.AtomicWriteFile(path, data, entry.perm); err != nil {
+		return fmt.Errorf("codex: write %s: %w", name, err)
+	}
+	return nil
+}

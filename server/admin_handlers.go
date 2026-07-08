@@ -405,13 +405,106 @@ func (h *AdminHandlers) HandleDeleteMcpServer(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, map[string]any{"agent": agentName, "name": name, "deleted": true})
 }
 
+// -----------------------------------------------------------------------------
+// Config files (GET /config/agents/{agent}/files, PUT .../files/{name})
+//
+// Whole-file editing of the agent backing CLI's raw config (e.g. codex
+// config.toml, claudecode settings.json). Unlike the provider endpoint (which
+// writes only the apiKey/baseUrl/model triple), this overwrites the entire file
+// so every CLI-supported field — model_reasoning_effort, web_search, [features],
+// permissions, hooks, … — can be managed over HTTP (cc-switch whole-file mode).
+// -----------------------------------------------------------------------------
+
+// HandleListLiveConfigFiles responds to GET /config/agents/{agent}/files.
+func (h *AdminHandlers) HandleListLiveConfigFiles(w http.ResponseWriter, r *http.Request) {
+	agentName := r.PathValue("agent")
+	agent, ok := h.Store.Agent(agentName)
+	if !ok {
+		writeError(w, http.StatusNotFound, "agent not found: "+agentName)
+		return
+	}
+	fp, ok := agent.(core.LiveConfigFileProvider)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "agent does not expose config files: "+agentName)
+		return
+	}
+	files, err := fp.ListLiveConfigFiles(r.Context())
+	if err != nil {
+		slog.Warn("list config files failed", "agent", agentName, "error", err)
+		writeError(w, http.StatusInternalServerError, "list config files failed: "+err.Error())
+		return
+	}
+	out := make([]LiveConfigFileResponse, 0, len(files))
+	for _, f := range files {
+		out = append(out, toLiveConfigFileResponse(f))
+	}
+	writeJSON(w, http.StatusOK, LiveConfigFileListResponse{Agent: agentName, Files: out})
+}
+
+// HandleWriteLiveConfigFile responds to PUT /config/agents/{agent}/files/{name}.
+// The request body is the full file content; the named file is overwritten
+// verbatim (not merged). The agent validates + probe-parses before persisting.
+func (h *AdminHandlers) HandleWriteLiveConfigFile(w http.ResponseWriter, r *http.Request) {
+	agentName := r.PathValue("agent")
+	name := r.PathValue("name")
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "config file name is required in the path")
+		return
+	}
+	agent, ok := h.Store.Agent(agentName)
+	if !ok {
+		writeError(w, http.StatusNotFound, "agent not found: "+agentName)
+		return
+	}
+	fp, ok := agent.(core.LiveConfigFileProvider)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "agent does not expose config files: "+agentName)
+		return
+	}
+
+	var req LiveConfigFileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+
+	if err := fp.WriteLiveConfigFile(r.Context(), name, []byte(req.Content)); err != nil {
+		slog.Warn("write config file failed", "agent", agentName, "name", name, "error", err)
+		status := http.StatusInternalServerError
+		switch {
+		case isNotFound(err):
+			status = http.StatusNotFound
+		case isValidationError(err):
+			status = http.StatusBadRequest
+		}
+		writeError(w, status, "write config file failed: "+err.Error())
+		return
+	}
+
+	// Read back the canonical on-disk content so the caller sees what persisted.
+	files, err := fp.ListLiveConfigFiles(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"agent": agentName, "name": name, "ok": true})
+		return
+	}
+	for _, f := range files {
+		if f.Name == name {
+			writeJSON(w, http.StatusOK, toLiveConfigFileResponse(f))
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"agent": agentName, "name": name, "ok": true})
+}
+
 // isValidationError distinguishes agent-side validation errors (we sent back
-// messages like "stdio mcp server requires a command") from real I/O failures,
-// so the handler can map them to 400 instead of 500.
+// messages like "stdio mcp server requires a command", or a TOML/JSON parse
+// failure from a raw config-file write) from real I/O failures, so the handler
+// can map them to 400 instead of 500.
 func isValidationError(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "requires") || strings.Contains(msg, "is required")
+	return strings.Contains(msg, "requires") || strings.Contains(msg, "is required") ||
+		strings.Contains(msg, "invalid toml") || strings.Contains(msg, "invalid json")
 }

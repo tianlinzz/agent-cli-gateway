@@ -94,6 +94,34 @@ func toMcpServerResponse(agent, name string, c core.McpServerConfig) McpServerRe
 	}
 }
 
+// LiveConfigFileRequest is the body of PUT /config/agents/{agent}/files/{name}.
+// The entire file is overwritten with Content (not merged); empty Content clears
+// the file.
+type LiveConfigFileRequest struct {
+	Content string `json:"content"`
+}
+
+// LiveConfigFileResponse is one editable file in GET responses / PUT echoes.
+type LiveConfigFileResponse struct {
+	Name    string `json:"name"`
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+// LiveConfigFileListResponse is the body of GET /config/agents/{agent}/files.
+type LiveConfigFileListResponse struct {
+	Agent string                   `json:"agent"`
+	Files []LiveConfigFileResponse `json:"files"`
+}
+
+func toLiveConfigFileResponse(f core.LiveConfigFile) LiveConfigFileResponse {
+	return LiveConfigFileResponse{
+		Name:    f.Name,
+		Path:    f.Path,
+		Content: f.Content,
+	}
+}
+
 // SessionListItem is one entry in the GET /sessions response.
 // Field naming follows cc-switch's SessionMeta (camelCase JSON, Unix-second
 // timestamps) so that downstream tooling can reuse the same shape.

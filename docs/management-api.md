@@ -35,6 +35,9 @@ session API. They are safe to call while sessions are running.
   - [List MCP servers](#list-mcp-servers)
   - [Save an MCP server](#save-an-mcp-server)
   - [Delete an MCP server](#delete-an-mcp-server)
+- [Config Files](#config-files)
+  - [List config files](#list-config-files)
+  - [Write a config file](#write-a-config-file)
 - [Agent capability matrix](#agent-capability-matrix)
 - [Field reference](#field-reference)
 
@@ -483,6 +486,111 @@ dropped.
 
 ---
 
+## Config Files
+
+Edit the backing CLI's **raw config files** in their entirety (cc-switch
+whole-file mode). Unlike the [provider endpoint](#write-provider) — which writes
+only the basic triple (`apiKey`/`baseUrl`/`model`) and re-encodes the file —
+this overwrites the whole file verbatim, so every CLI-supported field
+(`model_reasoning_effort`, `web_search`, `[features]`, `permissions`, `hooks`,
+…) and the original formatting/comments are preserved.
+
+Each agent exposes a fixed allowlist of editable files; you cannot write
+arbitrary paths.
+
+| Agent | File | On-disk path | Permissions |
+|---|---|---|---|
+| `codex` | `config.toml` | `$CODEX_HOME/config.toml` | `0o644` |
+| `codex` | `auth.json` | `$CODEX_HOME/auth.json` | `0o600` |
+| `claudecode` | `settings.json` | `~/.claude/settings.json` | `0o644` |
+
+> **Validation.** The agent probe-parses the content (TOML for `config.toml`,
+> JSON for `auth.json`/`settings.json`) *before* writing to disk, so a
+> syntactically broken file never reaches the CLI. A parse failure returns
+> `400`. Empty content is allowed (clears the file).
+
+---
+
+### List config files
+
+```
+GET /config/agents/{agent}/files
+```
+
+Returns every editable file with its current on-disk content. A file that does
+not exist yet is surfaced with an empty `content` (not an error), so a caller
+can seed a fresh install.
+
+**Example**
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:4096/config/agents/codex/files
+```
+
+**200**
+
+```json
+{
+  "agent": "codex",
+  "files": [
+    { "name": "config.toml", "path": "/home/.codex/config.toml", "content": "model = \"gpt-5\"\n" },
+    { "name": "auth.json",   "path": "/home/.codex/auth.json",   "content": "{\"OPENAI_API_KEY\":\"sk-...\"}\n" }
+  ]
+}
+```
+
+**Errors**
+
+| Status | When |
+|---|---|
+| `404` | unknown agent |
+| `500` | I/O failure |
+| `501` | agent does not expose config files |
+
+---
+
+### Write a config file
+
+```
+PUT /config/agents/{agent}/files/{name}
+Content-Type: application/json
+```
+
+**Body**
+
+```jsonc
+{
+  "content": "<entire file contents as a string>"
+}
+```
+
+The named file is **overwritten verbatim** with `content` — not merged with the
+existing file. Use [List config files](#list-config-files) first if you need to
+preserve existing fields.
+
+**Example**
+
+```bash
+curl -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  http://localhost:4096/config/agents/codex/files/config.toml \
+  -d '{"content":"model = \"deepseek/deepseek-v4-pro\"\nmodel_provider = \"xxx\"\nmodel_reasoning_effort = \"high\"\nweb_search = \"disabled\"\n\n[model_providers.xxx]\nname = \"xxx\"\nbase_url = \"https://xxx/v1\"\n"}'
+```
+
+**200 —** echoes back the persisted file (same shape as one entry in the GET
+response).
+
+**Errors**
+
+| Status | When |
+|---|---|
+| `400` | malformed JSON body, or content failed TOML/JSON parse |
+| `404` | unknown agent, or unknown file name |
+| `500` | I/O failure (disk full, permission denied, …) |
+| `501` | agent does not expose config files |
+
+---
+
 ## Agent capability matrix
 
 Not every agent implements every operation. Capability is detected at runtime;
@@ -498,6 +606,7 @@ calling an unsupported one returns `501 Not Implemented`.
 | Resume info | `ResumeCommander` | ✅ | ✅ | optional |
 | Provider live config | `LiveConfigProvider` | ✅ | ✅ | optional |
 | MCP config | `McpConfigManager` | ✅ | ✅ | optional |
+| Config files | `LiveConfigFileProvider` | ✅ | ✅ | optional |
 
 To add support for another agent (e.g. `gemini`), implement the relevant
 interface(s) on that agent type — no changes to `server/` or `core/` are needed.
@@ -524,6 +633,14 @@ interface(s) on that agent type — no changes to `server/` or `core/` are neede
 | `args` | string[] | Optional, stdio only |
 | `env` | `map[string]string` | Optional, stdio only |
 | `url` | string | Required for sse/http |
+
+### `LiveConfigFileResponse`
+
+| Field | Type | Notes |
+|---|---|---|
+| `name` | string | Caller-facing file key from the agent's allowlist (e.g. `config.toml`, `settings.json`) |
+| `path` | string | Absolute on-disk location (display only) |
+| `content` | string | Raw file text; empty when the file does not exist yet |
 
 ### `SessionListItem`
 

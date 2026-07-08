@@ -1,6 +1,7 @@
 package claudecode
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -21,10 +22,10 @@ const (
 	settingsEnvModel   = "ANTHROPIC_MODEL"
 )
 
-// claudeSettingsPath returns the path to ~/.claude/settings.json. The directory
-// is created on demand so a fresh install (no settings.json yet) can still be
-// written by the management API.
-func claudeSettingsPath() (string, error) {
+// claudeConfigDir returns the path to ~/.claude, creating it on demand so a
+// fresh install (no settings.json yet) can still be written by the management
+// API.
+func claudeConfigDir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("claudecode: cannot determine home dir: %w", err)
@@ -32,6 +33,17 @@ func claudeSettingsPath() (string, error) {
 	dir := filepath.Join(home, ".claude")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("claudecode: mkdir %s: %w", dir, err)
+	}
+	return dir, nil
+}
+
+// claudeSettingsPath returns the path to ~/.claude/settings.json. The directory
+// is created on demand so a fresh install (no settings.json yet) can still be
+// written by the management API.
+func claudeSettingsPath() (string, error) {
+	dir, err := claudeConfigDir()
+	if err != nil {
+		return "", err
 	}
 	return filepath.Join(dir, "settings.json"), nil
 }
@@ -252,4 +264,81 @@ func (a *Agent) modelsFromLiveConfig() []core.ModelOption {
 		return nil
 	}
 	return aliasModelsFromEnv(cfg.Env)
+}
+
+// claudeLiveConfigFiles is the allowlist of editable config files exposed for
+// whole-file editing. Currently just settings.json (~/.claude/settings.json),
+// written at 0o644 like WriteLiveProvider.
+var claudeLiveConfigFiles = []struct {
+	name string
+	file string
+	perm os.FileMode
+}{
+	{"settings.json", "settings.json", 0o644},
+}
+
+// ListLiveConfigFiles returns every editable Claude Code config file with its
+// current on-disk content. A missing file is surfaced with an empty Content
+// (not an error), so a caller can seed a fresh install. Implements
+// core.LiveConfigFileProvider.
+func (a *Agent) ListLiveConfigFiles(_ context.Context) ([]core.LiveConfigFile, error) {
+	dir, err := claudeConfigDir()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]core.LiveConfigFile, 0, len(claudeLiveConfigFiles))
+	for _, f := range claudeLiveConfigFiles {
+		path := filepath.Join(dir, f.file)
+		content, _ := os.ReadFile(path) // missing → empty content, not an error
+		out = append(out, core.LiveConfigFile{
+			Name:    f.name,
+			Path:    path,
+			Content: string(content),
+		})
+	}
+	return out, nil
+}
+
+// WriteLiveConfigFile overwrites the named config file's entire content. The
+// content is probe-parsed as JSON before it touches the disk. Unlike
+// WriteLiveProvider, the bytes are written verbatim — key order, comments (if
+// any survive jsonc parsing) and formatting are preserved, which is the whole
+// point of the raw-file endpoint. Implements core.LiveConfigFileProvider.
+func (a *Agent) WriteLiveConfigFile(_ context.Context, name string, content []byte) error {
+	dir, err := claudeConfigDir()
+	if err != nil {
+		return err
+	}
+
+	var entry struct {
+		name string
+		file string
+		perm os.FileMode
+	}
+	found := false
+	for _, f := range claudeLiveConfigFiles {
+		if f.name == name {
+			entry.name, entry.file, entry.perm = f.name, f.file, f.perm
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("claudecode: config file %q not found", name)
+	}
+
+	// Probe-parse as JSON before persisting so a broken settings.json never
+	// reaches the CLI. Empty content is allowed (clears the file).
+	if len(bytes.TrimSpace(content)) > 0 {
+		var probe map[string]any
+		if err := json.Unmarshal(content, &probe); err != nil {
+			return fmt.Errorf("claudecode: invalid json for %s: %w", name, err)
+		}
+	}
+
+	path := filepath.Join(dir, entry.file)
+	if err := core.AtomicWriteFile(path, content, entry.perm); err != nil {
+		return fmt.Errorf("claudecode: write %s: %w", name, err)
+	}
+	return nil
 }

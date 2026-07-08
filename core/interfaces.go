@@ -610,6 +610,39 @@ type McpConfigManager interface {
 	DeleteMcpServer(ctx context.Context, name string) error
 }
 
+// LiveConfigFile describes one editable CLI config file (e.g. config.toml,
+// settings.json) exposed for whole-file editing. Name is the caller-facing key
+// (an entry from the agent's allowlist); Path is the absolute on-disk location
+// (display only); Content is the raw file text.
+type LiveConfigFile struct {
+	Name    string `json:"name"`
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+// LiveConfigFileProvider is an optional interface for agents whose backing CLI
+// stores config in writable text files. Unlike LiveConfigProvider (which writes
+// only the provider triple — apiKey/baseUrl/model), this exposes the raw file
+// contents, letting the management API manage every field the CLI supports
+// (cc-switch whole-file editing).
+//
+// Implementations must:
+//   - constrain writes to a per-agent allowlist of filenames (reject unknown
+//     names so callers cannot write arbitrary paths);
+//   - probe-parse the content (TOML/JSON as appropriate) before persisting so a
+//     syntactically broken file never reaches the CLI;
+//   - be safe to call concurrently with session creation.
+type LiveConfigFileProvider interface {
+	// ListLiveConfigFiles returns every editable file with its current on-disk
+	// content. A missing file is surfaced with an empty Content (not an error),
+	// so callers can seed a fresh install.
+	ListLiveConfigFiles(ctx context.Context) ([]LiveConfigFile, error)
+	// WriteLiveConfigFile overwrites the named file's entire content. Unknown
+	// names should return a "not found" error; unparseable content should return
+	// a validation error.
+	WriteLiveConfigFile(ctx context.Context, name string, content []byte) error
+}
+
 // ResumeCommander returns the native CLI resume command for a given session ID,
 // used for display/reference in management UIs (e.g. "claude --resume <id>").
 // The gateway itself never shells out to this — resumption is driven by

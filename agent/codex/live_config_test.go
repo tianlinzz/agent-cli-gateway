@@ -262,3 +262,137 @@ func TestCodex_WriteLiveProvider_RollsBackAuthWhenConfigWriteFails(t *testing.T)
 func contains(s, sub string) bool {
 	return bytes.Contains([]byte(s), []byte(sub))
 }
+
+// -----------------------------------------------------------------------------
+// LiveConfigFileProvider (raw whole-file editing)
+// -----------------------------------------------------------------------------
+
+func TestCodex_ListLiveConfigFiles_IncludesBothFiles(t *testing.T) {
+	withTempCodexHome(t, func(home string, a *Agent) {
+		writeFile(t, filepath.Join(home, "config.toml"), `model = "deepseek-v4"`)
+		writeFile(t, filepath.Join(home, "auth.json"), `{"OPENAI_API_KEY":"k"}`)
+
+		files, err := a.ListLiveConfigFiles(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(files) != 2 {
+			t.Fatalf("files len = %d, want 2", len(files))
+		}
+		byName := map[string]core.LiveConfigFile{}
+		for _, f := range files {
+			byName[f.Name] = f
+		}
+		if byName["config.toml"].Content != `model = "deepseek-v4"` {
+			t.Errorf("config.toml content = %q", byName["config.toml"].Content)
+		}
+		if byName["auth.json"].Content != `{"OPENAI_API_KEY":"k"}` {
+			t.Errorf("auth.json content = %q", byName["auth.json"].Content)
+		}
+	})
+}
+
+func TestCodex_ListLiveConfigFiles_MissingFileIsEmptyNotError(t *testing.T) {
+	withTempCodexHome(t, func(home string, a *Agent) {
+		// No files seeded — both should surface with empty content.
+		files, err := a.ListLiveConfigFiles(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range files {
+			if f.Content != "" {
+				t.Errorf("%s content should be empty, got %q", f.Name, f.Content)
+			}
+		}
+	})
+}
+
+func TestCodex_WriteLiveConfigFile_ConfigToml_RoundTrip(t *testing.T) {
+	withTempCodexHome(t, func(home string, a *Agent) {
+		// Full config with advanced fields the provider triple can't express.
+		content := `model = "deepseek/deepseek-v4-pro"
+model_provider = "mify"
+model_reasoning_effort = "high"
+web_search = "disabled"
+
+[model_providers.mify]
+name = "mify"
+base_url = "https://api.llm.mioffice.cn/v1"
+`
+		if err := a.WriteLiveConfigFile(context.Background(), "config.toml", []byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		got := readFileOrEmpty(t, filepath.Join(home, "config.toml"))
+		if got != content {
+			t.Errorf("config.toml not written verbatim.\nwant:\n%s\ngot:\n%s", content, got)
+		}
+		// Round-trip: list reflects what was written.
+		files, _ := a.ListLiveConfigFiles(context.Background())
+		for _, f := range files {
+			if f.Name == "config.toml" && !contains(f.Content, "model_reasoning_effort") {
+				t.Errorf("advanced field lost in round-trip: %s", f.Content)
+			}
+		}
+	})
+}
+
+func TestCodex_WriteLiveConfigFile_AuthJSON_RoundTrip(t *testing.T) {
+	withTempCodexHome(t, func(home string, a *Agent) {
+		content := `{"OPENAI_API_KEY":"sk-test","auth_mode":"apikey"}`
+		if err := a.WriteLiveConfigFile(context.Background(), "auth.json", []byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		got := readFileOrEmpty(t, filepath.Join(home, "auth.json"))
+		// auth.json gets a trailing newline appended (matches WriteLiveProvider).
+		if got != content+"\n" {
+			t.Errorf("auth.json = %q, want %q+newline", got, content)
+		}
+	})
+}
+
+func TestCodex_WriteLiveConfigFile_InvalidTomlRejected(t *testing.T) {
+	withTempCodexHome(t, func(home string, a *Agent) {
+		// Syntactically broken TOML must not reach disk.
+		err := a.WriteLiveConfigFile(context.Background(), "config.toml", []byte("not = = valid"))
+		if err == nil {
+			t.Fatal("expected error for invalid TOML")
+		}
+		// Disk untouched (file should not exist).
+		if _, err := os.Stat(filepath.Join(home, "config.toml")); !os.IsNotExist(err) {
+			t.Errorf("broken TOML was persisted to disk")
+		}
+	})
+}
+
+func TestCodex_WriteLiveConfigFile_InvalidJSONRejected(t *testing.T) {
+	withTempCodexHome(t, func(home string, a *Agent) {
+		err := a.WriteLiveConfigFile(context.Background(), "auth.json", []byte("{not json"))
+		if err == nil {
+			t.Fatal("expected error for invalid JSON")
+		}
+		if _, err := os.Stat(filepath.Join(home, "auth.json")); !os.IsNotExist(err) {
+			t.Errorf("broken JSON was persisted to disk")
+		}
+	})
+}
+
+func TestCodex_WriteLiveConfigFile_UnknownFileRejected(t *testing.T) {
+	withTempCodexHome(t, func(home string, a *Agent) {
+		err := a.WriteLiveConfigFile(context.Background(), "instructions.md", []byte("hi"))
+		if err == nil {
+			t.Fatal("expected error for unknown file name")
+		}
+		if !contains(err.Error(), "not found") {
+			t.Errorf("error should contain 'not found', got: %v", err)
+		}
+	})
+}
+
+func TestCodex_WriteLiveConfigFile_EmptyAuthJSONAllowed(t *testing.T) {
+	withTempCodexHome(t, func(home string, a *Agent) {
+		// Empty content clears auth.json (e.g. removing credentials).
+		if err := a.WriteLiveConfigFile(context.Background(), "auth.json", []byte("")); err != nil {
+			t.Fatalf("empty auth.json should be allowed: %v", err)
+		}
+	})
+}

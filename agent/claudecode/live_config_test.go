@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/tianlinzz/agent-cli-gateway/core"
@@ -273,4 +274,107 @@ func TestClaude_marshalSorted_HasStableKeyOrder(t *testing.T) {
 	if string(outA) != string(outB) {
 		t.Errorf("marshalSorted not stable:\n--- A ---\n%s\n--- B ---\n%s", outA, outB)
 	}
+}
+
+// -----------------------------------------------------------------------------
+// LiveConfigFileProvider (raw whole-file editing)
+// -----------------------------------------------------------------------------
+
+func TestClaude_ListLiveConfigFiles_IncludesSettings(t *testing.T) {
+	withTempHome(t, func(homeDir string) {
+		writeSettings(t, homeDir, map[string]any{
+			"env": map[string]any{"ANTHROPIC_API_KEY": "sk-test"},
+		})
+		a := &Agent{}
+		files, err := a.ListLiveConfigFiles(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(files) != 1 || files[0].Name != "settings.json" {
+			t.Fatalf("files = %+v", files)
+		}
+		if !strings.Contains(files[0].Content, "sk-test") {
+			t.Errorf("settings.json content = %q", files[0].Content)
+		}
+	})
+}
+
+func TestClaude_ListLiveConfigFiles_MissingFileIsEmptyNotError(t *testing.T) {
+	withTempHome(t, func(homeDir string) {
+		a := &Agent{}
+		files, err := a.ListLiveConfigFiles(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(files) != 1 {
+			t.Fatalf("files len = %d, want 1", len(files))
+		}
+		if files[0].Content != "" {
+			t.Errorf("missing settings.json should have empty content, got %q", files[0].Content)
+		}
+	})
+}
+
+func TestClaude_WriteLiveConfigFile_RoundTrip(t *testing.T) {
+	withTempHome(t, func(homeDir string) {
+		a := &Agent{}
+		// Full settings with permissions + hooks + env — fields the provider
+		// triple endpoint can't manage.
+		content := `{
+  "permissions": {"allow": ["Bash(git:*)"]},
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://relay.example.com",
+    "ANTHROPIC_AUTH_TOKEN": "sk-bearer",
+    "ANTHROPIC_MODEL": "claude-sonnet-4"
+  }
+}`
+		if err := a.WriteLiveConfigFile(context.Background(), "settings.json", []byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		// Written verbatim — key order and formatting preserved.
+		got, err := os.ReadFile(filepath.Join(homeDir, ".claude", "settings.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != content {
+			t.Errorf("settings.json not written verbatim.\nwant:\n%s\ngot:\n%s", content, string(got))
+		}
+	})
+}
+
+func TestClaude_WriteLiveConfigFile_InvalidJSONRejected(t *testing.T) {
+	withTempHome(t, func(homeDir string) {
+		a := &Agent{}
+		err := a.WriteLiveConfigFile(context.Background(), "settings.json", []byte("{not json"))
+		if err == nil {
+			t.Fatal("expected error for invalid JSON")
+		}
+		// Disk untouched.
+		if _, err := os.Stat(filepath.Join(homeDir, ".claude", "settings.json")); !os.IsNotExist(err) {
+			t.Errorf("broken JSON was persisted to disk")
+		}
+	})
+}
+
+func TestClaude_WriteLiveConfigFile_UnknownFileRejected(t *testing.T) {
+	withTempHome(t, func(homeDir string) {
+		a := &Agent{}
+		err := a.WriteLiveConfigFile(context.Background(), "claude.json", []byte("{}"))
+		if err == nil {
+			t.Fatal("expected error for unknown file name")
+		}
+		if !strings.Contains(err.Error(), "not found") {
+			t.Errorf("error should contain 'not found', got: %v", err)
+		}
+	})
+}
+
+func TestClaude_WriteLiveConfigFile_EmptyContentAllowed(t *testing.T) {
+	withTempHome(t, func(homeDir string) {
+		a := &Agent{}
+		// Empty content clears the file (allowed — not all empties are invalid).
+		if err := a.WriteLiveConfigFile(context.Background(), "settings.json", []byte("")); err != nil {
+			t.Fatalf("empty content should be allowed: %v", err)
+		}
+	})
 }
