@@ -157,3 +157,55 @@ func TestGetSessionHistory_MarksCodexCommentarySeparately(t *testing.T) {
 		t.Fatalf("entries[2] = %+v, want assistant_final/final_answer", entries[2])
 	}
 }
+
+func TestGetSessionHistory_IncludesXMLLikeUserPrompt(t *testing.T) {
+	codexHome := t.TempDir()
+	sessionsDir := filepath.Join(codexHome, "sessions", "2026", "05", "20")
+	if err := os.MkdirAll(sessionsDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	path := filepath.Join(sessionsDir, "rollout-2026-05-20T10-00-00-sess-user-query.jsonl")
+	content := `{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"sess-user-query","cwd":"/workspace/f1-web"}}` + "\n" +
+		`{"timestamp":"2026-05-20T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_query>你是谁，可以干啥</user_query>"}]}}` + "\n" +
+		`{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"我是 Codex。"}]}}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+
+	entries, err := getSessionHistory("sess-user-query", codexHome, 0)
+	if err != nil {
+		t.Fatalf("getSessionHistory: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entries len = %d, want 2", len(entries))
+	}
+	if entries[0].Role != "user" || entries[0].Content != "<user_query>你是谁，可以干啥</user_query>" {
+		t.Fatalf("entries[0] = %+v, want XML-like user prompt", entries[0])
+	}
+}
+
+func TestListCodexSessions_UsesXMLLikeUserPromptAsSummary(t *testing.T) {
+	codexHome := t.TempDir()
+	sessionsDir := filepath.Join(codexHome, "sessions", "2026", "05", "20")
+	if err := os.MkdirAll(sessionsDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	path := filepath.Join(sessionsDir, "rollout-2026-05-20T10-00-00-sess-summary-query.jsonl")
+	content := `{"timestamp":"2026-05-20T10:00:00Z","type":"session_meta","payload":{"id":"sess-summary-query","cwd":"/workspace/f1-web"}}` + "\n" +
+		`{"timestamp":"2026-05-20T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions"}]}}` + "\n" +
+		`{"timestamp":"2026-05-20T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<user_query>list</user_query>"}]}}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+
+	sessions, err := listCodexSessions("/workspace/f1-web", codexHome)
+	if err != nil {
+		t.Fatalf("listCodexSessions: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("sessions len = %d, want 1", len(sessions))
+	}
+	if sessions[0].Summary != "<user_query>list</user_query>" {
+		t.Fatalf("summary = %q, want XML-like user prompt", sessions[0].Summary)
+	}
+}

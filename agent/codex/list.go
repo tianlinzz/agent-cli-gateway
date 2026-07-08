@@ -192,11 +192,8 @@ func parseCodexSessionFile(path, filterCwd string) *core.AgentSessionInfo {
 				if item.Role == "user" {
 					userMsgSeen++
 					msgCount++
-					// The actual user prompt is the last user response_item
-					// (earlier ones are system/AGENTS.md instructions).
-					// Pick the last content block that looks like a real prompt.
 					for _, c := range item.Content {
-						if c.Type == "input_text" && c.Text != "" && isUserPrompt(c.Text) {
+						if c.Type == "input_text" && c.Text != "" {
 							summary = c.Text
 						}
 					}
@@ -301,7 +298,7 @@ func getSessionHistory(sessionID, codexHome string, limit int) ([]core.HistoryEn
 		switch {
 		case item.Role == "user" && len(item.Content) > 0:
 			for _, c := range item.Content {
-				if c.Type == "input_text" && c.Text != "" && isUserPrompt(c.Text) {
+				if c.Type == "input_text" && c.Text != "" {
 					entries = append(entries, core.HistoryEntry{
 						Role: "user", Kind: "user", Content: c.Text, Timestamp: ts,
 					})
@@ -378,22 +375,4 @@ func patchSessionSource(sessionID, codexHome string) {
 	out = append(out, data[idx:]...)
 
 	_ = os.WriteFile(path, out, 0o644)
-}
-
-// isUserPrompt returns true if the text looks like an actual user prompt
-// rather than system context (AGENTS.md, environment_context, permissions, etc.)
-func isUserPrompt(text string) bool {
-	t := strings.TrimSpace(text)
-	if t == "" {
-		return false
-	}
-	// Skip XML-style system context
-	if strings.HasPrefix(t, "<") {
-		return false
-	}
-	// Skip AGENTS.md instructions injected by Codex
-	if strings.HasPrefix(t, "# AGENTS.md") || strings.HasPrefix(t, "#AGENTS.md") {
-		return false
-	}
-	return true
 }
