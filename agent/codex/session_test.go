@@ -644,6 +644,79 @@ func TestSend_HandlesLargeJSONLines(t *testing.T) {
 	}
 }
 
+func TestSend_PreservesAgentMessagePhaseMetadata(t *testing.T) {
+	workDir := t.TempDir()
+	binDir := filepath.Join(workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+
+	payload := strings.Join([]string{
+		`{"type":"thread.started","thread_id":"thread-phase"}`,
+		`{"type":"turn.started"}`,
+		`{"type":"item.completed","item":{"type":"agent_message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"checking constraints"}]}}`,
+		`{"type":"item.completed","item":{"type":"agent_message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"final answer"}]}}`,
+		`{"type":"turn.completed"}`,
+	}, "\n") + "\n"
+
+	payloadFile := filepath.Join(workDir, "payload.jsonl")
+	if err := os.WriteFile(payloadFile, []byte(payload), 0o644); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+
+	script := "#!/bin/sh\ncat \"$CODEX_PAYLOAD_FILE\"\n"
+	powershellScript := `[Console]::Out.Write([IO.File]::ReadAllText($env:CODEX_PAYLOAD_FILE))
+`
+	writeFakeCodexScript(t, binDir, script, powershellScript)
+
+	t.Setenv("CODEX_PAYLOAD_FILE", payloadFile)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cs, err := newCodexSession(context.Background(), "codex", nil, workDir, "", "", "", "", "", nil, "", "", "")
+	if err != nil {
+		t.Fatalf("newCodexSession: %v", err)
+	}
+	defer cs.Close()
+
+	if err := cs.Send("hello", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	var textEvents []core.Event
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case evt := <-cs.Events():
+			if evt.Type == core.EventError {
+				t.Fatalf("unexpected error event: %v", evt.Error)
+			}
+			if evt.Type == core.EventText {
+				textEvents = append(textEvents, evt)
+			}
+			if evt.Type == core.EventResult && evt.Done {
+				if len(textEvents) != 2 {
+					t.Fatalf("text events len = %d, want 2: %+v", len(textEvents), textEvents)
+				}
+				if textEvents[0].Content != "checking constraints" {
+					t.Fatalf("textEvents[0].Content = %q", textEvents[0].Content)
+				}
+				if textEvents[0].Metadata["phase"] != "commentary" || textEvents[0].Metadata["kind"] != "assistant_commentary" {
+					t.Fatalf("textEvents[0].Metadata = %#v, want commentary metadata", textEvents[0].Metadata)
+				}
+				if textEvents[1].Content != "final answer" {
+					t.Fatalf("textEvents[1].Content = %q", textEvents[1].Content)
+				}
+				if textEvents[1].Metadata["phase"] != "final_answer" || textEvents[1].Metadata["kind"] != "assistant_final" {
+					t.Fatalf("textEvents[1].Metadata = %#v, want final metadata", textEvents[1].Metadata)
+				}
+				return
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for phase metadata events")
+		}
+	}
+}
+
 func TestWaitForArgsFile_WaitsForNonEmptyContent(t *testing.T) {
 	workDir := t.TempDir()
 	argsFile := filepath.Join(workDir, "args.txt")

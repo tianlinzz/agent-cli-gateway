@@ -11,7 +11,7 @@ import (
 
 // sseEventPayload is the JSON-serialized form of a core.Event sent as an SSE data line.
 // It carries a practical subset of core.Event fields (message.go:233-254) — the fields
-// most useful to HTTP consumers. Fields like Questions, cache token counts, Metadata,
+// most useful to HTTP consumers. Fields like Questions, cache token counts,
 // and Synthetic are omitted as they are not needed by the gateway's HTTP API.
 type sseEventPayload struct {
 	Type         string                 `json:"type"`
@@ -29,6 +29,7 @@ type sseEventPayload struct {
 	InputTokens  int                    `json:"inputTokens,omitempty"`
 	OutputTokens int                    `json:"outputTokens,omitempty"`
 	Error        string                 `json:"error,omitempty"`
+	Metadata     map[string]any         `json:"metadata,omitempty"`
 }
 
 // eventToPayload converts a core.Event to the SSE JSON payload.
@@ -48,6 +49,7 @@ func eventToPayload(event core.Event) sseEventPayload {
 		Done:         event.Done,
 		InputTokens:  event.InputTokens,
 		OutputTokens: event.OutputTokens,
+		Metadata:     event.Metadata,
 	}
 	if event.Error != nil {
 		p.Error = event.Error.Error()

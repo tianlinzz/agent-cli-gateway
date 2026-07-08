@@ -228,6 +228,44 @@ func TestAppServerSession_HandleRequestUserInputEmitsAskQuestion(t *testing.T) {
 	}
 }
 
+func TestAppServerSession_PreservesAgentMessagePhaseMetadata(t *testing.T) {
+	s := &appServerSession{
+		events: make(chan core.Event, 4),
+	}
+	s.currentTurn = "turn-1"
+
+	raw, err := json.Marshal(itemNotification{
+		Item: map[string]any{
+			"type":  "agentMessage",
+			"role":  "assistant",
+			"phase": "commentary",
+			"text":  "checking constraints",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal notification: %v", err)
+	}
+
+	s.handleNotification("item/completed", raw)
+	s.completeTurn()
+
+	var event core.Event
+	select {
+	case event = <-s.events:
+	case <-time.After(time.Second):
+		t.Fatal("expected text event")
+	}
+	if event.Type != core.EventText {
+		t.Fatalf("event type = %s, want %s", event.Type, core.EventText)
+	}
+	if event.Content != "checking constraints" {
+		t.Fatalf("content = %q", event.Content)
+	}
+	if event.Metadata["phase"] != "commentary" || event.Metadata["kind"] != "assistant_commentary" {
+		t.Fatalf("metadata = %#v, want commentary metadata", event.Metadata)
+	}
+}
+
 func TestAppServerSession_HandleRequestUserInputWritesCodexResponse(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

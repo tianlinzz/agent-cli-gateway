@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/tianlinzz/agent-cli-gateway/core"
@@ -52,6 +53,31 @@ func TestEventToPayloadError(t *testing.T) {
 	payload := eventToPayload(event)
 	if payload.Error != "agent crashed" {
 		t.Errorf("expected error 'agent crashed', got %q", payload.Error)
+	}
+}
+
+func TestEventToPayloadMetadata(t *testing.T) {
+	event := core.Event{
+		Type:     core.EventText,
+		Content:  "checking constraints",
+		Metadata: map[string]any{"phase": "commentary", "kind": "assistant_commentary"},
+	}
+	payload := eventToPayload(event)
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	metadata, ok := got["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("metadata missing from payload: %s", string(data))
+	}
+	if metadata["phase"] != "commentary" || metadata["kind"] != "assistant_commentary" {
+		t.Fatalf("metadata = %#v, want phase/kind", metadata)
 	}
 }
 

@@ -44,7 +44,7 @@ type codexSession struct {
 	cmdMu          sync.Mutex
 	cmds           map[*exec.Cmd]struct{}
 
-	pendingMsgs []string // buffered agent_message texts awaiting classification
+	pendingMsgs []codexPendingMessage // buffered agent_message texts awaiting classification
 
 	runtimeCfgMu       sync.Mutex
 	runtimeCfgModel    string
@@ -63,6 +63,11 @@ var codexRuntimeConfigCacheTTL = 5 * time.Second
 var codexRuntimeConfigTimeout = 1500 * time.Millisecond
 var codexContextUsageRetryDelay = 50 * time.Millisecond
 var codexContextUsageRetryCount = 4
+
+type codexPendingMessage struct {
+	text     string
+	metadata map[string]any
+}
 
 func buildCodexPromptPreamble(systemPrompt string, appendPrompt string) string {
 	var sections []string
@@ -440,11 +445,11 @@ func (cs *codexSession) flushPendingAsThinking() {
 	if cs.ctx.Err() != nil {
 		return
 	}
-	for _, text := range cs.pendingMsgs {
+	for _, msg := range cs.pendingMsgs {
 		if cs.ctx.Err() != nil {
 			return
 		}
-		evt := core.Event{Type: core.EventThinking, Content: text}
+		evt := core.Event{Type: core.EventThinking, Content: msg.text, Metadata: msg.metadata}
 		select {
 		case cs.events <- evt:
 		case <-cs.ctx.Done():
@@ -459,11 +464,11 @@ func (cs *codexSession) flushPendingAsText() {
 	if cs.ctx.Err() != nil {
 		return
 	}
-	for _, text := range cs.pendingMsgs {
+	for _, msg := range cs.pendingMsgs {
 		if cs.ctx.Err() != nil {
 			return
 		}
-		evt := core.Event{Type: core.EventText, Content: text}
+		evt := core.Event{Type: core.EventText, Content: msg.text, Metadata: msg.metadata}
 		select {
 		case cs.events <- evt:
 		case <-cs.ctx.Done():
@@ -544,7 +549,10 @@ func (cs *codexSession) handleItemCompleted(raw map[string]any) {
 	case "agent_message", "message":
 		text := extractItemText(item, "content", "output_text")
 		if text != "" {
-			cs.pendingMsgs = append(cs.pendingMsgs, text)
+			cs.pendingMsgs = append(cs.pendingMsgs, codexPendingMessage{
+				text:     text,
+				metadata: codexAssistantMessageMetadata(item),
+			})
 		}
 
 	case "command_execution":
@@ -993,6 +1001,40 @@ func extractItemText(item map[string]any, arrayField, elementType string) string
 	}
 	text, _ := item["text"].(string)
 	return text
+}
+
+func codexAssistantMessageMetadata(item map[string]any) map[string]any {
+	metadata := map[string]any{}
+	if role, _ := item["role"].(string); strings.TrimSpace(role) != "" {
+		metadata["role"] = strings.TrimSpace(role)
+	}
+	if phase, _ := item["phase"].(string); strings.TrimSpace(phase) != "" {
+		phase = strings.TrimSpace(phase)
+		metadata["phase"] = phase
+		if kind := codexAssistantKindFromPhase(phase); kind != "" {
+			metadata["kind"] = kind
+		}
+	}
+	if kind, _ := item["kind"].(string); strings.TrimSpace(kind) != "" {
+		metadata["kind"] = strings.TrimSpace(kind)
+	}
+	if len(metadata) == 0 {
+		return nil
+	}
+	return metadata
+}
+
+func codexAssistantKindFromPhase(phase string) string {
+	phase = strings.TrimSpace(phase)
+	if phase == "" {
+		return ""
+	}
+	switch phase {
+	case "final", "final_answer":
+		return "assistant_final"
+	default:
+		return "assistant_" + phase
+	}
 }
 
 func truncate(s string, maxRunes int) string {

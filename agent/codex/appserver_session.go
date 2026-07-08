@@ -177,7 +177,7 @@ type appServerSession struct {
 	wg        sync.WaitGroup
 
 	stateMu      sync.Mutex
-	pendingMsgs  []string
+	pendingMsgs  []codexPendingMessage
 	currentTurn  string
 	preambleSent bool
 
@@ -1215,7 +1215,10 @@ func (s *appServerSession) handleItemCompleted(item map[string]any) {
 		text, _ := item["text"].(string)
 		if strings.TrimSpace(text) != "" {
 			s.stateMu.Lock()
-			s.pendingMsgs = append(s.pendingMsgs, text)
+			s.pendingMsgs = append(s.pendingMsgs, codexPendingMessage{
+				text:     text,
+				metadata: codexAssistantMessageMetadata(item),
+			})
 			s.stateMu.Unlock()
 		}
 
@@ -1522,26 +1525,26 @@ func (s *appServerSession) completeTurn() {
 
 func (s *appServerSession) flushPendingAsThinking() {
 	s.stateMu.Lock()
-	msgs := append([]string(nil), s.pendingMsgs...)
+	msgs := append([]codexPendingMessage(nil), s.pendingMsgs...)
 	s.pendingMsgs = s.pendingMsgs[:0]
 	s.stateMu.Unlock()
 
-	for _, text := range msgs {
-		if strings.TrimSpace(text) != "" {
-			s.emit(core.Event{Type: core.EventThinking, Content: text})
+	for _, msg := range msgs {
+		if strings.TrimSpace(msg.text) != "" {
+			s.emit(core.Event{Type: core.EventThinking, Content: msg.text, Metadata: msg.metadata})
 		}
 	}
 }
 
 func (s *appServerSession) flushPendingAsText() {
 	s.stateMu.Lock()
-	msgs := append([]string(nil), s.pendingMsgs...)
+	msgs := append([]codexPendingMessage(nil), s.pendingMsgs...)
 	s.pendingMsgs = s.pendingMsgs[:0]
 	s.stateMu.Unlock()
 
-	for _, text := range msgs {
-		if strings.TrimSpace(text) != "" {
-			s.emit(core.Event{Type: core.EventText, Content: text})
+	for _, msg := range msgs {
+		if strings.TrimSpace(msg.text) != "" {
+			s.emit(core.Event{Type: core.EventText, Content: msg.text, Metadata: msg.metadata})
 		}
 	}
 }
