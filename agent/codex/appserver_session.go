@@ -176,10 +176,11 @@ type appServerSession struct {
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 
-	stateMu      sync.Mutex
-	pendingMsgs  []codexPendingMessage
-	currentTurn  string
-	preambleSent bool
+	stateMu           sync.Mutex
+	pendingMsgs       []codexPendingMessage
+	currentTurn       string
+	preambleSent      bool
+	streamedMsgItems  map[string]bool // item ids whose agentMessage deltas were already streamed live
 
 	runtimeMu sync.RWMutex
 	usage     *core.UsageReport
@@ -207,9 +208,10 @@ func newAppServerSession(ctx context.Context, url, workDir, model, effort, mode,
 		events:           make(chan core.Event, 128),
 		ctx:              sessionCtx,
 		cancel:           cancel,
-		pending:          make(map[int64]chan rpcResponseEnvelope),
-		pendingApprovals: make(map[string]chan core.PermissionResult),
-		preambleSent:     resumeID != "" && resumeID != core.ContinueSession,
+		pending:           make(map[int64]chan rpcResponseEnvelope),
+		pendingApprovals:  make(map[string]chan core.PermissionResult),
+		streamedMsgItems:  make(map[string]bool),
+		preambleSent:      resumeID != "" && resumeID != core.ContinueSession,
 	}
 	s.alive.Store(true)
 
@@ -302,7 +304,6 @@ func (s *appServerSession) initialize() error {
 			"experimentalApi": true,
 			"optOutNotificationMethods": []string{
 				"command/exec/outputDelta",
-				"item/agentMessage/delta",
 				"item/plan/delta",
 				"item/fileChange/outputDelta",
 				"item/reasoning/summaryTextDelta",
@@ -1106,6 +1107,11 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 			s.stateMu.Lock()
 			s.currentTurn = notif.Turn.ID
 			s.pendingMsgs = s.pendingMsgs[:0]
+			// Reset per-turn delta tracking so streamedMsgItems doesn't grow
+			// unbounded across turns.
+			for k := range s.streamedMsgItems {
+				delete(s.streamedMsgItems, k)
+			}
 			s.stateMu.Unlock()
 			s.storeContextUsage(nil)
 		}
@@ -1120,6 +1126,25 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 		var notif itemNotification
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
 			s.handleItemCompleted(notif.Item)
+		}
+
+	case "item/agentMessage/delta":
+		// Stream assistant text incrementally instead of buffering until
+		// turn completion. The delta payload carries a text fragment; we emit
+		// it as EventText immediately and record the item id so the
+		// subsequent item/completed (which carries the full text) can be
+		// skipped to avoid double-emitting.
+		var notif struct {
+			ItemID string `json:"itemId"`
+			Delta  string `json:"delta"`
+		}
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil && strings.TrimSpace(notif.Delta) != "" {
+			s.stateMu.Lock()
+			if s.streamedMsgItems != nil {
+				s.streamedMsgItems[notif.ItemID] = true
+			}
+			s.stateMu.Unlock()
+			s.emit(core.Event{Type: core.EventText, Content: notif.Delta})
 		}
 
 	case "turn/completed":
@@ -1213,11 +1238,19 @@ func (s *appServerSession) handleItemCompleted(item map[string]any) {
 	case "agentMessage":
 		text, _ := item["text"].(string)
 		if strings.TrimSpace(text) != "" {
+			// If this message was already streamed live via
+			// item/agentMessage/delta notifications, skip buffering — the
+			// text has already reached the client. Only buffer when no
+			// deltas were seen (e.g. resumed/history messages).
+			itemID, _ := item["id"].(string)
 			s.stateMu.Lock()
-			s.pendingMsgs = append(s.pendingMsgs, codexPendingMessage{
-				text:     text,
-				metadata: codexAssistantMessageMetadata(item),
-			})
+			alreadyStreamed := itemID != "" && s.streamedMsgItems[itemID]
+			if !alreadyStreamed {
+				s.pendingMsgs = append(s.pendingMsgs, codexPendingMessage{
+					text:     text,
+					metadata: codexAssistantMessageMetadata(item),
+				})
+			}
 			s.stateMu.Unlock()
 		}
 
