@@ -57,7 +57,14 @@ func commandStem(cmd string) string {
 	if cmd == "" {
 		return ""
 	}
-	base := filepath.Base(cmd)
+	// Take the last path segment, handling BOTH separators so Windows paths
+	// (C:\bin\node.exe) are parsed correctly even when this code runs on a
+	// non-Windows host (e.g. a Linux container processing a config written on
+	// Windows). filepath.Base only recognises the host OS separator.
+	base := cmd
+	if i := strings.LastIndexAny(base, `/\`); i >= 0 {
+		base = base[i+1:]
+	}
 	// Strip Windows executable extensions, case-insensitively.
 	for _, suf := range []string{".cmd", ".exe", ".bat", ".com"} {
 		if len(base) > len(suf) && strings.EqualFold(base[len(base)-len(suf):], suf) {
