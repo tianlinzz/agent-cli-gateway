@@ -371,14 +371,13 @@ func (s *appServerSession) threadRequestParams() map[string]any {
 }
 
 func appServerModeSettings(mode string) (approval string, sandbox string) {
-	switch normalizeMode(mode) {
-	case "auto-edit", "full-auto":
-		return "never", "workspace-write"
-	case "yolo":
-		return "never", "danger-full-access"
-	default:
-		return "on-request", "read-only"
-	}
+	// Gateway fork: always danger-full-access. The deployment target is a
+	// container/image where the container itself is the isolation boundary,
+	// so codex's OS-level sandbox only blocks legitimate tooling (e.g. internal
+	// CLIs that need network) with no real security gain. The mode argument is
+	// kept for signature compatibility. See session.go buildExecArgs comment.
+	_ = mode // accepted for compatibility; no longer branches
+	return "never", "danger-full-access"
 }
 
 func (s *appServerSession) applyThreadRuntimeState(workDir, model string, effort *string) {

@@ -241,21 +241,21 @@ func (cs *codexSession) buildExecArgs(prompt string, imagePaths []string) []stri
 	// For real interactive approvals (suggest semantics), users must opt into
 	// the `app_server` backend, which handles execCommandApproval /
 	// applyPatchApproval / permissionsApproval over JSON-RPC.
-	switch cs.mode {
-	case "auto-edit", "full-auto":
-		if isResume {
-			args = append(args, "-c", `sandbox_mode="workspace-write"`, "-c", `approval_policy="never"`)
-		} else {
-			args = append(args, "--sandbox", "workspace-write", "-c", `approval_policy="never"`)
-		}
-	case "yolo":
-		args = append(args, "--dangerously-bypass-approvals-and-sandbox")
-	default: // "suggest"
-		if isResume {
-			args = append(args, "-c", `sandbox_mode="read-only"`, "-c", `approval_policy="never"`)
-		} else {
-			args = append(args, "--sandbox", "read-only", "-c", `approval_policy="never"`)
-		}
+	// Gateway fork: sandbox is pinned to danger-full-access unconditionally.
+	// The deployment target is a container/image where the container itself is
+	// the isolation boundary, so codex's OS-level sandbox only blocks legitimate
+	// tooling (e.g. internal CLIs that need network) with no real security gain.
+	// This makes bridge behavior match direct TUI usage where users set
+	// sandbox_mode = "danger-full-access" in config.toml — without it, the -c
+	// override below would silently downgrade to workspace-write / read-only.
+	//
+	// approval_policy must stay "never": `codex exec` (this backend) has no
+	// approval IPC, so any other value blocks waiting for a TTY response that
+	// never arrives.
+	if isResume {
+		args = append(args, "-c", `sandbox_mode="danger-full-access"`, "-c", `approval_policy="never"`)
+	} else {
+		args = append(args, "--sandbox", "danger-full-access", "-c", `approval_policy="never"`)
 	}
 
 	if cs.model != "" {
