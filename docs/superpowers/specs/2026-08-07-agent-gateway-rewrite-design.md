@@ -4,7 +4,7 @@
 
 将项目重写为一个云端可部署的 OpenAI-compatible Agent Gateway。公共入口只提供 OpenAI 风格的模型发现和对话接口；`model` 的值代表一个可执行 Agent，例如 `codex`、`claude-code` 和 `kimi`。Agent 的 CLI 启动、原生协议、session resume、权限事件和进程回收全部封装在独立 adapter/worker 内。每个 Worker 由 nsjail 独立包裹，确保 Agent 只能访问受控 workspace 和运行时挂载。
 
-本次重构不承担旧项目兼容，也不迁移 IM 业务。现有仓库和上游 `cc-connect` 只作为 agent CLI 进程管理、原生协议解析和测试经验的来源。
+本次重构不承担旧项目兼容，也不迁移 IM 业务。上游 `cc-connect` 作为三种 Agent 的选择性迁移源：直接复用成熟的 CLI 进程管理、原生协议解析、session resume、权限和测试代码，在新 adapter/runtime contract 外包裹适配；不整体复制上游的 core、Platform、IM、cron 或管理端。
 
 ## 范围
 
@@ -24,7 +24,7 @@
 
 第一阶段不实现旧 `/session`、`/event`、管理 API、provider/MCP HTTP 管理、IM 平台、卡片、cron、timer、relay 和其他 Agent。
 
-生产环境中 nsjail 是强制隔离边界：二进制缺失、user namespace/mount/seccomp 不可用或 jail 配置失败时，服务必须 readiness 失败，不能静默降级为无沙箱执行。未启用隔离只允许显式的本地开发/测试配置。
+生产环境和开发模式都使用 nsjail 作为强制隔离边界：二进制缺失、user namespace/mount/seccomp 不可用或 jail 配置失败时，服务必须 readiness 失败，不能静默降级为无沙箱执行。开发模式可以放宽日志、profile 和资源限制以便调试，但不能绕过 Worker/nsjail/CLI 进程链。只有不依赖真实 nsjail 的单元测试可以使用 stub 或显式关闭隔离。
 
 ## 运行拓扑
 
@@ -174,6 +174,10 @@ cmd/gateway/
 ```
 
 旧 `core` 不作为新架构的中心。迁移完成后删除 Platform、MessageHandler、IM Message、旧 session/event API、IM prompt 和管理端等代码。
+
+### 上游代码迁移策略
+
+不从零重写三种 Agent 的 CLI 细节。实现时固定一个上游 `cc-connect` tag/commit 作为迁移基线，选择性迁移 `agent/claudecode`、`agent/codex`、`agent/kimi` 中已经验证的 CLI 启动、原生流解析、session resume、permission、usage、进程组回收和测试代码；迁移后将旧 `core`/IM 类型替换为新 runtime contract，并通过 adapter 暴露。上游 LICENSE、版权和来源说明必须保留。上游其他 Agent、Platform、IM、cron/timer/relay、管理端和旧 HTTP contract 不迁移。
 
 ## 验证标准
 

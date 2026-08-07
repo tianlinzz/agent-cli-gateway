@@ -11,8 +11,8 @@
 > **决策对齐（2026-08-07，补充计划/spec 未明确的项）：**
 > 1. **IPC** = gRPC + protoc over per-session Unix sockets（设计文档「gRPC or Unix socket」二选一，采用 gRPC contract 和 Unix socket transport）。
 > 2. **权限** = permission 是 canonical runtime contract 的一部分；部署配置可选择 `auto`、`ask` 或 `deny`。第一阶段可以默认 `auto`，但不能删除 permission event，也不能把 nsjail 当作自动批准的替代品。
-> 3. **adapter** = 全新实现，仅把现有 `agent/{codex,claudecode,kimi}/` 当协议参考，零代码移植。
-> 4. **nsjail 纳入第一阶段**，包裹 worker fork 出的每一个 Worker 及其 Agent CLI（补计划 Task 3 原本「仅进程组回收」的隔离缺口）。
+> 3. **adapter** = 选择性迁移上游 `cc-connect` 固定 commit 中 `agent/{codex,claudecode,kimi}/` 的成熟 CLI 进程管理、原生协议、resume、permission、usage 和测试代码；迁移后替换旧 core/IM 类型，接入新 runtime contract，不复制整个项目。
+> 4. **nsjail 纳入第一阶段**，开发模式和生产模式都包裹 worker fork 出的每一个 Worker 及其 Agent CLI（补计划 Task 3 原本「仅进程组回收」的隔离缺口）；只有不依赖真实 nsjail 的单元测试可用 stub/显式关闭。
 > 5. **nsjail 运行模型**：(a) workspace = bind-mount 真实受控目录进沙箱 `/workspace`（非 tmpfs，保证 resume/多轮持久化）；(b) Agent home = 当前 Agent/session 专属可写目录 `/agent-home`；(c) `/tmp` 为 session 独立 tmpfs；(d) user-namespace 无特权降权，不加 CAP_SYS_ADMIN、不 privileged；(e) 第一阶段默认不创建独立 network namespace，保持 provider 网络可用；(f) Worker adapter 声明 `persistent_process` 或 `resume_per_turn`，不能把 `-Mo` 固定为所有 Agent 的 session 语义。
 > 6. **nsjail 二进制** = Dockerfile 多阶段构建并固定上游 tag/commit；builder 安装 autoconf/bison/flex/libprotobuf/libnl，运行镜像复制二进制及其实际运行时依赖，并在 CI 验证 `nsjail --version`、`ldd` 和最小 smoke jail。
 
@@ -27,15 +27,17 @@ api/openai/                 OpenAI request/response、SSE、错误
 runtime/                    Agent registry、session、canonical events
 worker/                     Worker RPC、supervisor、本地进程 backend、nsjail 集成
 worker/nsjail/              nsjail profile 模板（Kafel seccomp + mount + rlimit）
-adapters/claudecode/        Claude Code adapter（全新实现）
-adapters/codex/             Codex adapter（全新实现）
-adapters/kimi/              Kimi adapter（全新实现）
+adapters/claudecode/        Claude Code adapter（选择性迁移上游实现）
+adapters/codex/             Codex adapter（选择性迁移上游实现）
+adapters/kimi/              Kimi adapter（选择性迁移上游实现）
 config/                     新 gateway TOML 配置（含 isolation 段）
 workspace/                  workspace_id 到受控目录的解析和校验
 cmd/gateway/                新入口和插件注册
 ```
 
-adapters 为全新实现，仅把现有 `agent/claudecode`、`agent/codex`、`agent/kimi` 当作协议参考（CLI 启动、原生流解析、resume、permission、usage 的格式），不移植代码。不迁移 IM、Platform、旧 Message、cron/timer/relay 和管理端。
+adapters 以固定的上游 `cc-connect` commit 为迁移基线，选择性迁移 `agent/claudecode`、`agent/codex`、`agent/kimi` 中 CLI 启动、原生流解析、resume、permission、usage、进程回收和测试代码；迁移后删除旧 `core`/IM 类型依赖，并通过新 runtime contract 暴露。不迁移 IM、Platform、旧 Message、cron/timer/relay 和管理端，保留上游 LICENSE、版权和来源说明。
+
+上游迁移必须先记录来源：保存上游仓库 URL、tag/commit、迁移文件清单和 LICENSE 来源说明。迁移代码应在新目录中形成项目自己的 adapter；不以整个上游仓库作为 Go module 依赖，避免把上游的 core 和 IM 依赖重新引入。
 
 ### Task 1: 建立新模块入口和空架构
 
@@ -63,7 +65,7 @@ adapters 为全新实现，仅把现有 `agent/claudecode`、`agent/codex`、`ag
 
 - [ ] **Step 5: 添加默认配置解析**
 
-`config/gateway.go` 定义 server、auth、workspace 和 agent command/default model/permission/timeout 字段，并给出三个 Agent 的 enabled 配置默认值；不允许把客户端的绝对 `workDir` 直接带入运行时。同时定义 `Isolation` 配置段：nsjail 必须启用、二进制路径、profile 覆盖路径、workspace/agent-home/tmp mount 设置、rlimit/uid-gid 映射、seccomp policy 和 network namespace 开关。生产默认 `required=true`，本地测试只有显式配置才能禁用。
+`config/gateway.go` 定义 server、auth、workspace、运行模式和 agent command/default model/permission/timeout 字段，并给出三个 Agent 的 enabled 配置默认值；不允许把客户端的绝对 `workDir` 直接带入运行时。同时定义 `Isolation` 配置段：nsjail 必须启用、固定上游版本/来源、二进制路径、profile 覆盖路径、workspace/agent-home/tmp mount 设置、rlimit/uid-gid 映射、seccomp policy 和 network namespace 开关。生产和开发默认 `required=true`；只有 test profile 才能显式关闭。
 
 - [ ] **Step 6: 运行 `gofmt -w runtime config cmd/gateway` 和 `go test ./runtime ./config`**
 
@@ -124,7 +126,7 @@ git commit -m "feat: add isolated workspace and session metadata"
 
 - [ ] **Step 1: 写 supervisor 生命周期测试**
 
-使用假的 worker executable，覆盖启动、握手失败、事件流断开、abort、超时、SIGTERM 和子进程回收；额外覆盖「nsjail 包裹层挂掉时整组被回收」和「nsjail 配置缺失/二进制不可执行时 fail-closed/readiness 失败」（不要求单元测试环境真实装有 nsjail，用 stub binary 模拟）。测试 worker 异常不会让 API 主进程退出。
+使用假的 worker executable，覆盖启动、握手失败、事件流断开、abort、超时、SIGTERM 和子进程回收；额外覆盖「nsjail 包裹层挂掉时整组被回收」和「nsjail 配置缺失/二进制不可执行时 fail-closed/readiness 失败」（不要求单元测试环境真实装有 nsjail，用 stub binary 模拟）。测试 worker 异常不会让 API 主进程退出；开发 profile 也必须走 nsjail wrapper。
 
 - [ ] **Step 2: 运行 `go test ./worker -run TestSupervisor -v`，确认测试失败**
 
@@ -138,7 +140,7 @@ git commit -m "feat: add isolated workspace and session metadata"
 
 - [ ] **Step 5: 实现 supervisor（含 nsjail 包裹）**
 
-Supervisor 为一个 session 启动一个 worker 子进程：生产 isolation 必须启用，fork 的是 `nsjail -Mo --config <profile> -- <worker_executable>` 或 adapter 声明的等价 session 模式。profile 将真实受控 workspace bind-mount 到 `/workspace`，将 Agent 专属可写 home 挂载到 `/agent-home`，将 session tmpfs 挂载到 `/tmp`，并使用 user namespace、rlimit 和基础 seccomp policy；第一阶段默认不创建独立 network namespace。记录 worker ID/PID 与 nsjail PID，监听退出，发送取消，等待进程组退出，超时后强杀整个进程组（含 nsjail 与 Agent CLI）并回收资源。只有显式 local-dev 配置才允许关闭 isolation；生产配置缺失或启动失败必须 fail-closed。
+Supervisor 为一个 session 启动一个 worker 子进程：开发和生产 isolation 都必须启用，fork 的是 `nsjail -Mo --config <profile> -- <worker_executable>` 或 adapter 声明的等价 session 模式。profile 将真实受控 workspace bind-mount 到 `/workspace`，将 Agent 专属可写 home 挂载到 `/agent-home`，将 session tmpfs 挂载到 `/tmp`，并使用 user namespace、rlimit 和基础 seccomp policy；第一阶段默认不创建独立 network namespace。记录 worker ID/PID 与 nsjail PID，监听退出，发送取消，等待进程组退出，超时后强杀整个进程组（含 nsjail 与 Agent CLI）并回收资源。只有 test profile 才允许关闭 isolation；生产和开发配置缺失或启动失败必须 fail-closed。
 
 - [ ] **Step 6: 实现 `LocalExecutionBackend`**
 
@@ -166,15 +168,15 @@ git commit -m "feat: add process-isolated worker backend (nsjail-sandboxed)"
 - Create: `adapters/codex/adapter_test.go`
 - Modify: `cmd/gateway/plugin_agent_codex.go`
 
-- [ ] **Step 1: 参考 `agent/codex` 协议写 adapter regression tests**
+- [ ] **Step 1: 固定上游基线并迁移 Codex 测试**
 
-仅把现有 `agent/codex` 当协议参考（不移植代码），为全新 `adapters/codex` 写测试：启动参数、输入转换、JSON-RPC/stream 事件、native session ID、usage、permission、abort 和异常退出；测试不得依赖真实 Codex 登录态。
+记录上游 `cc-connect` 的 tag/commit 和 LICENSE 来源；将上游 `agent/codex` 中与 CLI 启动、JSON-RPC/stream 事件、native session ID、usage、permission、abort 和异常退出有关的测试迁移到 `adapters/codex`，先改成新 runtime contract 的 fixture，测试不得依赖真实 Codex 登录态。
 
 - [ ] **Step 2: 运行 `go test ./adapters/codex -v`，确认新 adapter 测试失败**
 
-- [ ] **Step 3: 实现 `CodexAdapter.Describe`**
+- [ ] **Step 3: 迁移并实现 `CodexAdapter`**
 
-检查 command 可执行性并返回 model ID `codex`、能力 metadata、配置中的 runtime model 列表和 session 生命周期模式。
+在保留上游已验证协议处理的基础上，移除对旧 `core`/IM 类型的引用，适配新 `AgentAdapter`；检查 command 可执行性并返回 model ID `codex`、能力 metadata、配置中的 runtime model 列表和 session 生命周期模式。
 
 - [ ] **Step 4: 实现 `CodexAdapter.Start`**
 
@@ -248,17 +250,17 @@ git commit -m "feat: expose openai compatible agent gateway"
 - Create: `adapters/kimi/adapter_test.go`
 - Modify: `cmd/gateway/plugin_agent_claudecode.go`, `cmd/gateway/plugin_agent_kimi.go`
 
-- [ ] **Step 1: 为 Claude Code 写失败测试并运行**
+- [ ] **Step 1: 固定上游基线并迁移 Claude Code 测试**
 
-覆盖 stream-json、resume、permission、tool event、usage、abort、CLI failure 和 session 生命周期模式。
+记录上游来源；迁移已验证的 stream-json、resume、permission、tool event、usage、abort、CLI failure 和 session 生命周期测试，改成新 runtime contract fixture。
 
-- [ ] **Step 2: 实现 Claude Code adapter 并运行 `go test ./adapters/claudecode -race`**
+- [ ] **Step 2: 迁移 Claude Code adapter 并运行 `go test ./adapters/claudecode -race`**
 
-- [ ] **Step 3: 为 Kimi 写失败测试并运行**
+- [ ] **Step 3: 迁移 Kimi 测试并运行**
 
-覆盖 Kimi 原生输出、session resume、usage、abort、异常退出和 session 生命周期模式。
+迁移已验证的 Kimi 原生输出、session resume、usage、abort、异常退出和 session 生命周期测试，移除旧 core/IM 依赖。
 
-- [ ] **Step 4: 实现 Kimi adapter 并运行 `go test ./adapters/kimi -race`**
+- [ ] **Step 4: 迁移 Kimi adapter 并运行 `go test ./adapters/kimi -race`**
 
 - [ ] **Step 5: 添加三 Agent discovery 和 Chat Completions 集成测试**
 
