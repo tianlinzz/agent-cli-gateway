@@ -1,0 +1,155 @@
+// Package workerpb defines the Worker RPC contract between the gateway
+// supervisor (API process) and one per-session worker process.
+//
+// The contract deliberately carries only canonical runtime fields (see
+// runtime/contract.go and runtime/events.go): model/session/owner/workspace
+// identifiers, canonical messages, tools, and canonical events. There is NO
+// OpenAI JSON and NO agent-specific field anywhere in this contract. nsjail is
+// a worker-side startup detail and never appears here — the supervisor
+// assembles the jail profile locally from config + workspace paths.
+//
+// Transport: one gRPC server per session, served by the worker process on a
+// per-session Unix socket; the supervisor is the client. One worker process =
+// one session = one AgentSession.
+syntax = "proto3";
+
+package gateway.worker;
+
+import "google/protobuf/struct.proto";
+
+option go_package = "github.com/tianlinzz/agent-cli-gateway/worker/proto;workerpb";
+
+// Worker is served by the worker process (inside its nsjail jail) and called
+// by the supervisor in the API process. All methods are session-scoped via
+// the per-session socket; session_id is echoed for robustness and future
+// multi-session workers.
+service Worker {
+  // Health is the supervisor's handshake with a freshly spawned worker. The
+  // worker reports its own PID (the host PID when the pid namespace is
+  // shared, which is the phase-1 default) so the supervisor can track both
+  // the nsjail PID and the worker PID.
+  rpc Health(HealthRequest) returns (HealthResponse);
+  // StartSession begins the session inside the worker.
+  rpc StartSession(StartSessionRequest) returns (StartSessionResponse);
+  // SendInput delivers one turn to the session.
+  rpc SendInput(SendInputRequest) returns (SendInputResponse);
+  // StreamEvents opens the canonical event stream for the session. It stays
+  // open for the session lifetime (persistent_process) and ends when the
+  // session ends.
+  rpc StreamEvents(StreamEventsRequest) returns (stream EventFrame);
+  // AbortSession cancels the in-flight turn. It does not tear the session
+  // down; the process keeps serving future turns.
+  rpc AbortSession(AbortSessionRequest) returns (AbortSessionResponse);
+  // CloseSession tears the session down. The worker then exits so the
+  // supervisor can reap the process group.
+  rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  // status is "ok" on success.
+  string status = 1;
+  // version identifies the worker implementation.
+  string version = 2;
+  // pid is the worker process's own PID.
+  int32 pid = 3;
+}
+
+message StartSessionRequest {
+  string model_id = 1;
+  string session_id = 2;
+  string owner_id = 3;
+  string workspace_id = 4;
+  map<string, string> metadata = 5;
+  Input first_input = 6;
+}
+
+message StartSessionResponse {
+  // lifecycle_mode mirrors runtime.Descriptor.LifecycleMode
+  // ("persistent_process" or "resume_per_turn"). The supervisor uses it to
+  // decide whether an abort tears down the process or just cancels the turn.
+  string lifecycle_mode = 1;
+}
+
+message SendInputRequest {
+  string session_id = 1;
+  Input input = 2;
+}
+
+message SendInputResponse {}
+
+message StreamEventsRequest {
+  string session_id = 1;
+}
+
+message AbortSessionRequest {
+  string session_id = 1;
+}
+
+message AbortSessionResponse {}
+
+message CloseSessionRequest {
+  string session_id = 1;
+}
+
+message CloseSessionResponse {}
+
+// Input is one canonical turn (runtime.Input).
+message Input {
+  repeated Message messages = 1;
+  repeated Tool tools = 2;
+  map<string, string> metadata = 3;
+}
+
+// Message is one canonical conversation message (runtime.Message).
+message Message {
+  string role = 1; // "system", "user", "assistant", or "tool"
+  string content = 2;
+  string name = 3; // optional sender/function name
+  repeated ToolCall tool_calls = 4;
+  string tool_call_id = 5; // set on tool-result messages
+}
+
+// Tool describes a callable tool exposed to an agent (runtime.Tool).
+message Tool {
+  string name = 1;
+  string description = 2;
+  google.protobuf.Struct parameters = 3; // JSON Schema fragment
+}
+
+// ToolCall is a tool invocation or its result (runtime.ToolCall).
+message ToolCall {
+  string id = 1;
+  string name = 2;
+  google.protobuf.Struct arguments = 3;
+  string result = 4; // set on tool-result frames
+  bool is_error = 5; // set on tool-result frames
+}
+
+// PermissionRequest is a canonical permission request (runtime.PermissionRequest).
+message PermissionRequest {
+  string id = 1;
+  string action = 2;
+  string detail = 3;
+}
+
+// Usage reports token accounting (runtime.Usage).
+message Usage {
+  int32 input_tokens = 1;
+  int32 output_tokens = 2;
+  int32 total_tokens = 3;
+}
+
+// EventFrame is one canonical runtime event (runtime.Event) serialized over
+// the wire. type is the runtime.EventType string.
+message EventFrame {
+  string type = 1;
+  string text = 2;
+  ToolCall tool = 3;
+  PermissionRequest permission = 4;
+  Usage usage = 5;
+  string error = 6;
+  string finish_reason = 7;
+  string status = 8;
+}

@@ -1,0 +1,111 @@
+package worker
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"syscall"
+)
+
+// spawnSpec carries everything the process spawner needs for one session.
+type spawnSpec struct {
+	// isolated marks the session as requiring the nsjail wrapper. Only the
+	// test runtime mode may spawn directly.
+	isolated bool
+	// nsjailBinary is the path to the nsjail executable (isolated sessions).
+	nsjailBinary string
+	// profilePath is the generated nsjail config file (isolated sessions).
+	profilePath string
+	// workerExe is the worker child executable.
+	workerExe string
+	// workerArgs are extra argv passed to the worker child.
+	workerArgs []string
+	// env is the environment for the spawned process.
+	env []string
+	// logPath is the per-session file worker stdout/stderr is written to.
+	// When empty the supervisor's own stderr is used.
+	logPath string
+}
+
+// spawnFunc starts the session worker process. The returned *exec.Cmd is
+// already started and is the direct child of the supervisor. The child runs
+// in its own process group (Setpgid), so the supervisor can signal -pgid to
+// reach the whole tree (nsjail + worker + agent CLI).
+type spawnFunc func(ctx context.Context, spec spawnSpec) (*exec.Cmd, error)
+
+// defaultSpawner selects the platform-appropriate spawn strategy: a direct
+// spawn only when isolation is disabled (test profile only), otherwise the
+// nsjail-wrapped spawn — a real nsjail fork on linux, a fail-closed error
+// elsewhere.
+func defaultSpawner(cfg Config) spawnFunc {
+	if !cfg.Isolation.Required {
+		return spawnDirect
+	}
+	return spawnJailed
+}
+
+// buildNsjailCommand assembles the exact argv used to fork the worker inside
+// nsjail: `nsjail -Mo --config <profile> -- <worker> <args...>`. nsjail runs
+// in ONCE mode (-Mo): one nsjail process per session, one jail, lifecycle 1:1
+// with the session. nsjail itself is never part of the RPC contract — this
+// argv is a worker-side startup detail.
+func buildNsjailCommand(nsjailBinary, profilePath, workerExe string, workerArgs []string) []string {
+	argv := []string{nsjailBinary, "-Mo", "--config", profilePath, "--", workerExe}
+	return append(argv, workerArgs...)
+}
+
+// buildDirectCommand assembles the argv for a direct (test-only, isolation
+// disabled) spawn.
+func buildDirectCommand(workerExe string, workerArgs []string) []string {
+	argv := []string{workerExe}
+	return append(argv, workerArgs...)
+}
+
+// spawnDirect starts the worker directly, without nsjail. It is a fail-closed
+// seam: it REFUSES to fork when the session requires isolation (spec.isolated),
+// so no reachable code path can spawn an unsandboxed worker when
+// Isolation.Required=true in a non-test mode (spec.isolated mirrors
+// cfg.Isolation.Required at the single call site in StartSession). Only the
+// test profile (isolation disabled → spec.isolated=false) may spawn directly.
+func spawnDirect(ctx context.Context, spec spawnSpec) (*exec.Cmd, error) {
+	if spec.isolated {
+		return nil, fmt.Errorf("worker: spawn: refusing unsandboxed direct spawn: session requires nsjail isolation")
+	}
+	return startCommand(ctx, buildDirectCommand(spec.workerExe, spec.workerArgs), spec.env, spec.logPath)
+}
+
+// startCommand is the single cross-platform place that turns a command line
+// into a supervised process. It deliberately does NOT use CommandContext:
+// process lifetime (and process-group signals) is owned entirely by the
+// supervisor, so a short-lived caller context must never kill the child.
+//
+// Worker output is written to logPath (or the supervisor's stderr) as a plain
+// *os.File. It must NOT be piped through exec.Cmd: a piped Stdout/Stderr makes
+// cmd.Wait() block until the pipe reaches EOF, which — when a grandchild (the
+// agent CLI, or an orphaned worker after the nsjail wrapper dies) inherits the
+// pipe descriptors — would stall the monitor goroutine that is responsible for
+// reaping the process group.
+func startCommand(_ context.Context, argv, env []string, logPath string) (*exec.Cmd, error) {
+	if len(argv) == 0 || argv[0] == "" {
+		return nil, fmt.Errorf("worker: spawn: empty command")
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Env = env
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	out := (io.Writer)(os.Stderr)
+	if logPath != "" {
+		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("worker: open session log %q: %w", logPath, err)
+		}
+		out = f
+	}
+	cmd.Stdout = out
+	cmd.Stderr = out
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("worker: start %q: %w", argv[0], err)
+	}
+	return cmd, nil
+}
