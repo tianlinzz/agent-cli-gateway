@@ -460,8 +460,13 @@ func (ws *workerSession) Send(ctx context.Context, input runtime.Input) error {
 	return ws.client.SendInput(ctx, ws.req.SessionID, input)
 }
 
-// Abort cancels the in-flight turn. It is RPC-only: persistent_process
-// sessions keep their process and serve future turns.
+// Abort cancels the in-flight turn. It is RPC-only: the session is never torn
+// down here, so persistent_process sessions keep their process and serve
+// future turns. Phase-1 adapters implement Abort as a turn-level cancel that
+// does NOT kill the CLI process — claudecode has no stream-json interrupt
+// message, so it marks the turn cancelled and leaves the process alive; if the
+// CLI becomes unrecoverable it exits and the API layer's dead-handle recovery
+// starts a fresh process on the next turn.
 func (ws *workerSession) Abort(ctx context.Context) error {
 	ws.mu.Lock()
 	state, err := ws.state, ws.err
@@ -533,6 +538,16 @@ func (ws *workerSession) Err() error {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	return ws.err
+}
+
+// Closed reports whether the session has terminated (the worker exited or was
+// torn down). It backs the API layer's dead-handle recovery: Send on a closed
+// handle fails terminally, and the API drops the handle and starts a fresh
+// execution instead of wedging the session with 500s.
+func (ws *workerSession) Closed() bool {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	return ws.state == stateClosed
 }
 
 // monitor waits for the direct child (nsjail wrapper, or the worker itself in

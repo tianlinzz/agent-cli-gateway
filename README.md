@@ -159,6 +159,14 @@ See [`config.example.toml`](config.example.toml) for a full annotated example.
 | `[agents.<id>]` | `enabled` | `true` | Whether the agent is available |
 | `[agents.<id>]` | `permission` | `auto` | `auto` / `ask` / `deny` |
 
+> **Phase-1 limitation:** `[agents.<id>]` settings and `CC_GATEWAY_*` env
+> knobs are parsed/validated by the gateway but are not yet threaded through
+> the nsjail boundary into the worker process — the worker's adapters build
+> their options from the process environment, which nsjail `KeepEnv` strips to
+> a fixed allowlist. Agents currently run with adapter built-in defaults,
+> `permission` is auto-approve inside the controlled workspace, and full
+> per-agent config wiring is a follow-up.
+
 ## Architecture
 
 ```

@@ -56,6 +56,13 @@ type claudeSession struct {
 	// activeModel stores the model id reported by the CLI's init event.
 	activeModel atomic.Value // stores string
 
+	// turnAborted records the most recent Abort request. Phase-1 Abort marks
+	// the in-flight turn cancelled WITHOUT killing the persistent process
+	// (stream-json has no interrupt/cancel message), so this flag is the
+	// observable trace of an aborted turn. A subsequent Send proceeds on the
+	// same process.
+	turnAborted atomic.Bool
+
 	// usageMu guards lastUsage. Populated from the most recent assistant and
 	// result events.
 	usageMu   sync.Mutex
@@ -642,29 +649,25 @@ func (cs *claudeSession) emit(evt runtime.Event) {
 	}
 }
 
-// Abort cancels the in-flight turn by terminating the persistent process
-// (CommandContext kills the direct child; the process-group kill reaps any
-// descendant tree, e.g. MCP bridges). The session ends — a later resume
-// starts a fresh execution.
+// Abort cancels the in-flight turn WITHOUT destroying the persistent process
+// or the session. Claude Code's stream-json protocol has no interrupt/cancel
+// input message, so phase 1 cannot abort the in-flight turn at the protocol
+// level. Instead the process and stdin are left alive and the turn is marked
+// cancelled: a subsequent turn proceeds on the same process (a new user
+// message mid-turn interrupts the stale turn), and if the CLI ends up
+// unrecoverable it exits and the API layer's dead-handle recovery (F1) starts
+// a fresh process. This matches the supervisor's contract — Abort is RPC-only
+// and persistent_process sessions keep their process and serve future turns.
 func (cs *claudeSession) Abort(ctx context.Context) error {
 	if !cs.alive.Load() {
 		return nil
 	}
-	cs.cancel()
-	select {
-	case <-cs.done:
-		return nil
-	case <-time.After(2 * time.Second):
-	}
-	if cs.cmd != nil {
-		if err := forceKillCmd(cs.cmd); err != nil {
-			slog.Warn("claudeSession: abort force kill", "error", err)
-		}
-	}
-	select {
-	case <-cs.done:
-	case <-ctx.Done():
-	}
+	// Deliberately NOT cs.cancel()/forceKillCmd: killing the process here
+	// tears the whole persistent session down and loses the native
+	// conversation history on every client disconnect (the API aborts on
+	// every dropped SSE connection).
+	cs.turnAborted.Store(true)
+	slog.Debug("claudeSession: abort requested; keeping persistent process alive for the next turn")
 	return nil
 }
 

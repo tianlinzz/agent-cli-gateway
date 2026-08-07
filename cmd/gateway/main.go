@@ -26,7 +26,12 @@ import (
 	"github.com/tianlinzz/agent-cli-gateway/worker"
 )
 
-var version = "dev"
+var (
+	version = "dev"
+	// commit and buildTime are injected via Makefile LDFLAGS (-X main.commit=...).
+	commit    = "none"
+	buildTime = "unknown"
+)
 
 func main() {
 	// -config defaults to $GATEWAY_CONFIG (set by the container entrypoint to
@@ -38,7 +43,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("gateway %s\n", version)
+		fmt.Printf("gateway %s (commit %s, built %s)\n", version, commit, buildTime)
 		return
 	}
 
@@ -116,6 +121,8 @@ func main() {
 
 	slog.Info("gateway starting",
 		"version", version,
+		"commit", commit,
+		"build_time", buildTime,
 		"mode", cfg.Mode,
 		"listen_addr", cfg.Server.ListenAddr,
 		"workspace_root", rootAbs,

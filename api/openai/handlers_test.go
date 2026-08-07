@@ -39,6 +39,7 @@ func (a *fakeAdapter) Start(ctx context.Context, req runtime.StartRequest) (runt
 type fakeHandle struct {
 	mu     sync.Mutex
 	sends  int
+	dead   bool                // true = the worker/CLI exited; Send fails terminally
 	script func(h *fakeHandle) // runs once per Send, in a goroutine
 	events chan runtime.Event
 
@@ -60,11 +61,32 @@ func newFakeHandle(script func(h *fakeHandle)) *fakeHandle {
 func (h *fakeHandle) Send(ctx context.Context, input runtime.Input) error {
 	h.mu.Lock()
 	h.sends++
+	dead := h.dead
 	h.mu.Unlock()
+	if dead {
+		return errors.New("fake handle: session is closed (worker exited)")
+	}
 	if h.script != nil {
 		go h.script(h)
 	}
 	return nil
+}
+
+// markDead simulates the worker/CLI exiting while the session is idle: the
+// handle stops accepting turns (Send fails terminally) and reports Closed.
+func (h *fakeHandle) markDead() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.dead = true
+}
+
+// Closed implements the optional closedHandle capability the handler uses to
+// distinguish a dead handle (recover with a fresh execution) from a transient
+// send error.
+func (h *fakeHandle) Closed() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.dead
 }
 
 func (h *fakeHandle) SendCount() int {
@@ -98,8 +120,6 @@ func (h *fakeHandle) Close(ctx context.Context) error {
 	h.closeOnce.Do(func() { close(h.closed) })
 	return nil
 }
-
-func (h *fakeHandle) Closed() <-chan struct{} { return h.closed }
 
 type fakeBackend struct {
 	mu           sync.Mutex
@@ -1131,6 +1151,55 @@ func TestMultiTurn_ReusesExecution(t *testing.T) {
 	h := backend.Handle(sid)
 	if h == nil || h.SendCount() != 2 {
 		t.Errorf("handle sends = %d, want 2", h.SendCount())
+	}
+}
+
+// TestDeadHandleBetweenTurns_RecoversWithFreshExecution is the regression test
+// for F1: a worker/handle that dies while the session is IDLE between turns
+// must be dropped and replaced with a FRESH execution on the next request.
+// Before the fix the dead handle stayed in the map, Send failed terminally,
+// and every subsequent request to the session returned 500 "failed to send
+// turn" until the gateway restarted.
+func TestDeadHandleBetweenTurns_RecoversWithFreshExecution(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(runtime.Event{Type: runtime.EventText, Text: "turn done"}, runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"})
+	})
+
+	body := chatReq("codex", false, defaultMessages())
+
+	// Turn 1 creates the session and its execution.
+	resp1 := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body)
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("turn1 status = %d (body %s)", resp1.StatusCode, readBody(t, resp1))
+	}
+	sid := resp1.Header.Get("X-Gateway-Session-Id")
+	if sid == "" {
+		t.Fatal("no X-Gateway-Session-Id in turn 1 response")
+	}
+	if got := len(backend.StartRequests()); got != 1 {
+		t.Fatalf("start requests after turn 1 = %d, want 1", got)
+	}
+
+	// The worker/CLI exits while the session is idle between turns.
+	backend.Handle(sid).markDead()
+
+	// Turn 2 on the same session must recover: drop the dead handle, start a
+	// fresh execution, and deliver the turn — NOT return 500 forever.
+	resp2 := doAuthJSONH(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body,
+		map[string]string{"X-Gateway-Session-Id": sid})
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("turn2 status = %d, want 200 (dead handle must recover with a fresh execution, body %s)", resp2.StatusCode, readBody(t, resp2))
+	}
+	if got := len(backend.StartRequests()); got != 2 {
+		t.Errorf("start requests after recovery = %d, want 2 (dead handle replaced by a fresh execution)", got)
+	}
+	fresh := backend.Handle(sid)
+	if fresh == nil {
+		t.Fatal("no fresh handle registered for the session after recovery")
+	}
+	if fresh.SendCount() != 1 {
+		t.Errorf("fresh handle sends = %d, want 1 (the turn was delivered to the fresh execution)", fresh.SendCount())
 	}
 }
 

@@ -286,15 +286,16 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 	// Execution goes through the runtime.ExecutionBackend — the API never
 	// starts a CLI itself. A live session reuses its existing execution.
+	startReq := runtime.StartRequest{
+		ModelID:     req.Model,
+		SessionID:   sessionID,
+		OwnerID:     ownerID,
+		WorkspaceID: workspaceID,
+		Metadata:    input.Metadata,
+	}
 	handle := h.getHandle(sessionID)
 	if handle == nil {
-		startReq := runtime.StartRequest{
-			ModelID:     req.Model,
-			SessionID:   sessionID,
-			OwnerID:     ownerID,
-			WorkspaceID: workspaceID,
-			Metadata:    input.Metadata,
-		}
+		var err error
 		handle, err = h.backend.Start(r.Context(), startReq)
 		if err != nil {
 			failed = true
@@ -304,7 +305,13 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		handle = h.registerHandle(sessionID, handle)
 	}
 
-	if err := handle.Send(turnCtx, input); err != nil {
+	// Deliver the turn. A Send failure on a handle whose worker/CLI died while
+	// the session was IDLE between turns is recovered here: the stale handle is
+	// dropped and a FRESH execution is started for the session. Without this, a
+	// dead handle stays in the map and every later request to the session fails
+	// with "failed to send turn" until the gateway restarts.
+	handle, err = h.deliverTurn(turnCtx, sessionID, handle, startReq, input)
+	if err != nil {
 		failed = true
 		if r.Context().Err() != nil {
 			return // the client is gone; nothing to write
@@ -320,6 +327,59 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	}
 	res := h.aggregateTurn(turnCtx, sessionID, handle)
 	h.writeCompletion(w, r, req.Model, res)
+}
+
+// closedHandle is the optional capability an ExecutionHandle implements to
+// report that its underlying session/worker has terminated. workerSession
+// implements it; a handle whose session is closed must be dropped so a later
+// request to that session starts a fresh execution instead of wedging it.
+type closedHandle interface {
+	// Closed reports whether the underlying session has terminated. Send on a
+	// closed handle fails terminally.
+	Closed() bool
+}
+
+// deliverTurn sends a turn to the session's execution handle, recovering from
+// a DEAD handle — a worker/CLI that exited while the session was idle between
+// turns — by dropping the stale handle and starting a FRESH execution for the
+// session. This matches the "dead handle → fresh execution on resume" contract
+// that the event consumers (aggregateTurn/streamTurn) already implement for
+// mid-turn deaths: a closed events channel means the execution terminated and
+// the handle must not be reused.
+func (h *Handler) deliverTurn(ctx context.Context, sessionID string, handle runtime.ExecutionHandle, startReq runtime.StartRequest, input runtime.Input) (runtime.ExecutionHandle, error) {
+	if err := handle.Send(ctx, input); err == nil {
+		return handle, nil
+	} else if !h.deadHandle(handle) {
+		// Transient turn error on a live handle: surface it, keep the handle.
+		return handle, err
+	}
+
+	// The session/worker is gone. Drop the stale handle (the supervisor has
+	// already reaped the dead worker and removed its session) and start a fresh
+	// execution. For resume_per_turn adapters this is the normal model; for
+	// persistent_process (claude-code) a fresh process loses in-process state
+	// but native transcript on disk allows resume — strictly better than the
+	// permanent 500 that otherwise wedges the session until gateway restart.
+	h.dropHandle(sessionID, handle)
+	fresh, err := h.backend.Start(ctx, startReq)
+	if err != nil {
+		return nil, fmt.Errorf("restart execution for session %s: %w", sessionID, err)
+	}
+	fresh = h.registerHandle(sessionID, fresh)
+	if err := fresh.Send(ctx, input); err != nil {
+		return fresh, err
+	}
+	return fresh, nil
+}
+
+// deadHandle reports whether a Send failure means the underlying session is
+// gone (terminal) rather than a transient turn error. When the handle exposes
+// no liveness signal we are conservative and treat the failure as transient.
+func (h *Handler) deadHandle(handle runtime.ExecutionHandle) bool {
+	if ch, ok := handle.(closedHandle); ok {
+		return ch.Closed()
+	}
+	return false
 }
 
 func (h *Handler) deleteSession(ctx context.Context, id, ownerID string) {

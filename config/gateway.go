@@ -156,6 +156,15 @@ type SeccompConfig struct {
 }
 
 // AgentConfig configures one agent adapter.
+//
+// PHASE-1 LIMITATION: per-agent settings are parsed and validated here but are
+// NOT yet threaded through the nsjail boundary into the worker process — the
+// worker's adapters build their Options from the process environment, which
+// nsjail KeepEnv strips down to a fixed allowlist (see worker/supervisor.go
+// StartSession). Agents therefore run with adapter built-in defaults,
+// permission is auto-approve inside the controlled workspace, and the
+// CC_GATEWAY_* env knobs are not wired to this config either. Full per-agent
+// config wiring through the worker is a follow-up.
 type AgentConfig struct {
 	// Enabled toggles whether the agent is available. Defaults to enabled for
 	// the three first-generation agents.

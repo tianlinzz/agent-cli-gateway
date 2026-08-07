@@ -798,9 +798,13 @@ func TestSend_MultiTurnPersistentProcess(t *testing.T) {
 	}
 }
 
-// TestAbort_KillsPersistentProcess proves Abort terminates the persistent
-// Claude process (and its process group) so Close completes quickly.
-func TestAbort_KillsPersistentProcess(t *testing.T) {
+// TestAbort_KeepsPersistentProcessAlive is the regression test for F3: Abort
+// must cancel the in-flight turn WITHOUT killing the persistent Claude process
+// or destroying the session, so a subsequent turn proceeds on the SAME
+// process. (Previously Abort cancelled the session context and killed the
+// CLI, which destroyed the whole persistent session and lost native
+// conversation history on every client disconnect.)
+func TestAbort_KeepsPersistentProcessAlive(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("process-group semantics differ on windows")
 	}
@@ -810,13 +814,13 @@ func TestAbort_KillsPersistentProcess(t *testing.T) {
 		t.Fatalf("mkdir bin: %v", err)
 	}
 
+	stdinFile := filepath.Join(workDir, "stdin.txt")
 	script := "#!/bin/sh\n" +
-		"IFS= read -r line\n" +
-		"printf '%s\\n' '{\"type\":\"system\",\"session_id\":\"sess-abort\"}'\n" +
-		"printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"working\"}]}}'\n" +
-		"sleep 30\n"
+		"while IFS= read -r line; do echo \"$line\" >> \"$CLAUDE_STDIN_FILE\"; done\n" +
+		"printf '%s\\n' '{\"type\":\"system\",\"session_id\":\"sess-persist\"}'\n"
 	writeFakeClaudeScript(t, binDir, script)
 
+	t.Setenv("CLAUDE_STDIN_FILE", stdinFile)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	cs, err := newClaudeSession(context.Background(), workDir, "claude", nil, "", "", "", "default", "", "", nil, nil, nil, nil, 0, "")
@@ -825,25 +829,41 @@ func TestAbort_KillsPersistentProcess(t *testing.T) {
 	}
 	defer cs.Close(context.Background())
 
-	if err := cs.Send(context.Background(), gwrt.Input{Messages: []gwrt.Message{{Role: "user", Content: "hi"}}}); err != nil {
-		t.Fatalf("Send: %v", err)
+	// Turn 1 is delivered to the persistent process.
+	if err := cs.Send(context.Background(), gwrt.Input{Messages: []gwrt.Message{{Role: "user", Content: "first"}}}); err != nil {
+		t.Fatalf("Send(first): %v", err)
 	}
-	// Wait until the persistent process is actually streaming a response.
-	waitForText(t, cs.Events(), "working")
+	waitForFileLines(t, stdinFile, 1)
 
+	// Abort must NOT destroy the process or the session.
 	if err := cs.Abort(context.Background()); err != nil {
 		t.Fatalf("Abort: %v", err)
 	}
-
-	done := make(chan error, 1)
-	go func() { done <- cs.Close(context.Background()) }()
+	if !cs.Alive() {
+		t.Fatal("Abort killed the persistent process; the session is destroyed")
+	}
+	// The event stream must still be open (session not torn down).
 	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Close after Abort: %v", err)
+	case _, ok := <-cs.Events():
+		if !ok {
+			t.Fatal("Abort closed the session event stream; the session is destroyed")
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("Close blocked after Abort; persistent process was not killed")
+	case <-time.After(100 * time.Millisecond):
+		// Channel open with no event yet — process still alive and serving.
+	}
+
+	// Turn 2 proceeds on the SAME process.
+	if err := cs.Send(context.Background(), gwrt.Input{Messages: []gwrt.Message{{Role: "user", Content: "second"}}}); err != nil {
+		t.Fatalf("Send(second) after Abort: %v", err)
+	}
+	waitForFileLines(t, stdinFile, 2)
+
+	data, err := os.ReadFile(stdinFile)
+	if err != nil {
+		t.Fatalf("read stdin file: %v", err)
+	}
+	if !strings.Contains(string(data), `"content":"first"`) || !strings.Contains(string(data), `"content":"second"`) {
+		t.Fatalf("stdin missing both turns after Abort: %q", string(data))
 	}
 }
 
@@ -1055,29 +1075,7 @@ func waitForDoneResult(t *testing.T, events <-chan gwrt.Event) {
 	}
 }
 
-// waitForText drains events until an EventText carrying the wanted substring
-// is seen (the process is live and streaming).
-func waitForText(t *testing.T, events <-chan gwrt.Event, want string) {
-	t.Helper()
-	timeout := time.After(5 * time.Second)
-	for {
-		select {
-		case evt, ok := <-events:
-			if !ok {
-				t.Fatal("events channel closed before text arrived")
-			}
-			if evt.Type == gwrt.EventError {
-				t.Fatalf("unexpected error event: %v", evt.Error)
-			}
-			if evt.Type == gwrt.EventText && strings.Contains(evt.Text, want) {
-				return
-			}
-		case <-timeout:
-			t.Fatalf("timed out waiting for text %q", want)
-		}
-	}
-}
-
+// waitForFileContains polls a file until it contains the wanted substring.
 func waitForFileContains(t *testing.T, path, want string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
