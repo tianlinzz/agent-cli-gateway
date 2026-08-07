@@ -1,0 +1,1256 @@
+package openai
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/tianlinzz/agent-cli-gateway/runtime"
+)
+
+// ---------------------------------------------------------------------------
+// Fake adapters, backend and session handles (the API layer only ever speaks
+// the canonical runtime contract, so a fake backend is enough; no real adapter
+// is imported here).
+// ---------------------------------------------------------------------------
+
+type fakeAdapter struct {
+	desc    runtime.Descriptor
+	descErr error
+}
+
+func (a *fakeAdapter) Describe(ctx context.Context) (runtime.Descriptor, error) {
+	return a.desc, a.descErr
+}
+
+func (a *fakeAdapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.Session, error) {
+	return nil, errors.New("fake adapter Start must never be called by the API layer")
+}
+
+type fakeHandle struct {
+	mu     sync.Mutex
+	sends  int
+	script func(h *fakeHandle) // runs once per Send, in a goroutine
+	events chan runtime.Event
+
+	abortOnce sync.Once
+	aborted   chan struct{}
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func newFakeHandle(script func(h *fakeHandle)) *fakeHandle {
+	return &fakeHandle{
+		script:  script,
+		events:  make(chan runtime.Event, 256),
+		aborted: make(chan struct{}),
+		closed:  make(chan struct{}),
+	}
+}
+
+func (h *fakeHandle) Send(ctx context.Context, input runtime.Input) error {
+	h.mu.Lock()
+	h.sends++
+	h.mu.Unlock()
+	if h.script != nil {
+		go h.script(h)
+	}
+	return nil
+}
+
+func (h *fakeHandle) SendCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.sends
+}
+
+func (h *fakeHandle) emit(evs ...runtime.Event) {
+	for _, ev := range evs {
+		h.events <- ev
+	}
+}
+
+// emitThenClose emits events and then closes the stream (session ended).
+func (h *fakeHandle) emitThenClose(evs ...runtime.Event) {
+	h.emit(evs...)
+	close(h.events)
+}
+
+func (h *fakeHandle) Events() <-chan runtime.Event { return h.events }
+
+func (h *fakeHandle) Abort(ctx context.Context) error {
+	h.abortOnce.Do(func() { close(h.aborted) })
+	return nil
+}
+
+func (h *fakeHandle) Aborted() <-chan struct{} { return h.aborted }
+
+func (h *fakeHandle) Close(ctx context.Context) error {
+	h.closeOnce.Do(func() { close(h.closed) })
+	return nil
+}
+
+func (h *fakeHandle) Closed() <-chan struct{} { return h.closed }
+
+type fakeBackend struct {
+	mu           sync.Mutex
+	handles      map[string]*fakeHandle
+	started      []runtime.StartRequest
+	startErr     error
+	preflightErr error
+	script       func(h *fakeHandle) // script handed to every created handle
+}
+
+func (b *fakeBackend) Start(ctx context.Context, req runtime.StartRequest) (runtime.ExecutionHandle, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.startErr != nil {
+		return nil, b.startErr
+	}
+	h := newFakeHandle(b.script)
+	b.handles[req.SessionID] = h
+	b.started = append(b.started, req)
+	return h, nil
+}
+
+func (b *fakeBackend) Preflight(ctx context.Context) error {
+	return b.preflightErr
+}
+
+func (b *fakeBackend) StartRequests() []runtime.StartRequest {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]runtime.StartRequest, len(b.started))
+	copy(out, b.started)
+	return out
+}
+
+func (b *fakeBackend) Handle(sessionID string) *fakeHandle {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.handles[sessionID]
+}
+
+// withScript sets the script for handles created by subsequent Start calls and
+// resets any handles/start-requests recorded so far.
+func (b *fakeBackend) withScript(script func(h *fakeHandle)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.script = script
+	b.handles = make(map[string]*fakeHandle)
+	b.started = nil
+}
+
+func newFakeBackend() *fakeBackend {
+	return &fakeBackend{handles: make(map[string]*fakeHandle)}
+}
+
+// ---------------------------------------------------------------------------
+// Test harness
+// ---------------------------------------------------------------------------
+
+const (
+	testToken     = "test-secret-token"
+	testOwner     = "owner-a"
+	testOwnerB    = "owner-b"
+	testWorkspace = "ws-default"
+)
+
+// codexDesc is the fake adapter descriptor for the "codex" model.
+var codexDesc = runtime.Descriptor{
+	ModelID:       "codex",
+	DisplayName:   "Codex",
+	Description:   "fake codex for api tests",
+	LifecycleMode: runtime.LifecycleResumePerTurn,
+	Capabilities: runtime.Capabilities{
+		Streaming: true, ToolCalls: true, Reasoning: true,
+		Permission: true, Resume: true, MultiTurn: true,
+	},
+}
+
+// newTestHandler builds a Handler backed by a fresh registry (registered fake
+// adapters), a real memory SessionStore, and a fake backend. Tests may mutate
+// opts before construction.
+func newTestHandler(t *testing.T, opts *Options) (*Handler, *fakeBackend) {
+	t.Helper()
+	if opts == nil {
+		opts = &Options{}
+	}
+	reg := runtime.NewRegistry()
+	mustRegister(t, reg, "codex", codexDesc, nil)
+	mustRegister(t, reg, "zeta", runtime.Descriptor{ModelID: "zeta", DisplayName: "Zeta"}, nil)
+	mustRegister(t, reg, "broken", runtime.Descriptor{ModelID: "broken"}, errors.New("discovery fails"))
+
+	backend := newFakeBackend()
+	store := runtime.NewMemorySessionStore()
+
+	o := *opts
+	o.Registry = reg
+	o.Store = store
+	o.Backend = backend
+	h := NewHandler(o)
+	return h, backend
+}
+
+func mustRegister(t *testing.T, reg *runtime.Registry, name string, desc runtime.Descriptor, descErr error) {
+	t.Helper()
+	reg.Register(name, func(ctx context.Context, n string) (runtime.AgentAdapter, error) {
+		return &fakeAdapter{desc: desc, descErr: descErr}, nil
+	})
+}
+
+// newTestServer wraps a Handler in an httptest.Server with auth enabled.
+func newTestServer(t *testing.T, mut ...func(*Options)) (*httptest.Server, *Handler, *fakeBackend) {
+	t.Helper()
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	opts := &Options{
+		AuthToken:   testToken,
+		OwnerHeader: "X-User-Id",
+		TurnTimeout: 5 * time.Second,
+		UsageGrace:  15 * time.Millisecond,
+		Now:         func() time.Time { return now },
+		Enabled:     func(name string) bool { return name != "disabled" },
+	}
+	for _, m := range mut {
+		m(opts)
+	}
+	h, backend := newTestHandler(t, opts)
+	ts := httptest.NewServer(h.Routes())
+	t.Cleanup(ts.Close)
+	return ts, h, backend
+}
+
+func doAuthJSON(t *testing.T, method, url, token, owner string, body any) *http.Response {
+	t.Helper()
+	return doAuthJSONH(t, method, url, token, owner, body, nil)
+}
+
+func doAuthJSONH(t *testing.T, method, url, token, owner string, body any, headers map[string]string) *http.Response {
+	t.Helper()
+	var rdr io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			t.Fatalf("marshal body: %v", err)
+		}
+		rdr = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, url, rdr)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if owner != "" {
+		req.Header.Set("X-User-Id", owner)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
+}
+
+func readBody(t *testing.T, resp *http.Response) []byte {
+	t.Helper()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return b
+}
+
+// decodeError decodes the OpenAI error envelope.
+func decodeError(t *testing.T, resp *http.Response) apiError {
+	t.Helper()
+	var eb errorBody
+	if err := json.Unmarshal(readBody(t, resp), &eb); err != nil {
+		t.Fatalf("decode error envelope: %v", err)
+	}
+	return eb.Error
+}
+
+type completionBody struct {
+	ID      string          `json:"id"`
+	Object  string          `json:"object"`
+	Model   string          `json:"model"`
+	Choices []choiceMessage `json:"choices"`
+	Usage   *usageInfo      `json:"usage"`
+}
+
+type choiceMessage struct {
+	Index        int             `json:"index"`
+	Message      chatCompMessage `json:"message"`
+	FinishReason *string         `json:"finish_reason"`
+	Logprobs     json.RawMessage `json:"logprobs"`
+}
+
+type chatCompMessage struct {
+	Role      string           `json:"role"`
+	Content   *string          `json:"content"`
+	ToolCalls []openAIToolCall `json:"tool_calls"`
+}
+
+// sseData is one parsed SSE event.
+type sseData struct {
+	raw string
+}
+
+// splitSSE splits a raw SSE body into individual "data:" payloads.
+func splitSSE(t *testing.T, body []byte) []string {
+	t.Helper()
+	var out []string
+	sc := bufio.NewScanner(bytes.NewReader(body))
+	var cur []string
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" {
+			if len(cur) > 0 {
+				out = append(out, strings.Join(cur, "\n"))
+			}
+			cur = nil
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			cur = append(cur, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scan sse body: %v", err)
+	}
+	if len(cur) > 0 {
+		out = append(out, strings.Join(cur, "\n"))
+	}
+	return out
+}
+
+func chatReq(model string, stream bool, messages []map[string]any) map[string]any {
+	body := map[string]any{
+		"model":    model,
+		"messages": messages,
+		"metadata": map[string]any{"workspace_id": testWorkspace},
+	}
+	if stream {
+		body["stream"] = true
+	}
+	return body
+}
+
+func defaultMessages() []map[string]any {
+	return []map[string]any{
+		{"role": "system", "content": "You are a helpful assistant."},
+		{"role": "user", "content": "hello"},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// /v1/models
+// ---------------------------------------------------------------------------
+
+func TestModels_SortedAndFiltered(t *testing.T) {
+	ts, h, _ := newTestServer(t)
+	_ = h
+
+	resp := doAuthJSON(t, "GET", ts.URL+"/v1/models", testToken, testOwner, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	var ml struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(readBody(t, resp), &ml); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	if ml.Object != "list" {
+		t.Errorf("object = %q, want list", ml.Object)
+	}
+	if len(ml.Data) != 2 {
+		t.Fatalf("data length = %d, want 2 (broken must be skipped, disabled excluded)", len(ml.Data))
+	}
+	// Stable sorted order by id.
+	if ml.Data[0].ID != "codex" || ml.Data[1].ID != "zeta" {
+		t.Errorf("data ids = [%s %s], want [codex zeta] (sorted)", ml.Data[0].ID, ml.Data[1].ID)
+	}
+	for _, m := range ml.Data {
+		if m.Object != "model" {
+			t.Errorf("model %s object = %q, want model", m.ID, m.Object)
+		}
+		if m.OwnedBy != "agent-cli-gateway" {
+			t.Errorf("model %s owned_by = %q, want agent-cli-gateway", m.ID, m.OwnedBy)
+		}
+	}
+}
+
+func TestModels_DisabledExcluded(t *testing.T) {
+	ts, _, _ := newTestServer(t, func(o *Options) {
+		o.Enabled = func(name string) bool { return name == "codex" }
+	})
+	resp := doAuthJSON(t, "GET", ts.URL+"/v1/models", testToken, testOwner, nil)
+	var ml struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(readBody(t, resp), &ml); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	if len(ml.Data) != 1 || ml.Data[0].ID != "codex" {
+		t.Errorf("data = %+v, want only codex (zeta/disabled excluded)", ml.Data)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Chat completions (non-stream)
+// ---------------------------------------------------------------------------
+
+func TestChatCompletions_NonStream(t *testing.T) {
+	ts, h, backend := newTestServer(t)
+	_ = h
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(
+			runtime.Event{Type: runtime.EventText, Text: "Hello "},
+			runtime.Event{Type: runtime.EventText, Text: "world"},
+			runtime.Event{Type: runtime.EventUsage, Usage: &runtime.Usage{InputTokens: 11, OutputTokens: 22, TotalTokens: 33}},
+			runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"},
+		)
+	})
+
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", false, defaultMessages()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	var cb completionBody
+	if err := json.Unmarshal(readBody(t, resp), &cb); err != nil {
+		t.Fatalf("decode completion: %v", err)
+	}
+	if cb.Object != "chat.completion" {
+		t.Errorf("object = %q, want chat.completion", cb.Object)
+	}
+	if cb.Model != "codex" {
+		t.Errorf("model = %q, want codex", cb.Model)
+	}
+	if len(cb.Choices) != 1 {
+		t.Fatalf("choices len = %d, want 1", len(cb.Choices))
+	}
+	ch := cb.Choices[0]
+	if ch.Message.Role != "assistant" {
+		t.Errorf("role = %q, want assistant", ch.Message.Role)
+	}
+	if ch.Message.Content == nil || *ch.Message.Content != "Hello world" {
+		t.Errorf("content = %v, want Hello world", ch.Message.Content)
+	}
+	if ch.FinishReason == nil || *ch.FinishReason != "stop" {
+		t.Errorf("finish_reason = %v, want stop", ch.FinishReason)
+	}
+	if cb.Usage == nil {
+		t.Fatal("usage missing")
+	}
+	if cb.Usage.PromptTokens != 11 || cb.Usage.CompletionTokens != 22 || cb.Usage.TotalTokens != 33 {
+		t.Errorf("usage = %+v, want 11/22/33", cb.Usage)
+	}
+	if cb.ID == "" || !strings.HasPrefix(cb.ID, "chatcmpl-") {
+		t.Errorf("id = %q, want chatcmpl- prefix", cb.ID)
+	}
+}
+
+func TestChatCompletions_UnknownModel(t *testing.T) {
+	ts, _, _ := newTestServer(t)
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("no-such-model", false, defaultMessages()))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	ae := decodeError(t, resp)
+	if ae.Type != "invalid_request_error" || ae.Code != "model_not_found" {
+		t.Errorf("error = %+v, want type invalid_request_error code model_not_found", ae)
+	}
+}
+
+func TestChatCompletions_AgentError(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(runtime.Event{Type: runtime.EventError, Error: "boom: codex failed"})
+	})
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", false, defaultMessages()))
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	ae := decodeError(t, resp)
+	if ae.Type != "server_error" {
+		t.Errorf("error type = %q, want server_error", ae.Type)
+	}
+	if !strings.Contains(ae.Message, "boom") {
+		t.Errorf("error message = %q, want to mention agent error", ae.Message)
+	}
+}
+
+func TestChatCompletions_ToolCalls(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(
+			runtime.Event{Type: runtime.EventText, Text: "Let me run that."},
+			runtime.Event{Type: runtime.EventToolUse, Tool: &runtime.ToolCall{
+				Name: "Bash", Arguments: map[string]any{"command": "ls -la"},
+			}},
+			runtime.Event{Type: runtime.EventToolResult, Tool: &runtime.ToolCall{
+				Name: "Bash", Result: "file1", IsError: false,
+			}},
+			runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"},
+		)
+	})
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", false, defaultMessages()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	var cb completionBody
+	if err := json.Unmarshal(readBody(t, resp), &cb); err != nil {
+		t.Fatalf("decode completion: %v", err)
+	}
+	if len(cb.Choices) != 1 {
+		t.Fatalf("choices len = %d", len(cb.Choices))
+	}
+	ch := cb.Choices[0]
+	if len(ch.Message.ToolCalls) != 1 {
+		t.Fatalf("tool_calls len = %d, want 1", len(ch.Message.ToolCalls))
+	}
+	tc := ch.Message.ToolCalls[0]
+	if tc.Type != "function" || tc.Function.Name != "Bash" {
+		t.Errorf("tool call = %+v, want function Bash", tc)
+	}
+	if !strings.Contains(tc.Function.Arguments, "ls -la") {
+		t.Errorf("tool call arguments = %q, want to contain ls -la", tc.Function.Arguments)
+	}
+	// A concrete canonical reason (end_turn) wins over the presence of tool
+	// calls: the turn is done, so clients must not loop again on tools.
+	if ch.FinishReason == nil || *ch.FinishReason != "stop" {
+		t.Errorf("finish_reason = %v, want stop (end_turn is canonical)", ch.FinishReason)
+	}
+}
+
+func TestChatCompletions_ToolCalls_EmptyReason(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(
+			runtime.Event{Type: runtime.EventToolUse, Tool: &runtime.ToolCall{
+				Name: "Bash", Arguments: map[string]any{"command": "ls"},
+			}},
+			// No explicit finish reason: the tool call is the last action, so
+			// the gateway synthesizes finish_reason tool_calls.
+			runtime.Event{Type: runtime.EventFinish, FinishReason: ""},
+		)
+	})
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", false, defaultMessages()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	var cb completionBody
+	if err := json.Unmarshal(readBody(t, resp), &cb); err != nil {
+		t.Fatalf("decode completion: %v", err)
+	}
+	if len(cb.Choices) != 1 {
+		t.Fatalf("choices len = %d, want 1", len(cb.Choices))
+	}
+	ch := cb.Choices[0]
+	if len(ch.Message.ToolCalls) != 1 {
+		t.Fatalf("tool_calls len = %d, want 1", len(ch.Message.ToolCalls))
+	}
+	if ch.FinishReason == nil || *ch.FinishReason != "tool_calls" {
+		t.Errorf("finish_reason = %v, want tool_calls (synthesized from empty reason)", ch.FinishReason)
+	}
+}
+
+func TestChatCompletions_UnknownFinishReason(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(
+			runtime.Event{Type: runtime.EventText, Text: "ok"},
+			// Unknown canonical reason: never pass it through; fall back to stop.
+			runtime.Event{Type: runtime.EventFinish, FinishReason: "pause_turn"},
+		)
+	})
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", false, defaultMessages()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	var cb completionBody
+	if err := json.Unmarshal(readBody(t, resp), &cb); err != nil {
+		t.Fatalf("decode completion: %v", err)
+	}
+	if len(cb.Choices) != 1 {
+		t.Fatalf("choices len = %d, want 1", len(cb.Choices))
+	}
+	ch := cb.Choices[0]
+	if ch.FinishReason == nil || *ch.FinishReason != "stop" {
+		t.Errorf("finish_reason = %v, want stop (unknown reason falls back)", ch.FinishReason)
+	}
+}
+
+// TestMapFinishReason pins the finish_reason mapping contract: concrete
+// canonical reasons win, tool_calls is only synthesized from an empty reason,
+// and unknown reasons fall back to the safe OpenAI default.
+func TestMapFinishReason(t *testing.T) {
+	cases := []struct {
+		name      string
+		reason    string
+		toolCalls int
+		want      string
+	}{
+		// A turn that used tools but ended with end_turn/stop is done; clients
+		// must not continue the tool loop.
+		{"text after tools", "end_turn", 1, "stop"},
+		{"explicit stop after tools", "stop", 1, "stop"},
+		{"plain end_turn", "end_turn", 0, "stop"},
+		{"empty reason, no tools", "", 0, "stop"},
+		// tool_calls is synthesized only when no canonical reason was given and
+		// the turn ended on a tool use.
+		{"synthesize after tool use", "", 1, "tool_calls"},
+		{"known tool_use reason", "tool_use", 1, "tool_calls"},
+		{"known function_calls reason", "function_calls", 1, "tool_calls"},
+		{"known requires_action reason", "requires_action", 1, "tool_calls"},
+		// Unknown reasons fall back to the safe OpenAI default.
+		{"unknown reason", "pause_turn", 0, "stop"},
+		{"unknown reason after tools", "idk", 1, "stop"},
+		// max_tokens maps to the OpenAI length value.
+		{"max_tokens", "max_tokens", 0, "length"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := mapFinishReason(c.reason, c.toolCalls); got != c.want {
+				t.Errorf("mapFinishReason(%q, %d) = %q, want %q", c.reason, c.toolCalls, got, c.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Chat completions (streaming)
+// ---------------------------------------------------------------------------
+
+func TestChatCompletions_Stream(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(
+			runtime.Event{Type: runtime.EventText, Text: "Hello"},
+			runtime.Event{Type: runtime.EventText, Text: " world"},
+			runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"},
+		)
+	})
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", true, defaultMessages()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("content-type = %q, want text/event-stream", ct)
+	}
+	events := splitSSE(t, readBody(t, resp))
+	if len(events) < 3 {
+		t.Fatalf("sse events = %d, want >= 3 (role + 2 content + final + DONE)", len(events))
+	}
+	// Last event must be [DONE].
+	if events[len(events)-1] != "[DONE]" {
+		t.Errorf("last sse event = %q, want [DONE]", events[len(events)-1])
+	}
+	// Parse the chunks and accumulate content.
+	var content strings.Builder
+	seenFinish := false
+	var lastFinish *string
+	for i := 0; i < len(events)-1; i++ {
+		var chunk struct {
+			Object  string `json:"object"`
+			Model   string `json:"model"`
+			Choices []struct {
+				Index int `json:"index"`
+				Delta struct {
+					Role    string `json:"role"`
+					Content string `json:"content"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(events[i]), &chunk); err != nil {
+			t.Fatalf("chunk %d not json: %v (raw %q)", i, err, events[i])
+		}
+		if chunk.Object != "chat.completion.chunk" {
+			t.Errorf("chunk %d object = %q, want chat.completion.chunk", i, chunk.Object)
+		}
+		if chunk.Model != "codex" {
+			t.Errorf("chunk %d model = %q, want codex", i, chunk.Model)
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		content.WriteString(chunk.Choices[0].Delta.Content)
+		if chunk.Choices[0].FinishReason != nil {
+			seenFinish = true
+			lastFinish = chunk.Choices[0].FinishReason
+		}
+	}
+	if got := content.String(); got != "Hello world" {
+		t.Errorf("streamed content = %q, want Hello world", got)
+	}
+	if !seenFinish {
+		t.Error("no final chunk with finish_reason seen")
+	} else if lastFinish == nil || *lastFinish != "stop" {
+		t.Errorf("finish_reason = %v, want stop", lastFinish)
+	}
+}
+
+func TestChatCompletions_StreamUsage(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(
+			runtime.Event{Type: runtime.EventText, Text: "hi"},
+			runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"},
+			runtime.Event{Type: runtime.EventUsage, Usage: &runtime.Usage{InputTokens: 3, OutputTokens: 5, TotalTokens: 8}},
+		)
+	})
+	body := chatReq("codex", true, defaultMessages())
+	body["stream_options"] = map[string]any{"include_usage": true}
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	events := splitSSE(t, readBody(t, resp))
+	var found bool
+	for _, ev := range events {
+		var chunk struct {
+			Choices []json.RawMessage `json:"choices"`
+			Usage   *usageInfo        `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(ev), &chunk); err != nil {
+			continue
+		}
+		if len(chunk.Choices) == 0 && chunk.Usage != nil && chunk.Usage.TotalTokens == 8 {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("streamed usage chunk (empty choices, total_tokens 8) not found")
+	}
+}
+
+func TestChatCompletions_StreamAgentError(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(
+			runtime.Event{Type: runtime.EventText, Text: "partial"},
+			runtime.Event{Type: runtime.EventError, Error: "codex exploded"},
+		)
+	})
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", true, defaultMessages()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	events := splitSSE(t, readBody(t, resp))
+	// [DONE] must still terminate the stream, and an error frame must be present.
+	if len(events) == 0 {
+		t.Fatal("stream produced no events")
+	}
+	if events[len(events)-1] != "[DONE]" {
+		t.Fatalf("last sse event = %q, want [DONE]", events[len(events)-1])
+	}
+	foundErr := false
+	for _, ev := range events[:len(events)-1] {
+		var eb errorBody
+		if err := json.Unmarshal([]byte(ev), &eb); err == nil && eb.Error.Message != "" {
+			foundErr = true
+			if eb.Error.Type != "server_error" {
+				t.Errorf("error type = %q, want server_error", eb.Error.Type)
+			}
+		}
+	}
+	if !foundErr {
+		t.Error("no error frame in stream")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
+
+func TestAuth_Required(t *testing.T) {
+	ts, _, _ := newTestServer(t)
+	for name, token := range map[string]string{"missing": "", "wrong": "not-the-token"} {
+		resp := doAuthJSON(t, "GET", ts.URL+"/v1/models", token, testOwner, nil)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s: status = %d, want 401", name, resp.StatusCode)
+		}
+		ae := decodeError(t, resp)
+		if ae.Type != "authentication_error" {
+			t.Errorf("%s: error type = %q, want authentication_error", name, ae.Type)
+		}
+	}
+	// Health endpoints must NOT require auth.
+	for _, path := range []string{"/health/live", "/health/ready"} {
+		resp := doAuthJSON(t, "GET", ts.URL+path, "", testOwner, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("%s without auth: status = %d, want 200", path, resp.StatusCode)
+		}
+	}
+}
+
+func TestAuth_DisabledWhenNoTokenConfigured(t *testing.T) {
+	ts, _, _ := newTestServer(t, func(o *Options) { o.AuthToken = "" })
+	resp := doAuthJSON(t, "GET", ts.URL+"/v1/models", "", testOwner, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 when auth disabled", resp.StatusCode)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Owner isolation + existence leak prevention
+// ---------------------------------------------------------------------------
+
+func TestOwnerIsolation_SessionNotLeaked(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(runtime.Event{Type: runtime.EventText, Text: "ok"}, runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"})
+	})
+
+	// Owner A creates a session implicitly (no gateway session id on the
+	// request) and receives it in the X-Gateway-Session-Id response header.
+	body := chatReq("codex", false, defaultMessages())
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("owner A create: status = %d (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	sid := resp.Header.Get("X-Gateway-Session-Id")
+	if sid == "" {
+		t.Fatal("owner A create did not return X-Gateway-Session-Id")
+	}
+
+	// Owner B must not be able to observe A's session: the response must be the
+	// same generic not-found/not-authorized (404), never a 403 that leaks that
+	// the session exists.
+	resp = doAuthJSONH(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwnerB, body,
+		map[string]string{"X-Gateway-Session-Id": sid})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("owner B resume: status = %d, want 404 (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	ae := decodeError(t, resp)
+	if ae.Code != "session_not_found" {
+		t.Errorf("owner B resume code = %q, want session_not_found", ae.Code)
+	}
+
+	// Same for the abort endpoint.
+	resp = doAuthJSON(t, "POST", ts.URL+"/v1/sessions/"+sid+"/abort", testToken, testOwnerB, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("owner B abort: status = %d, want 404 (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	ae = decodeError(t, resp)
+	if ae.Code != "session_not_found" {
+		t.Errorf("owner B abort code = %q, want session_not_found", ae.Code)
+	}
+
+	// Existence-leak prevention: an explicit UNKNOWN session id must produce
+	// the exact same generic 404 as a wrong-owner id — never an implicit
+	// create-and-run.
+	before := len(backend.StartRequests())
+	resp = doAuthJSONH(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body,
+		map[string]string{"X-Gateway-Session-Id": "does-not-exist"})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown session chat: status = %d, want 404 (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	ae = decodeError(t, resp)
+	if ae.Code != "session_not_found" {
+		t.Errorf("unknown session chat code = %q, want session_not_found", ae.Code)
+	}
+	if got := len(backend.StartRequests()); got != before {
+		t.Errorf("unknown explicit session id started an execution (start requests %d -> %d)", before, got)
+	}
+	resp = doAuthJSON(t, "POST", ts.URL+"/v1/sessions/does-not-exist/abort", testToken, testOwner, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown session abort: status = %d, want 404 (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Client disconnect -> abort
+// ---------------------------------------------------------------------------
+
+func TestClientDisconnect_AbortsTurn(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	// A handle that never emits anything: the turn would block forever.
+	backend.withScript(func(h *fakeHandle) {})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	body, err := json.Marshal(chatReq("codex", true, defaultMessages()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", ts.URL+"/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	req.Header.Set("X-User-Id", testOwner)
+	req.Header.Set("Content-Type", "application/json")
+
+	done := make(chan error, 1)
+	var resp *http.Response
+	go func() {
+		r, err := http.DefaultClient.Do(req)
+		resp = r
+		done <- err
+	}()
+
+	// Wait for the handler to have started the session and delivered the turn.
+	sid := ""
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		started := backend.StartRequests()
+		if len(started) > 0 {
+			sid = started[0].SessionID
+			if h := backend.Handle(sid); h != nil && h.SendCount() >= 1 {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sid == "" {
+		t.Fatal("session never started")
+	}
+	h := backend.Handle(sid)
+	if h == nil {
+		t.Fatal("handle missing")
+	}
+	if h.SendCount() < 1 {
+		t.Fatalf("send count = %d, want >= 1", h.SendCount())
+	}
+
+	// Simulate client disconnect.
+	cancel()
+	<-done
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	select {
+	case <-h.Aborted():
+	case <-time.After(3 * time.Second):
+		t.Fatal("fake handle Abort was not called after client disconnect")
+	}
+	_ = resp
+}
+
+// ---------------------------------------------------------------------------
+// Abort endpoint
+// ---------------------------------------------------------------------------
+
+func TestAbortEndpoint(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(h *fakeHandle) {})
+
+	// Start a blocking stream as owner A (session id is generated by the
+	// gateway and returned in the response header).
+	body := chatReq("codex", true, defaultMessages())
+	req, err := http.NewRequest("POST", ts.URL+"/v1/chat/completions", jsonReader(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	req.Header.Set("X-User-Id", testOwner)
+	req.Header.Set("Content-Type", "application/json")
+	respCh := make(chan *http.Response, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		r, err := http.DefaultClient.Do(req)
+		respCh <- r
+		errCh <- err
+	}()
+
+	var r *http.Response
+	select {
+	case r = <-respCh:
+		if err := <-errCh; err != nil {
+			t.Fatalf("stream request error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("streaming response never arrived")
+	}
+	sid := r.Header.Get("X-Gateway-Session-Id")
+	if sid == "" {
+		t.Fatal("no X-Gateway-Session-Id in response")
+	}
+	// Wait until the turn has actually been delivered before aborting.
+	h := backend.Handle(sid)
+	if h == nil {
+		t.Fatal("handle missing")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for h.SendCount() < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if h.SendCount() < 1 {
+		t.Fatal("turn never delivered")
+	}
+
+	// Abort it via the endpoint.
+	abortResp := doAuthJSON(t, "POST", ts.URL+"/v1/sessions/"+sid+"/abort", testToken, testOwner, nil)
+	if abortResp.StatusCode != http.StatusOK {
+		t.Fatalf("abort status = %d (body %s)", abortResp.StatusCode, readBody(t, abortResp))
+	}
+	select {
+	case <-h.Aborted():
+	case <-time.After(3 * time.Second):
+		t.Fatal("abort endpoint did not reach the handle")
+	}
+	// The blocking stream must terminate (client sees the stream end).
+	b := readBody(t, r)
+	if !strings.Contains(string(b), "[DONE]") {
+		t.Errorf("stream body missing [DONE], got %q", b)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Single active turn
+// ---------------------------------------------------------------------------
+
+func TestSessionBusy_ConcurrentTurn(t *testing.T) {
+	// A short turn timeout so the first blocking turn terminates promptly when
+	// the test ends.
+	ts, _, backend := newTestServer(t, func(o *Options) {
+		o.TurnTimeout = 300 * time.Millisecond
+	})
+	backend.withScript(func(h *fakeHandle) {})
+
+	// Start a blocking turn (session id generated by the gateway).
+	body := chatReq("codex", true, defaultMessages())
+	req, _ := http.NewRequest("POST", ts.URL+"/v1/chat/completions", jsonReader(t, body))
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	req.Header.Set("X-User-Id", testOwner)
+	req.Header.Set("Content-Type", "application/json")
+	firstResp := make(chan *http.Response, 1)
+	go func() {
+		r, _ := http.DefaultClient.Do(req)
+		firstResp <- r
+	}()
+
+	// Wait for the session id and confirm the turn is active.
+	var sid string
+	select {
+	case r := <-firstResp:
+		sid = r.Header.Get("X-Gateway-Session-Id")
+		if sid == "" {
+			t.Fatal("no X-Gateway-Session-Id in response")
+		}
+		go func() {
+			io.Copy(io.Discard, r.Body)
+			r.Body.Close()
+		}()
+	case <-time.After(5 * time.Second):
+		t.Fatal("first turn never responded")
+	}
+	h := backend.Handle(sid)
+	if h == nil {
+		t.Fatal("handle missing")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for h.SendCount() < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// A second concurrent turn on the same session must be rejected.
+	dup := chatReq("codex", true, defaultMessages())
+	resp := doAuthJSONH(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, dup,
+		map[string]string{"X-Gateway-Session-Id": sid})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("second turn status = %d, want 409 (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	ae := decodeError(t, resp)
+	if ae.Code != "session_busy" {
+		t.Errorf("code = %q, want session_busy", ae.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Multi-turn reuse
+// ---------------------------------------------------------------------------
+
+func TestMultiTurn_ReusesExecution(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(runtime.Event{Type: runtime.EventText, Text: "turn done"}, runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"})
+	})
+
+	body := chatReq("codex", false, defaultMessages())
+
+	// Turn 1 creates the execution; the gateway returns the session id.
+	resp1 := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body)
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("turn1 status = %d (body %s)", resp1.StatusCode, readBody(t, resp1))
+	}
+	sid := resp1.Header.Get("X-Gateway-Session-Id")
+	if sid == "" {
+		t.Fatal("no X-Gateway-Session-Id in turn 1 response")
+	}
+	if got := len(backend.StartRequests()); got != 1 {
+		t.Fatalf("start requests after turn 1 = %d, want 1", got)
+	}
+
+	// Turn 2 on the same session (via the gateway session header) must reuse
+	// the same execution handle, not start a second one.
+	resp2 := doAuthJSONH(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body,
+		map[string]string{"X-Gateway-Session-Id": sid})
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("turn2 status = %d (body %s)", resp2.StatusCode, readBody(t, resp2))
+	}
+	if got := len(backend.StartRequests()); got != 1 {
+		t.Errorf("start requests after turn 2 = %d, want 1 (execution reused)", got)
+	}
+	h := backend.Handle(sid)
+	if h == nil || h.SendCount() != 2 {
+		t.Errorf("handle sends = %d, want 2", h.SendCount())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Normalizer: no client-controlled workdir; messages/tools/metadata mapping
+// ---------------------------------------------------------------------------
+
+func TestNormalizer_NoWorkDirInjection(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(runtime.Event{Type: runtime.EventText, Text: "ok"}, runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"})
+	})
+
+	body := map[string]any{
+		"model": "codex",
+		"messages": []map[string]any{
+			{"role": "system", "content": "sys"},
+			{"role": "user", "content": "do something"},
+			{"role": "assistant", "content": nil, "tool_calls": []map[string]any{
+				{"id": "call_1", "type": "function", "function": map[string]any{
+					"name": "Bash", "arguments": `{"command":"ls"}`,
+				}},
+			}},
+			{"role": "tool", "tool_call_id": "call_1", "content": "file list"},
+		},
+		"tools": []map[string]any{
+			{"type": "function", "function": map[string]any{
+				"name": "Bash", "description": "run a shell command",
+				"parameters": map[string]any{"type": "object", "properties": map[string]any{}},
+			}},
+		},
+		"metadata": map[string]any{
+			"workdir":           "/etc",
+			"cwd":               "/tmp",
+			"working_directory": "/var",
+			"workspace_id":      "ws-norm",
+			"trace_id":          "abc",
+		},
+	}
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	sid := resp.Header.Get("X-Gateway-Session-Id")
+	if sid == "" {
+		t.Fatal("no X-Gateway-Session-Id in response")
+	}
+
+	reqs := backend.StartRequests()
+	if len(reqs) != 1 {
+		t.Fatalf("start requests = %d, want 1", len(reqs))
+	}
+	sr := reqs[0]
+	// The gateway must route workspace_id from metadata to the start request.
+	if sr.WorkspaceID != "ws-norm" {
+		t.Errorf("workspace id = %q, want ws-norm", sr.WorkspaceID)
+	}
+	if sr.SessionID != sid {
+		t.Errorf("session id = %q, want gateway-generated %q", sr.SessionID, sid)
+	}
+	// Absolute-path metadata must never be forwarded to the execution.
+	for _, key := range []string{"workdir", "cwd", "working_directory"} {
+		if _, ok := sr.Metadata[key]; ok {
+			t.Errorf("metadata %q leaked into the start request: %v", key, sr.Metadata)
+		}
+	}
+	if sr.Metadata["trace_id"] != "abc" {
+		t.Errorf("trace_id metadata lost: %v", sr.Metadata)
+	}
+	if sr.ModelID != "codex" || sr.OwnerID != testOwner {
+		t.Errorf("start request = %+v, want model codex owner %s", sr, testOwner)
+	}
+	if h := backend.Handle(sid); h == nil {
+		t.Fatal("handle missing")
+	}
+
+	// Resume routing via metadata["session_id"] (not the header) must resolve
+	// to the same session and reuse the execution.
+	resumeBody := map[string]any{
+		"model":    "codex",
+		"messages": defaultMessages(),
+		"metadata": map[string]any{"session_id": sid, "workspace_id": "ws-norm"},
+	}
+	resp2 := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, resumeBody)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("resume status = %d (body %s)", resp2.StatusCode, readBody(t, resp2))
+	}
+	if got := len(backend.StartRequests()); got != 1 {
+		t.Errorf("start requests after metadata-session resume = %d, want 1 (execution reused)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
+
+func TestHealth(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	resp := doAuthJSON(t, "GET", ts.URL+"/health/live", "", testOwner, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("live status = %d, want 200", resp.StatusCode)
+	}
+	resp = doAuthJSON(t, "GET", ts.URL+"/health/ready", "", testOwner, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("ready status = %d, want 200", resp.StatusCode)
+	}
+	// Preflight failure must make readiness 503.
+	backend.preflightErr = errors.New("nsjail binary missing")
+	resp = doAuthJSON(t, "GET", ts.URL+"/health/ready", "", testOwner, nil)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("ready with preflight failure status = %d, want 503", resp.StatusCode)
+	}
+}
+
+// jsonReader builds an io.Reader from a value.
+func jsonReader(t *testing.T, v any) io.Reader {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bytes.NewReader(b)
+}
