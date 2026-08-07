@@ -1,0 +1,414 @@
+package runtime_test
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/tianlinzz/agent-cli-gateway/runtime"
+)
+
+func sessionRec(id, owner string) runtime.SessionRecord {
+	return runtime.SessionRecord{
+		ID:          id,
+		ModelID:     "alpha",
+		OwnerID:     owner,
+		WorkspaceID: "ws-1",
+		Status:      runtime.SessionActive,
+	}
+}
+
+func TestSessionStoreCreateAndGet(t *testing.T) {
+	store := runtime.NewMemorySessionStore()
+	ctx := context.Background()
+
+	rec := sessionRec("s1", "alice")
+	rec.NativeSessionID = "native-1"
+	if err := store.Create(ctx, rec); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, err := store.Get(ctx, "s1", "alice")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.ID != "s1" || got.OwnerID != "alice" || got.ModelID != "alpha" {
+		t.Fatalf("Get returned wrong record: %+v", got)
+	}
+	if got.NativeSessionID != "native-1" {
+		t.Fatalf("NativeSessionID = %q, want %q", got.NativeSessionID, "native-1")
+	}
+	if got.Status != runtime.SessionActive {
+		t.Fatalf("Status = %q, want %q", got.Status, runtime.SessionActive)
+	}
+}
+
+// TestSessionStoreGetReturnsCopy pins the no-pointer-leak rule: mutating a
+// returned record must never mutate the store's internal state.
+func TestSessionStoreGetReturnsCopy(t *testing.T) {
+	store := runtime.NewMemorySessionStore()
+	ctx := context.Background()
+
+	if err := store.Create(ctx, sessionRec("s1", "alice")); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, err := store.Get(ctx, "s1", "alice")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got.Status = runtime.SessionClosed
+	got.ModelID = "hacked"
+	got.WorkspaceID = "escaped"
+	got.OwnerID = "mallory"
+
+	again, err := store.Get(ctx, "s1", "alice")
+	if err != nil {
+		t.Fatalf("second Get: %v", err)
+	}
+	if again.Status != runtime.SessionActive || again.ModelID != "alpha" {
+		t.Fatalf("store state leaked after mutating returned record: %+v", again)
+	}
+	if again.WorkspaceID != "ws-1" || again.OwnerID != "alice" {
+		t.Fatalf("store state leaked after mutating returned record: %+v", again)
+	}
+}
+
+func TestSessionStoreRejectsDuplicateCreate(t *testing.T) {
+	store := runtime.NewMemorySessionStore()
+	ctx := context.Background()
+
+	if err := store.Create(ctx, sessionRec("s1", "alice")); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+	if err := store.Create(ctx, sessionRec("s1", "bob")); !errors.Is(err, runtime.ErrSessionExists) {
+		t.Fatalf("duplicate Create error = %v, want ErrSessionExists", err)
+	}
+}
+
+func TestSessionStoreRejectsInvalidCreate(t *testing.T) {
+	store := runtime.NewMemorySessionStore()
+	ctx := context.Background()
+
+	emptyID := sessionRec("", "alice")
+	if err := store.Create(ctx, emptyID); !errors.Is(err, runtime.ErrInvalidSession) {
+		t.Fatalf("Create with empty ID error = %v, want ErrInvalidSession", err)
+	}
+	emptyOwner := sessionRec("s1", "")
+	if err := store.Create(ctx, emptyOwner); !errors.Is(err, runtime.ErrInvalidSession) {
+		t.Fatalf("Create with empty owner error = %v, want ErrInvalidSession", err)
+	}
+	badStatus := sessionRec("s1", "alice")
+	badStatus.Status = runtime.SessionStatus("nonsense")
+	if err := store.Create(ctx, badStatus); !errors.Is(err, runtime.ErrInvalidSession) {
+		t.Fatalf("Create with invalid status error = %v, want ErrInvalidSession", err)
+	}
+}
+
+// TestSessionStoreOwnerIsolation verifies every read and mutation is
+// owner-scoped: a request from a different owner must fail with
+// ErrSessionForbidden and must never see the session.
+func TestSessionStoreOwnerIsolation(t *testing.T) {
+	store := runtime.NewMemorySessionStore()
+	ctx := context.Background()
+
+	if err := store.Create(ctx, sessionRec("s1", "alice")); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	ops := []struct {
+		name string
+		run  func() error
+	}{
+		{"Get", func() error { _, err := store.Get(ctx, "s1", "bob"); return err }},
+		{"Update", func() error {
+			_, err := store.Update(ctx, "s1", "bob", func(*runtime.SessionRecord) {})
+			return err
+		}},
+		{"BeginTurn", func() error { return store.BeginTurn(ctx, "s1", "bob") }},
+		{"EndTurn", func() error { return store.EndTurn(ctx, "s1", "bob") }},
+		{"Touch", func() error { return store.Touch(ctx, "s1", "bob", time.Minute) }},
+		{"Delete", func() error { return store.Delete(ctx, "s1", "bob") }},
+	}
+	for _, op := range ops {
+		t.Run(op.name, func(t *testing.T) {
+			if err := op.run(); !errors.Is(err, runtime.ErrSessionForbidden) {
+				t.Fatalf("%s by wrong owner error = %v, want ErrSessionForbidden", op.name, err)
+			}
+		})
+	}
+
+	// The session must still exist and be owned by alice after all the
+	// rejected operations.
+	if _, err := store.Get(ctx, "s1", "alice"); err != nil {
+		t.Fatalf("session lost after rejected ops: %v", err)
+	}
+	// alice must not see bob's sessions and vice versa.
+	if err := store.Create(ctx, sessionRec("s2", "bob")); err != nil {
+		t.Fatalf("Create(s2, bob): %v", err)
+	}
+	aliceList, _ := store.List(ctx, "alice")
+	if len(aliceList) != 1 || aliceList[0].ID != "s1" {
+		t.Fatalf("List(alice) = %+v, want only s1", aliceList)
+	}
+	bobList, _ := store.List(ctx, "bob")
+	if len(bobList) != 1 || bobList[0].ID != "s2" {
+		t.Fatalf("List(bob) = %+v, want only s2", bobList)
+	}
+}
+
+func TestSessionStoreSingleActiveTurn(t *testing.T) {
+	store := runtime.NewMemorySessionStore()
+	ctx := context.Background()
+
+	if err := store.Create(ctx, sessionRec("s1", "alice")); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := store.BeginTurn(ctx, "s1", "alice"); err != nil {
+		t.Fatalf("first BeginTurn: %v", err)
+	}
+	rec, _ := store.Get(ctx, "s1", "alice")
+	if rec.Status != runtime.SessionTurnActive {
+		t.Fatalf("Status after BeginTurn = %q, want %q", rec.Status, runtime.SessionTurnActive)
+	}
+
+	// A second active turn on the same session must be rejected.
+	if err := store.BeginTurn(ctx, "s1", "alice"); !errors.Is(err, runtime.ErrSessionBusy) {
+		t.Fatalf("second BeginTurn error = %v, want ErrSessionBusy", err)
+	}
+
+	// EndTurn clears the active-turn flag and returns the session to active.
+	if err := store.EndTurn(ctx, "s1", "alice"); err != nil {
+		t.Fatalf("EndTurn: %v", err)
+	}
+	rec, _ = store.Get(ctx, "s1", "alice")
+	if rec.Status != runtime.SessionActive {
+		t.Fatalf("Status after EndTurn = %q, want %q", rec.Status, runtime.SessionActive)
+	}
+	if err := store.BeginTurn(ctx, "s1", "alice"); err != nil {
+		t.Fatalf("BeginTurn after EndTurn: %v", err)
+	}
+}
+
+func TestSessionStoreRejectsTurnsOnTerminalSessions(t *testing.T) {
+	store := runtime.NewMemorySessionStore()
+	ctx := context.Background()
+
+	rec := sessionRec("s1", "alice")
+	rec.Status = runtime.SessionClosed
+	if err := store.Create(ctx, rec); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := store.BeginTurn(ctx, "s1", "alice"); !errors.Is(err, runtime.ErrSessionState) {
+		t.Fatalf("BeginTurn on closed session error = %v, want ErrSessionState", err)
+	}
+
+	rec.Status = runtime.SessionClosing
+	rec.ID = "s2"
+	if err := store.Create(ctx, rec); err != nil {
+		t.Fatalf("Create(s2): %v", err)
+	}
+	if err := store.BeginTurn(ctx, "s2", "alice"); !errors.Is(err, runtime.ErrSessionState) {
+		t.Fatalf("BeginTurn on closing session error = %v, want ErrSessionState", err)
+	}
+}
+
+func TestSessionStoreUpdate(t *testing.T) {
+	store := runtime.NewMemorySessionStore()
+	ctx := context.Background()
+
+	created := time.Unix(1000, 0)
+	rec := sessionRec("s1", "alice")
+	rec.CreatedAt = created
+	if err := store.Create(ctx, rec); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	updated, err := store.Update(ctx, "s1", "alice", func(r *runtime.SessionRecord) {
+		r.WorkerID = "worker-7"
+		r.NodeID = "node-3"
+		r.NativeSessionID = "native-9"
+	})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if updated.WorkerID != "worker-7" || updated.NodeID != "node-3" || updated.NativeSessionID != "native-9" {
+		t.Fatalf("Update did not persist fields: %+v", updated)
+	}
+	// CreatedAt is immutable; UpdatedAt must be stamped forward.
+	if !updated.CreatedAt.Equal(created) {
+		t.Fatalf("Update changed CreatedAt: %v, want %v", updated.CreatedAt, created)
+	}
+	if updated.UpdatedAt.Before(created) {
+		t.Fatalf("UpdatedAt %v not stamped after creation", updated.UpdatedAt)
+	}
+
+	got, _ := store.Get(ctx, "s1", "alice")
+	if got.WorkerID != "worker-7" {
+		t.Fatalf("Update did not persist to store: %+v", got)
+	}
+}
+
+func TestSessionStoreTouchAndExpiry(t *testing.T) {
+	store := runtime.NewMemorySessionStore()
+	ctx := context.Background()
+
+	rec := sessionRec("s1", "alice")
+	rec.ExpiresAt = time.Now().Add(24 * time.Hour)
+	if err := store.Create(ctx, rec); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Touch with a TTL extends the expiry and stamps UpdatedAt.
+	if err := store.Touch(ctx, "s1", "alice", time.Hour); err != nil {
+		t.Fatalf("Touch: %v", err)
+	}
+	got, _ := store.Get(ctx, "s1", "alice")
+	if !got.ExpiresAt.After(time.Now().Add(30 * time.Minute)) {
+		t.Fatalf("Touch did not extend expiry: %v", got.ExpiresAt)
+	}
+
+	// Expired records are purged lazily on Get.
+	rec.ExpiresAt = time.Now().Add(-time.Second)
+	rec.ID = "s-expired"
+	if err := store.Create(ctx, rec); err != nil {
+		t.Fatalf("Create(s-expired): %v", err)
+	}
+	if _, err := store.Get(ctx, "s-expired", "alice"); !errors.Is(err, runtime.ErrSessionNotFound) {
+		t.Fatalf("Get on expired session error = %v, want ErrSessionNotFound", err)
+	}
+
+	// Prune physically removes expired records at the given clock time.
+	rec.ID = "s-stale"
+	rec.ExpiresAt = time.Now().Add(-time.Second)
+	if err := store.Create(ctx, rec); err != nil {
+		t.Fatalf("Create(s-stale): %v", err)
+	}
+	n, err := store.Prune(ctx, time.Now())
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("Prune removed %d, want 1", n)
+	}
+	if _, err := store.Get(ctx, "s-stale", "alice"); !errors.Is(err, runtime.ErrSessionNotFound) {
+		t.Fatalf("Get after Prune error = %v, want ErrSessionNotFound", err)
+	}
+	// A fresh session must survive Prune.
+	if _, err := store.Get(ctx, "s1", "alice"); err != nil {
+		t.Fatalf("s1 should survive Prune: %v", err)
+	}
+}
+
+func TestSessionStoreDelete(t *testing.T) {
+	store := runtime.NewMemorySessionStore()
+	ctx := context.Background()
+
+	if err := store.Create(ctx, sessionRec("s1", "alice")); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := store.Delete(ctx, "s1", "alice"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := store.Get(ctx, "s1", "alice"); !errors.Is(err, runtime.ErrSessionNotFound) {
+		t.Fatalf("Get after Delete error = %v, want ErrSessionNotFound", err)
+	}
+	// Deleting again reports not found, not forbidden.
+	if err := store.Delete(ctx, "s1", "alice"); !errors.Is(err, runtime.ErrSessionNotFound) {
+		t.Fatalf("second Delete error = %v, want ErrSessionNotFound", err)
+	}
+}
+
+func TestSessionStoreListScopedAndSorted(t *testing.T) {
+	store := runtime.NewMemorySessionStore()
+	ctx := context.Background()
+
+	mk := func(id, owner string, created int64) runtime.SessionRecord {
+		r := sessionRec(id, owner)
+		r.CreatedAt = time.Unix(created, 0)
+		return r
+	}
+	for _, rec := range []runtime.SessionRecord{
+		mk("s3", "alice", 300),
+		mk("s1", "alice", 100),
+		mk("s2", "alice", 200),
+		mk("sX", "bob", 50),
+	} {
+		if err := store.Create(ctx, rec); err != nil {
+			t.Fatalf("Create(%s): %v", rec.ID, err)
+		}
+	}
+
+	alice, err := store.List(ctx, "alice")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(alice) != 3 {
+		t.Fatalf("List(alice) returned %d sessions, want 3", len(alice))
+	}
+	for i, want := range []string{"s1", "s2", "s3"} {
+		if alice[i].ID != want {
+			t.Fatalf("List(alice)[%d].ID = %q, want %q (sorted by CreatedAt)", i, alice[i].ID, want)
+		}
+	}
+
+	bob, _ := store.List(ctx, "bob")
+	if len(bob) != 1 || bob[0].ID != "sX" {
+		t.Fatalf("List(bob) = %+v, want only sX", bob)
+	}
+}
+
+// TestSessionStoreConcurrentBeginTurnOnlyOneWins proves the single-active-turn
+// constraint holds under concurrency (run with -race): exactly one of N racing
+// BeginTurn calls may win.
+func TestSessionStoreConcurrentBeginTurnOnlyOneWins(t *testing.T) {
+	store := runtime.NewMemorySessionStore()
+	ctx := context.Background()
+
+	if err := store.Create(ctx, sessionRec("s1", "alice")); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	const n = 16
+	var wg sync.WaitGroup
+	wins := make(chan struct{}, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := store.BeginTurn(ctx, "s1", "alice"); err == nil {
+				wins <- struct{}{}
+			}
+		}()
+	}
+	wg.Wait()
+	if got := len(wins); got != 1 {
+		t.Fatalf("%d concurrent BeginTurn calls won, want exactly 1", got)
+	}
+
+	// The session must still be owned by alice and a subsequent EndTurn works.
+	if err := store.EndTurn(ctx, "s1", "alice"); err != nil {
+		t.Fatalf("EndTurn after race: %v", err)
+	}
+}
+
+// TestSessionRecordContainsNoProcessPointers is a structural guard for the
+// "no process pointers leak" invariant: every field of SessionRecord must be a
+// value type (string, time.Time, enum). Anything pointer-like (ptr, slice,
+// map, chan, func, interface, unsafe.Pointer) would let callers mutate store
+// internals or escape the process.
+func TestSessionRecordContainsNoProcessPointers(t *testing.T) {
+	typ := reflect.TypeOf(runtime.SessionRecord{})
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		switch f.Type.Kind() {
+		case reflect.Ptr, reflect.Slice, reflect.Map, reflect.Chan, reflect.Func,
+			reflect.Interface, reflect.UnsafePointer:
+			t.Errorf("SessionRecord.%s has kind %v: pointer-like fields are forbidden", f.Name, f.Type.Kind())
+		}
+	}
+}
