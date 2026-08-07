@@ -1,0 +1,53 @@
+# .dockerignore — keep the Docker build context minimal.
+#
+# The Dockerfile's `COPY . .` (gobuild stage) otherwise ships the git-ignored
+# ~18MB `gateway` + ~15MB `gateway-worker` binaries, `gateway-run/`, `.git/`,
+# `workspaces/`, `tmp/`, and other local state to the daemon on every build.
+#
+# Source the Dockerfile needs stays included: cmd/, runtime/, worker/, api/,
+# adapters/, config/, workspace/, go.mod, go.sum, Makefile, Dockerfile, docker/
+# (entrypoint.sh).
+
+# VCS / tooling
+.git/
+.github/
+.zcode/
+.claude/
+.superpowers/
+
+# Build artifacts
+/gateway
+/gateway-worker
+bin/
+dist/
+build/
+release/
+
+# Runtime state (dev)
+gateway-run/
+workspaces/
+tmp/
+temp/
+test/
+
+# Tests (not needed to build the binaries; integration/ is hermetic but only
+# exercised by `go test`, not by the image build)
+integration/
+
+# Migration reference (compiled out behind the `agent_ref` build tag; still
+# imports the deleted core package and deliberately does not compile)
+agent/
+
+# Docs, dev files, and markdown (not needed in the image)
+docs/
+scripts/
+config.example.toml
+*.md
+
+# Node modules (not used by the Go build)
+node_modules/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

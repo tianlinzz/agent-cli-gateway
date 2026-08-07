@@ -1,277 +1,263 @@
-# CC-Connect Development Guide
+# Agent Gateway Development Guide
 
 ## Project Overview
 
-CC-Connect is a bridge that connects AI coding agents (Claude Code, Codex, Gemini CLI, Cursor, etc.) with messaging platforms (Feishu/Lark, Telegram, Discord, Slack, DingTalk, WeChat Work, QQ, LINE). Users interact with their coding agent through their preferred messaging app.
+`agent-cli-gateway` is an OpenAI-compatible **Agent Gateway** that exposes coding
+agents (Codex, Claude Code, Kimi) behind a single HTTP API. Clients talk
+standard OpenAI shapes (`/v1/models`, `/v1/chat/completions`, SSE streaming);
+the gateway forks one **nsjail-isolated worker process per session** and the
+worker owns the actual agent CLI. Every agent executes inside a sandbox — a
+worker crash or a CLI meltdown never takes the gateway down and never leaks
+into another session.
+
+This is a rewrite of cc-connect: the IM platform layer (Feishu/Telegram/Discord
+and friends) and the management/event APIs are gone, replaced by a clean
+OpenAI-compatible surface and a process-isolation-first execution model.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│                   cmd/cc-connect                │  ← entry point, CLI, daemon
-├─────────────────────────────────────────────────┤
-│                     config/                     │  ← TOML config parsing
-├─────────────────────────────────────────────────┤
-│                      core/                      │  ← engine, interfaces, i18n,
-│                                                 │     cards, sessions, registry
-├──────────────────────┬──────────────────────────┤
-│     agent/           │      platform/           │
-│  ├── claudecode/     │  ├── feishu/             │
-│  ├── codex/          │  ├── telegram/           │
-│  ├── cursor/         │  ├── discord/            │
-│  ├── gemini/         │  ├── slack/              │
-│  ├── iflow/          │  ├── dingtalk/           │
-│  ├── opencode/       │  ├── wecom/              │
-│  ├── acp/            │  ├── qq/                 │
-│  └── qoder/          │  ├── qqbot/              │
-│                      │  ├── line/               │
-│                      │  └── weibo/              │
-├──────────────────────┴──────────────────────────┤
-│                     daemon/                     │  ← systemd/launchd service
-└─────────────────────────────────────────────────┘
+HTTP client (any OpenAI client)
+        │  /v1/* + SSE (Bearer token, X-User-Id)
+        ▼
+cmd/gateway  (API process + worker Supervisor)
+  ├── api/openai     OpenAI-compatible HTTP layer (models/chat/abort/health)
+  ├── runtime        canonical contract: descriptors, events, session store,
+  │                  registry, execution backend
+  ├── config         TOML config (config.GatewayConfig)
+  └── worker
+      ├── supervisor   forks/reaps one nsjail-wrapped worker per session
+      ├── rpc          gRPC Worker contract over per-session Unix sockets
+      └── nsjail       profile generation + preflight
+              │  fork: nsjail -Mo --config profile -- gateway-worker
+              ▼
+cmd/gateway-worker   (one per session; the ONLY process that runs agent CLIs)
+  └── adapters/{codex,claudecode,kimi}   native CLI process mgmt + parsing
 ```
 
 ### Key Design Principles
 
-**`core/` is the nucleus.** It defines all interfaces (`Platform`, `Agent`, `AgentSession`, etc.) and contains the `Engine` that orchestrates message flow. The core package must **never** import from `agent/` or `platform/`.
+**`runtime/` is the nucleus.** It defines the canonical contract
+(`Descriptor`, `AgentAdapter`, `Session`, `ExecutionBackend`, `Event`,
+`SessionRecord`, `SessionStore`, `Registry`) that every layer speaks. The
+runtime package is deliberately transport-agnostic: it imports only the
+standard library and never references HTTP, gRPC, Unix sockets, platform/IM
+types, or any concrete adapter.
 
-**Plugin architecture via registries.** Agents and platforms register themselves through `core.RegisterAgent()` and `core.RegisterPlatform()` in their `init()` functions. The engine creates instances via `core.CreateAgent()` / `core.CreatePlatform()` using string names from config.
+**Adapters register themselves by string name.** Adapter packages call
+`runtime.Register(name, factory)` from their `init()`; the gateway entrypoints
+(`cmd/gateway/plugin_agent_*.go`, `cmd/gateway-worker/plugin_agent_*.go`) import
+them and names from config are wired into the process-wide registry
+(`runtime.DefaultRegistry()`). Nothing in `runtime/` knows any specific agent.
 
 **Dependency direction:**
 ```
-cmd/ → config/, core/, agent/*, platform/*
-agent/*   → core/   (never other agents or platforms)
-platform/* → core/  (never other platforms or agents)
-core/     → stdlib only (never agent/ or platform/)
+cmd/gateway → config/, runtime/, api/openai/, worker/
+cmd/gateway-worker → adapters/*, runtime/
+api/openai → runtime/   (never adapters/, worker/, or config/)
+adapters/* → runtime/   (never api/, worker/, or each other)
+worker/     → runtime/, workspace/, config/ (never adapters/ or api/)
+workspace/  → stdlib only
+runtime/    → stdlib only
 ```
 
 ### Core Interfaces
 
-- **`Platform`** — messaging platform adapter (Start, Reply, Send, Stop)
-- **`Agent`** — AI coding agent adapter (StartSession, ListSessions, Stop)
-- **`AgentSession`** — a running bidirectional session (Send, RespondPermission, Events)
-- **`Engine`** — the central orchestrator that routes messages between platforms and agents
-
-Optional capability interfaces (implement only when needed):
-- `CardSender` — rich card messages
-- `InlineButtonSender` — inline keyboard buttons
-- `ProviderSwitcher` — multi-model switching
-- `DoctorChecker` — agent-specific health checks
-- `AgentDoctorInfo` — CLI binary metadata for diagnostics
+- **`AgentAdapter`** — canonical adapter contract (`Describe`, `Start`). The
+  API layer never imports an adapter directly.
+- **`Session`** — a running agent session (`Send`, `Events`, `Abort`, `Close`).
+- **`ExecutionBackend` / `ExecutionHandle`** — the API layer's only way to
+  execute a model request. Transport details (worker processes, gRPC, Unix
+  sockets, nsjail) hide behind this interface; a future cross-node deployment
+  replaces only it, never the adapter or API contract.
+- **`Registry`** — thread-safe registry of adapter factories keyed by string
+  name; deliberately name-agnostic.
+- **`SessionStore`** — owner-scoped session metadata store (in-memory for
+  phase 1); every read returns a deep copy and operations are scoped to the
+  owner so one tenant can never observe another's sessions.
+- **`Event`** — canonical runtime events: `text`, `tool_use`, `tool_result`,
+  `permission`, `usage`, `error`, `finish`, `status`. This is the only event
+  shape that crosses the API boundary.
 
 ## Development Rules
 
-### 1. No Hardcoding Platform or Agent Names in Core
+### 1. No Hardcoded Agent Names in Runtime
 
-The `core/` package must remain agnostic. Never write `if p.Name() == "feishu"` or `CreateAgent("claudecode", ...)` in core. Use interfaces and capability checks instead:
+`runtime/` must stay name-agnostic. Never write `if name == "codex"` in
+runtime, and never import `adapters/*` from `api/` or `worker/`. Use the
+registry and capability-based checks instead:
 
 ```go
-// BAD — hardcodes platform knowledge in core
-if p.Name() == "feishu" && supportsCards(p) {
+// BAD — hardcodes an agent in runtime
+if req.ModelID == "codex" && supportsPermission(req) {
 
 // GOOD — capability-based check
-if supportsCards(p) {
-```
-
-```go
-// BAD — hardcodes agent type
-agent, _ := CreateAgent("claudecode", opts)
-
-// GOOD — derives from current agent
-agent, _ := CreateAgent(e.agent.Name(), opts)
+if d.Capabilities.Permission {
 ```
 
 ### 2. Prefer Interfaces Over Type Switches
 
-When behavior differs across platforms/agents, define an optional interface in core and let implementations opt in:
+When behavior differs across adapters/backends, define an optional interface in
+`runtime/` and let implementations opt in. Query via the interface and fall
+back gracefully:
 
 ```go
-// In core/
-type AgentDoctorInfo interface {
-    CLIBinaryName() string
-    CLIDisplayName() string
-}
-
-// In agent/claudecode/
-func (a *Agent) CLIBinaryName() string  { return "claude" }
-func (a *Agent) CLIDisplayName() string { return "Claude" }
-
-// In core/ — query via interface, fallback gracefully
-if info, ok := agent.(AgentDoctorInfo); ok {
-    bin = info.CLIBinaryName()
+if handle, ok := someBackend.(OptionalCapability); ok {
+    handle.OptionalBehavior()
 }
 ```
 
 ### 3. Configuration Over Code
 
-- Features that may vary per deployment should be configurable in `config.toml`
-- Use `map[string]any` options for agent/platform factories to stay flexible
-- Add new config fields with sensible defaults so existing configs don't break
+- Features that may vary per deployment are configurable in `gateway.toml`
+  (`config.GatewayConfig` — server/auth/workspace/isolation/per-agent).
+- Add new config fields with sensible defaults so existing configs don't break.
+- The `test` runtime mode is the ONLY mode that may disable nsjail isolation;
+  prod and dev fail closed without the sandbox.
 
 ### 4. High Cohesion, Low Coupling
 
-- Each `agent/X/` package is self-contained: it handles process lifecycle, output parsing, and session management for agent X
-- Each `platform/X/` package is self-contained: it handles API connection, message receiving/sending, and card rendering for platform X
-- Cross-cutting concerns (i18n, cards, streaming, rate limiting) live in `core/`
+- Each `adapters/X/` package is self-contained: process lifecycle, output
+  parsing, and session management for agent X, speaking only the runtime
+  contract.
+- `worker/` owns everything about process isolation: the supervisor, the gRPC
+  RPC layer, and `worker/nsjail/` profile generation + preflight.
+- `api/openai/` translates OpenAI shapes ↔ runtime contract and holds no
+  agent-specific logic.
+- Cross-cutting concerns live in their own packages (`api/openai` auth,
+  `workspace/` resolution, `runtime/` session store).
 
-### 5. Error Handling
+### 5. Isolation Is Mandatory
 
-- Always wrap errors with context: `fmt.Errorf("feishu: reply card: %w", err)`
-- Never silently swallow errors; at minimum log them with `slog.Error` / `slog.Warn`
-- Use `slog` (structured logging) consistently; never `log.Printf` or `fmt.Printf` for runtime logs
-- Redact tokens/secrets in error messages using `core.RedactToken()`
+- Production and dev profiles refuse to start sessions without nsjail
+  (fail-closed). Only the `test` profile may spawn workers directly.
+- Never add a code path that silently falls back to an unsandboxed spawn; on
+  non-Linux hosts the jailed path fails closed too.
+- The worker layer spawns one jailed `gateway-worker` per session; the API
+  process must never launch an agent CLI itself.
+- Workspace access is a security boundary: clients submit opaque
+  `workspace_id`s; `workspace/` resolves them to directories under a
+  configured root, and the directory is bind-mounted into the sandbox. No
+  client-controlled absolute path can ever be injected.
 
-### 6. Concurrency Safety
+### 6. Permission Is Part of the Contract
 
-- Agent sessions are accessed from multiple goroutines; protect shared state with `sync.Mutex` or `atomic` types
-- Use `context.Context` for cancellation propagation
-- Channels should have clear ownership; document who closes them
-- Prefer `sync.Once` for one-time teardown (`pendingPermission.resolve()`)
+- `runtime.PermissionRequest` is a canonical event. Even in phase 1 (permission
+  auto-approved inside the controlled workspace), the event surface must keep
+  the ability to request permission.
+- Agent config selects the mode: `auto` / `ask` / `deny`.
 
-### 7. i18n
+### 7. Error Handling
 
-All user-facing strings must go through `core/i18n.go`:
-- Define a `MsgKey` constant
-- Add translations for all supported languages (EN, ZH, ZH-TW, JA, ES)
-- Use `e.i18n.T(MsgKey)` or `e.i18n.Tf(MsgKey, args...)`
+- Always wrap errors with context: `fmt.Errorf("worker: spawn: %w", err)`
+- Never silently swallow errors; at minimum log them with `slog.Error` /
+  `slog.Warn`.
+- Use `slog` (structured logging) consistently; never `log.Printf` or
+  `fmt.Printf` for runtime logs.
+- Redact tokens/secrets in error messages and logs.
+
+### 8. Concurrency Safety
+
+- Sessions, the registry, and the session store are accessed from multiple
+  goroutines; protect shared state with `sync.Mutex` or `atomic` types.
+- Use `context.Context` for cancellation propagation, especially across the
+  API → supervisor → worker(nsjail) → CLI boundary.
+- Channels should have clear ownership; document who closes them.
 
 ## Code Style
 
 - Follow standard Go conventions (`gofmt`, `go vet`)
 - Use `strings.EqualFold` for case-insensitive comparisons
-- Avoid `init()` for anything other than platform/agent registration
 - Keep functions focused; extract helpers when a function exceeds ~80 lines
-- Naming: `New()` for constructors, `Get/Set` for accessors, avoid stuttering (`feishu.FeishuPlatform` → `feishu.Platform`)
+- Naming: `New()` for constructors, avoid stuttering (`worker.WorkerConfig` →
+  `worker.Config`)
 
 ## Testing
 
 ### Requirements
 
 - All new features must include unit tests.
-- **All bug fixes MUST include a regression test in the same PR.** A bug
-  fix PR without a test that fails on the pre-fix code and passes on the
-  fixed code will not be merged. Name regression tests so the bug is
-  searchable later, e.g. `TestSwitchToAgentSession_PreservesHistory` for
-  the cmdSwitch history-loss bug.
+- **All bug fixes MUST include a regression test in the same PR.** A bug fix
+  PR without a test that fails on the pre-fix code and passes on the fixed
+  code will not be merged. Name regression tests so the bug is searchable
+  later.
 - Tests must pass before committing: `go test ./...`.
-- Changes that touch a Critical User Journey (CUJ) — see
-  `core/cuj_test.go` — should explicitly run `go test ./core/ -run TestCUJ`
-  before opening the PR.
+- Concurrency-sensitive changes must pass `go test -race ./...`.
 
 ### Running Tests
 
 ```bash
-# Full test suite
+# Full unit + integration test suite
 go test ./...
 
-# Specific package
-go test ./core/ -v
-
-# Run specific test
-go test ./core/ -run TestHandlePendingPermission -v
-
-# Run Critical User Journey tests (recommended for any core/engine.go or
-# core/session.go change)
-go test ./core/ -run TestCUJ -v
-
-# With race detector (CI)
+# Race detector (CI)
 go test -race ./...
+
+# A specific package
+go test ./runtime/ -v
+
+# Container-level integration tests (hermetic stub worker; darwin-runnable)
+go test ./integration/ -v
 ```
 
 ### Test Patterns
 
-- Use stub types for `Platform` and `Agent` in core tests (see `core/engine_test.go`).
-- Test card rendering by inspecting the returned `*Card` struct, not JSON.
-- For agent session tests, simulate event streams via channels.
-- **For multi-step user behavior, add a CUJ test in `core/cuj_test.go`.**
-  CUJ tests assert what a USER sees on the platform side across multiple
-  actions (e.g. "create s1 → chat → /new s2 → /switch s1 → /history
-  must show s1's content"). They exist because per-function unit tests
-  can all pass while a user journey is still broken — the `/switch
-  loses history` bug shipped in exactly that scenario despite full
-  unit coverage of every individual function involved.
+- `worker/` and `adapters/` unit tests use hermetic stub binaries (the
+  `worker/testworker` child, fake-agent scripts) — no real agent CLIs required.
+- `integration/agent_gateway_test.go` runs the real HTTP API against the real
+  supervisor and a stub worker child end to end: health, model discovery,
+  streaming completion, abort, worker-crash recovery, workspace
+  out-of-bounds rejection, and nsjail preflight fail-closed.
+- Cross-platform: the module builds and vets on darwin, linux, and windows
+  (`GOOS=linux go build ./...`, `GOOS=windows go build ./...`). Keep build-tag
+  splits (`_unix`/`_windows`, `_linux`/`_other`) minimal and fail-closed on
+  non-Linux.
+- Real nsjail smoke (version + ldd + minimal jail) is Linux-CI-only via
+  `docker/nsjail-smoke.sh`; it cannot run on the darwin dev host.
 
-### Critical User Journeys (CUJ)
+### Build Tags
 
-A CUJ test is a USER-perspective end-to-end scenario, not a developer-
-perspective unit test. The current inventory of CUJs and their coverage
-status lives in:
-
-`projects/cc-connect/agents/qa-cursor/release-gate/CUJ-INVENTORY.md`
-(in the spaceship agency workspace; the registered authoritative copy).
-
-Rules for adding/updating CUJ tests in `core/cuj_test.go`:
-
-1. Name: `TestCUJ_<group><id>_<short_camel_case>` (e.g. `TestCUJ_B3_SwitchPreservesHistory`).
-2. Use real `SessionManager` + real `Engine`; mock only external boundaries (`Platform` sender, `Agent` process).
-3. Drive the engine via `ReceiveMessage` — the same entrypoint platforms use, so engine/platform wiring is also covered.
-4. Assert what the USER sees via `p.getSent()`, not internal struct fields.
-5. ≥3 user actions per CUJ. A single-action assertion belongs in a unit test, not a CUJ.
-
-When a user-reported bug maps to an existing CUJ, add a sub-case to that
-CUJ rather than creating a new one.
-
-## Selective Compilation
-
-Each agent and platform is imported via a separate `plugin_*.go` file with a
-build tag (e.g. `//go:build !no_feishu`). By default **all** agents and
-platforms are compiled in.
-
-### Include only specific agents/platforms
-
-```bash
-# Only Claude Code agent + Feishu and Telegram platforms
-make build AGENTS=claudecode PLATFORMS_INCLUDE=feishu,telegram
-
-# Multiple agents
-make build AGENTS=claudecode,codex PLATFORMS_INCLUDE=feishu,telegram,discord
-```
-
-### Exclude specific agents/platforms
-
-```bash
-# Exclude some platforms you don't need
-make build EXCLUDE=discord,dingtalk,qq,qqbot,line
-```
-
-### Direct build tag usage (without Make)
-
-```bash
-go build -tags 'no_discord no_dingtalk no_qq no_qqbot no_line' ./cmd/cc-connect
-```
-
-Available tags: `no_acp`, `no_claudecode`, `no_codex`, `no_copilot`, `no_cursor`, `no_gemini`,
-`no_iflow`, `no_opencode`, `no_qoder`, `no_feishu`, `no_telegram`,
-`no_discord`, `no_slack`, `no_dingtalk`, `no_wecom`, `no_weixin`, `no_qq`, `no_qqbot`,
-`no_line`, `no_weibo`.
+- Adapters are wired into both binaries via `plugin_agent_*.go` files with a
+  `//go:build !no_<agent>` tag (e.g. `!no_codex`).
+- `agent/{codex,claudecode,kimi}/` are **migration-reference only**: they are
+  the pre-rewrite cc-connect-era implementations cited by
+  `adapters/*/SOURCE.md` and are compiled out behind a `//go:build agent_ref`
+  tag. They still import the deleted `core` package and deliberately do **not**
+  compile — never build with `-tags agent_ref`, and do not edit them unless you
+  are also updating the corresponding `adapters/*/SOURCE.md` provenance.
 
 ## Pre-Commit Checklist
 
 1. **Build passes**: `go build ./...`
-2. **Tests pass**: `go test ./...`
-3. **CUJ tests pass** (for any change in `core/engine.go`, `core/session.go`, `core/cron.go`, `core/timer.go`, or command handlers): `go test ./core/ -run TestCUJ`
-4. **Bug fix has a regression test**: a new test in this PR that fails on the pre-fix code and passes on the fix.
-5. **No new hardcoded platform/agent names in core**: grep for platform names in `core/*.go`.
-6. **i18n complete**: all new user-facing strings have translations for all languages.
-7. **No secrets in code**: no API keys, tokens, or credentials in source files.
-
-## Adding a New Platform
-
-1. Create `platform/newplatform/newplatform.go`
-2. Implement `core.Platform` interface (and optional interfaces as needed)
-3. Register in `init()`: `core.RegisterPlatform("newplatform", factory)`
-4. Create `cmd/cc-connect/plugin_platform_newplatform.go` with `//go:build !no_newplatform` tag
-5. Add `newplatform` to `ALL_PLATFORMS` in `Makefile`
-6. Add config example in `config.example.toml`
-7. Add unit tests
+2. **Cross-platform build passes**: `GOOS=linux go build ./...` and
+   `GOOS=windows go build ./...`
+3. **Tests pass**: `go test ./...`
+4. **Race tests pass** (for concurrency changes): `go test -race ./...`
+5. **Integration tests pass** (for api/runtime/worker changes):
+   `go test ./integration/ -v`
+6. **Bug fix has a regression test**: a new test in this PR that fails on the
+   pre-fix code and passes on the fix.
+7. **No hardcoded agent names in runtime**: grep for adapter names in
+   `runtime/*.go` and `api/openai/*.go`.
+8. **No secrets in code**: no API keys, tokens, or credentials in source files.
 
 ## Adding a New Agent
 
-1. Create `agent/newagent/newagent.go`
-2. Implement `core.Agent` and `core.AgentSession` interfaces
-3. Register in `init()`: `core.RegisterAgent("newagent", factory)`
-4. Create `cmd/cc-connect/plugin_agent_newagent.go` with `//go:build !no_newagent` tag
-5. Add `newagent` to `ALL_AGENTS` in `Makefile`
-6. Optionally implement `AgentDoctorInfo` for `cc-connect doctor` support
-7. Add config example in `config.example.toml`
-8. Add unit tests
+1. Create `adapters/newagent/newagent.go` implementing `runtime.AgentAdapter`
+   and `runtime.Session`.
+2. Register in `init()`: `runtime.Register("newagent", factory)`.
+3. Create `cmd/gateway/plugin_agent_newagent.go` AND
+   `cmd/gateway-worker/plugin_agent_newagent.go`, both with
+   `//go:build !no_newagent`.
+4. Add config example in `config.example.toml` under `[agents.newagent]`.
+5. Add unit tests using a hermetic fake CLI (no real binary required).
+
+## Adding a New Endpoint
+
+1. Add the route in `api/openai/` (e.g. `chat_completions.go` for
+   `/v1/chat/completions`); the HTTP handler layer lives there.
+2. Speak only the `runtime` contract — never import `adapters/` or `worker/`
+   in the API layer.
+3. Add an integration case in `integration/agent_gateway_test.go` so the
+   API → supervisor → worker path is covered end to end.
+4. Document the endpoint in `README.md`.

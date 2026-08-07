@@ -1,4 +1,4 @@
-//go:build unix
+//go:build agent_ref && unix
 
 package claudecode
 

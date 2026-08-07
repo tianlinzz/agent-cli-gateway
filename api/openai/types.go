@@ -8,7 +8,7 @@
 // never launches a CLI. Everything is expressed through the canonical runtime
 // contract — a runtime.Registry for model discovery, a runtime.SessionStore
 // for session metadata/owner isolation, and a runtime.ExecutionBackend for
-// execution. wire-up in cmd/gatewayd plugs in worker.LocalExecutionBackend,
+// execution. wire-up in cmd/gateway plugs in worker.LocalExecutionBackend,
 // which forks one nsjail-wrapped worker per session.
 package openai
 

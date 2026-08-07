@@ -1,0 +1,63 @@
+# agent-cli-gateway configuration. Run `gateway -config gateway.toml`, or omit
+# --config for built-in defaults (prod profile, isolation required).
+# See README.md for the full field reference.
+
+# Runtime profile: "prod" (default), "dev", or "test". nsjail isolation is
+# mandatory in prod and dev; only the "test" profile may disable it
+# (isolation.required = false).
+mode = "prod"
+
+[server]
+listen_addr = ":4096"
+shutdown_timeout = "10s"
+
+[auth]
+# Shared bearer token accepted by /v1/* endpoints. Empty disables auth
+# (dev/test only). Health probes are always unauthenticated.
+# token = "change-me"
+
+[workspace]
+# Directory all opaque workspace_ids resolve under. Only the server owns this
+# path; clients reference workspaces by opaque ID and can never inject a path.
+root = "/srv/workspaces"
+
+[isolation]
+# nsjail sandbox boundary (phase 1). The gateway forks one nsjail-wrapped
+# worker per session; nsjail runs unprivileged via user namespaces (no
+# CAP_SYS_ADMIN, not --privileged).
+required = true
+nsjail_version = "0.12.0"
+nsjail_source = "https://github.com/google/nsjail"
+binary_path = "/usr/local/bin/nsjail"
+
+[isolation.mounts]
+workspace_dir = "/workspace"
+agent_home_dir = "/agent-home"
+tmp_dir = "/tmp"
+
+[isolation.rlimits]
+max_open_files = 1024
+max_processes = 256
+
+[isolation.user_namespace]
+enabled = true
+uid = 65532
+gid = 65532
+
+[isolation.seccomp]
+policy = "kafel"
+
+# --- Agents ----------------------------------------------------------------
+# The three first-generation agents default to enabled with auto permission.
+
+[agents.codex]
+enabled = true
+permission = "auto"
+
+[agents.claude-code]
+enabled = true
+permission = "auto"
+
+[agents.kimi]
+enabled = true
+permission = "auto"

@@ -1,4 +1,4 @@
-//go:build windows
+//go:build agent_ref && windows
 
 package claudecode
 

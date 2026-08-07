@@ -3,10 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
-	"io"
-	"os"
 	"os/exec"
-	"syscall"
 )
 
 // spawnSpec carries everything the process spawner needs for one session.
@@ -76,10 +73,16 @@ func spawnDirect(ctx context.Context, spec spawnSpec) (*exec.Cmd, error) {
 	return startCommand(ctx, buildDirectCommand(spec.workerExe, spec.workerArgs), spec.env, spec.logPath)
 }
 
-// startCommand is the single cross-platform place that turns a command line
-// into a supervised process. It deliberately does NOT use CommandContext:
-// process lifetime (and process-group signals) is owned entirely by the
-// supervisor, so a short-lived caller context must never kill the child.
+// startCommand is defined in the platform files:
+//   - spawn_unix.go (!windows): the worker starts in its own process group
+//     (Setpgid), so the supervisor can signal -pgid to reach the whole tree
+//     (nsjail + worker + agent CLI).
+//   - spawn_windows.go (windows): CREATE_NEW_PROCESS_GROUP, since Windows has
+//     no POSIX process groups (nsjail is Linux-only; Windows is dev-only).
+//
+// It deliberately does NOT use CommandContext: process lifetime (and
+// process-group signals) is owned entirely by the supervisor, so a
+// short-lived caller context must never kill the child.
 //
 // Worker output is written to logPath (or the supervisor's stderr) as a plain
 // *os.File. It must NOT be piped through exec.Cmd: a piped Stdout/Stderr makes
@@ -87,25 +90,3 @@ func spawnDirect(ctx context.Context, spec spawnSpec) (*exec.Cmd, error) {
 // agent CLI, or an orphaned worker after the nsjail wrapper dies) inherits the
 // pipe descriptors — would stall the monitor goroutine that is responsible for
 // reaping the process group.
-func startCommand(_ context.Context, argv, env []string, logPath string) (*exec.Cmd, error) {
-	if len(argv) == 0 || argv[0] == "" {
-		return nil, fmt.Errorf("worker: spawn: empty command")
-	}
-	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.Env = env
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	out := (io.Writer)(os.Stderr)
-	if logPath != "" {
-		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-		if err != nil {
-			return nil, fmt.Errorf("worker: open session log %q: %w", logPath, err)
-		}
-		out = f
-	}
-	cmd.Stdout = out
-	cmd.Stderr = out
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("worker: start %q: %w", argv[0], err)
-	}
-	return cmd, nil
-}

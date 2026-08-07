@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -150,16 +149,7 @@ func waitEventsClosed(t *testing.T, ws *workerSession, timeout time.Duration) {
 	}
 }
 
-func pidAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	err := syscall.Kill(pid, 0)
-	if err == nil {
-		return true
-	}
-	return err == syscall.EPERM
-}
+// pidAlive is defined in proc_test_unix.go / proc_test_windows.go.
 
 func writeFakeNsjail(t *testing.T, content string) string {
 	t.Helper()
@@ -540,7 +530,7 @@ func TestSupervisor_NsjailWrapperCrashReapsGroup(t *testing.T) {
 
 	// Kill the nsjail wrapper; the worker is orphaned. The supervisor's
 	// monitor must detect the wrapper exit and kill the whole group.
-	if err := syscall.Kill(ws.outerPID, syscall.SIGKILL); err != nil {
+	if err := killProcess(ws.outerPID); err != nil {
 		t.Fatalf("kill nsjail wrapper: %v", err)
 	}
 	waitEventsClosed(t, ws, 10*time.Second)

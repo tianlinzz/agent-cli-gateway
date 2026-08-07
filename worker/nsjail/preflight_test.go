@@ -12,7 +12,7 @@ import (
 )
 
 func TestPreflight_DisabledWhenNotRequired(t *testing.T) {
-	iso := config.DefaultGatewayRuntimeConfig().Isolation
+	iso := config.DefaultGatewayConfig().Isolation
 	iso.Required = false // test profile only
 	if err := Preflight(context.Background(), iso); err != nil {
 		t.Fatalf("Preflight must pass when isolation is not required: %v", err)
@@ -36,7 +36,7 @@ func TestPreflight_FailClosedBinaryChecks(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			iso := config.DefaultGatewayRuntimeConfig().Isolation
+			iso := config.DefaultGatewayConfig().Isolation
 			iso.Required = true
 			iso.BinaryPath = tt.path
 			err := Preflight(context.Background(), iso)
@@ -64,7 +64,7 @@ func TestPreflight_ExecutableBinaryOnNonLinux(t *testing.T) {
 	if err := os.WriteFile(exe, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	iso := config.DefaultGatewayRuntimeConfig().Isolation
+	iso := config.DefaultGatewayConfig().Isolation
 	iso.Required = true
 	iso.BinaryPath = exe
 	err := Preflight(context.Background(), iso)

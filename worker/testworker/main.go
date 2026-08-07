@@ -5,6 +5,10 @@
 // session whose behavior is selected by GW_TESTWORKER_BEHAVIOR:
 //
 //	(empty)|"echo"        persistent session; SendInput echoes a text event
+//	"slow-echo"           SendInput accepts the turn but delays the echo ~1.5s
+//	                      (a turn that stays in flight for abort tests)
+//	"slow-crash"          SendInput accepts the turn but the worker exits(1)
+//	                      ~1.5s later without output (a mid-turn crash)
 //	"reject-start"        StartSession returns an error
 //	"crash-on-start"      worker exits(9) while handling StartSession
 //	"crash-after-start"   worker exits(1) ~300ms after StartSession succeeds
@@ -145,6 +149,28 @@ func (h *stubHandler) SendInput(_ context.Context, input runtime.Input) error {
 			text += "\n"
 		}
 		text += m.Content
+	}
+	switch h.behavior {
+	case "slow-echo":
+		// A turn that stays in flight long enough for an abort to land. The
+		// reply is delayed ~1.5s; the emit is guarded so it never fires after
+		// Close (the worker process may be killed before the timer runs).
+		time.AfterFunc(1500*time.Millisecond, func() {
+			h.mu.Lock()
+			if h.closed {
+				h.mu.Unlock()
+				return
+			}
+			h.mu.Unlock()
+			h.emit(runtime.Event{Type: runtime.EventText, Text: "echo:" + text})
+			h.emit(runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"})
+		})
+		return nil
+	case "slow-crash":
+		// Accept the turn but die mid-turn (~1.5s) before producing any output:
+		// the supervisor must close the event stream and the API must survive.
+		time.AfterFunc(1500*time.Millisecond, func() { os.Exit(1) })
+		return nil
 	}
 	h.emit(runtime.Event{Type: runtime.EventText, Text: "echo:" + text})
 	h.emit(runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"})

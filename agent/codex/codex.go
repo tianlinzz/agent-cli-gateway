@@ -1,3 +1,5 @@
+//go:build agent_ref
+
 package codex
 
 import (

@@ -29,7 +29,7 @@ func testLayout(t *testing.T) SessionLayout {
 }
 
 func TestBuildProfile_KafelDefaults(t *testing.T) {
-	iso := config.DefaultGatewayRuntimeConfig().Isolation
+	iso := config.DefaultGatewayConfig().Isolation
 	layout := testLayout(t)
 
 	p, err := Build(iso, layout, "sess-1")
@@ -80,7 +80,7 @@ func TestBuildProfile_KafelDefaults(t *testing.T) {
 // jail's primary view; the profile must not widen that to the whole runtime
 // dir.
 func TestBuildProfile_MountsScopedToThisSession(t *testing.T) {
-	iso := config.DefaultGatewayRuntimeConfig().Isolation
+	iso := config.DefaultGatewayConfig().Isolation
 	root := t.TempDir()
 
 	ws := filepath.Join(root, "ws")
@@ -125,7 +125,7 @@ func TestBuildProfile_MountsScopedToThisSession(t *testing.T) {
 }
 
 func TestBuildProfile_CustomMountDirs(t *testing.T) {
-	iso := config.DefaultGatewayRuntimeConfig().Isolation
+	iso := config.DefaultGatewayConfig().Isolation
 	iso.Mounts.WorkspaceDir = "/srv/ws"
 	iso.Mounts.AgentHomeDir = "/var/agent-home"
 	iso.Mounts.TmpDir = "/var/tmp"
@@ -162,7 +162,7 @@ func TestBuildProfile_CustomMountDirs(t *testing.T) {
 }
 
 func TestBuildProfile_NetworkNamespaceOptIn(t *testing.T) {
-	iso := config.DefaultGatewayRuntimeConfig().Isolation
+	iso := config.DefaultGatewayConfig().Isolation
 	iso.NetworkNamespace = true
 	layout := testLayout(t)
 	p, err := Build(iso, layout, "sess-3")
@@ -175,7 +175,7 @@ func TestBuildProfile_NetworkNamespaceOptIn(t *testing.T) {
 }
 
 func TestBuildProfile_SeccompOffOmitted(t *testing.T) {
-	iso := config.DefaultGatewayRuntimeConfig().Isolation
+	iso := config.DefaultGatewayConfig().Isolation
 	iso.Seccomp.Policy = config.SeccompOff
 	layout := testLayout(t)
 	p, err := Build(iso, layout, "sess-4")
@@ -188,7 +188,7 @@ func TestBuildProfile_SeccompOffOmitted(t *testing.T) {
 }
 
 func TestBuildProfile_InvalidSeccompPolicyFailsClosed(t *testing.T) {
-	iso := config.DefaultGatewayRuntimeConfig().Isolation
+	iso := config.DefaultGatewayConfig().Isolation
 	iso.Seccomp.Policy = "banana"
 	layout := testLayout(t)
 	if _, err := Build(iso, layout, "sess-5"); err == nil {
@@ -197,7 +197,7 @@ func TestBuildProfile_InvalidSeccompPolicyFailsClosed(t *testing.T) {
 }
 
 func TestBuildProfile_FailClosed(t *testing.T) {
-	iso := config.DefaultGatewayRuntimeConfig().Isolation
+	iso := config.DefaultGatewayConfig().Isolation
 	layout := testLayout(t)
 
 	tests := []struct {

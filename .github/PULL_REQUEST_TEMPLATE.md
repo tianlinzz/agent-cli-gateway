@@ -38,28 +38,18 @@ The reviewer will use the checklist at the bottom to gate merge.
 - Manual verification this test catches the regression:
   - [ ] Reverted the fix locally; the regression test failed as expected.
 
-### Critical User Journeys (CUJ) impact
+### Integration (E2E) impact
 
-<!-- See AGENTS.md → "Critical User Journeys (CUJ)" and the inventory in
-     projects/cc-connect/agents/qa-cursor/release-gate/CUJ-INVENTORY.md.
-     Mark which CUJ groups this PR touches: -->
+<!-- See AGENTS.md → "Testing". The hermetic E2E suite
+     (integration/agent_gateway_test.go) drives the real HTTP API against the
+     real supervisor and a stub worker child. If your change touches the API
+     layer (api/openai/), the runtime contract (runtime/), the worker
+     supervisor (worker/), or workspace resolution (workspace/), confirm: -->
 
-- [ ] No CUJ touched (small refactor, doc change, etc.)
-- [ ] A — basic conversation
-- [ ] B — session lifecycle (`/new` `/switch` `/list` `/history` etc.)
-- [ ] C — agent execution control (`/mode` `/cancel` `/stop` permissions)
-- [ ] D — security & permissions (`allow_from` `admin_from` `banned_words` rate limits)
-- [ ] E — scheduled tasks (`/cron` `/timer`)
-- [ ] F — config switching (`/lang` `/provider` `/model` reload)
-- [ ] G — error handling & robustness (LLM failure, ws reconnect, agent crash)
-- [ ] H — multi-platform / multi-project isolation
-- [ ] I — UI rendering correctness (cards, streaming, display modes)
-
-If any CUJ group is touched, confirm:
-
-- [ ] `go test ./core/ -run TestCUJ` passes locally.
-- [ ] If the change alters an existing user-visible flow, the corresponding
-      CUJ test was updated (or a new CUJ added) to cover the new behavior.
+- [ ] No integration path touched (small refactor, doc change, etc.)
+- [ ] `go test ./integration/ -v` passes locally.
+- [ ] If the change alters a user-visible flow, an integration case was added
+      (or updated) to cover the new behavior.
 
 ## Manual / user-visible behavior change
 
@@ -69,10 +59,15 @@ If any CUJ group is touched, confirm:
 ## Checklist (reviewer will verify)
 
 - [ ] `go build ./...` passes
-- [ ] `go test ./...` passes (with `-race` if touching concurrency)
+- [ ] Cross-platform build passes: `GOOS=linux go build ./...` and
+      `GOOS=windows go build ./...`
+- [ ] `go test ./...` passes (with `go test -race ./...` if touching
+      concurrency)
+- [ ] `go test ./integration/ -v` passes (for api/runtime/worker/workspace
+      changes)
 - [ ] AGENTS.md Pre-Commit Checklist items are satisfied
-- [ ] No new hardcoded platform/agent names in `core/`
-- [ ] i18n strings have all-language translations (if any new user-facing text)
+- [ ] No adapter imports in `api/openai/`; `runtime/` stays name-agnostic
+      (no hardcoded agent names)
 - [ ] No secrets / credentials in source
 
 ## Related

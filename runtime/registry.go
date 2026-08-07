@@ -74,7 +74,7 @@ func (r *Registry) Resolve(ctx context.Context, name string) (AgentAdapter, erro
 }
 
 // defaultRegistry is the process-wide registry that adapter packages populate
-// from their init() functions (see cmd/gatewayd/plugin_agent_*.go).
+// from their init() functions (see cmd/gateway/plugin_agent_*.go).
 var defaultRegistry = NewRegistry()
 
 // DefaultRegistry returns the process-wide registry used by adapter packages.

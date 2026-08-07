@@ -1,122 +1,168 @@
+// Command gateway is the agent-gateway entrypoint. It is the API gateway: it
+// loads the gateway runtime config, exposes the OpenAI-compatible HTTP API
+// (/v1/models, /v1/chat/completions, /v1/sessions/{id}/abort, /health/*), and
+// owns the worker Supervisor. Every execution goes through
+// runtime.ExecutionBackend (worker.LocalExecutionBackend), which forks one
+// nsjail-wrapped worker per session. The API process never imports or launches
+// a concrete agent CLI itself.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
+	"path/filepath"
 	"syscall"
 	"time"
 
+	"github.com/tianlinzz/agent-cli-gateway/api/openai"
 	"github.com/tianlinzz/agent-cli-gateway/config"
-	"github.com/tianlinzz/agent-cli-gateway/core"
-	"github.com/tianlinzz/agent-cli-gateway/server"
+	"github.com/tianlinzz/agent-cli-gateway/runtime"
+	"github.com/tianlinzz/agent-cli-gateway/worker"
 )
 
-var (
-	version   = "dev"
-	commit    = "none"
-	buildTime = "unknown"
-)
+var version = "dev"
 
 func main() {
-	port := flag.Int("port", 4096, "HTTP listen port")
-	token := flag.String("token", "", "Bearer token for API authentication (empty = no auth)")
-	dataDir := flag.String("data-dir", "", "Data directory for agent transcripts (empty = default)")
-	corsOrigins := flag.String("cors", "", "Comma-separated CORS origins (empty = allow all)")
-	userIDHeader := flag.String("user-id-header", "X-User-Id", "HTTP header name carrying caller identity")
-	identityMode := flag.String("identity-mode", "strict", "identity mode: strict (missing header → 401) or anonymous (missing → default user)")
-	maxSessionsPerUser := flag.Int("max-sessions-per-user", 5, "max concurrent sessions per caller (0 = unlimited)")
-	sessionIdleTTL := flag.Duration("session-idle-ttl", 2*time.Hour, "idle session TTL before reaper evicts (0 = unlimited)")
-	showVersion := flag.Bool("version", false, "Print version and exit")
+	// -config defaults to $GATEWAY_CONFIG (set by the container entrypoint to
+	// the runtime config path) so a mounted/entrypoint-written config is loaded
+	// without extra argv.
+	configPath := flag.String("config", envOrDefault("GATEWAY_CONFIG", ""), "path to the gateway TOML config (default: $GATEWAY_CONFIG or built-in defaults)")
+	showVersion := flag.Bool("version", false, "print version and exit")
+	workerExec := flag.String("worker-exec", "", "worker child executable (default: $GW_WORKER_EXEC or gateway-worker)")
 	flag.Parse()
 
 	if *showVersion {
-		slog.Info("agent-cli-gateway", "version", version, "commit", commit, "buildTime", buildTime)
+		fmt.Printf("gateway %s\n", version)
 		return
 	}
 
-	// Token env fallback for containerized deployment.
-	// Priority: CLI flag (-token) > env var (GATEWAY_TOKEN) > empty (no auth).
-	// Lets the cloud platform inject the token via env config without overriding CMD.
-	if *token == "" {
-		*token = os.Getenv("GATEWAY_TOKEN")
-	}
-
-	// Identity-mode env fallback for containerized deployment.
-	// GATEWAY_ANONYMOUS_IDENTITY=1 is a shorthand for identity-mode=anonymous.
-	if *identityMode == "strict" && os.Getenv("GATEWAY_ANONYMOUS_IDENTITY") == "1" {
-		*identityMode = "anonymous"
-		slog.Info("identity mode: anonymous (GATEWAY_ANONYMOUS_IDENTITY=1)")
-	}
-
-	// Agent drivers are registered via blank imports in plugin_agent_*.go
-	agentNames := core.ListRegisteredAgents()
-	slog.Info("registered agents", "agents", agentNames)
-
-	// Build agent singletons from registered factories.
-	agents := make(map[string]core.Agent)
-	for _, name := range agentNames {
-		agent, err := core.CreateAgent(name, map[string]any{})
+	// Load the gateway runtime config (defaults when --config is absent).
+	cfg := config.DefaultGatewayConfig()
+	if *configPath != "" {
+		loaded, err := config.LoadGateway(*configPath)
 		if err != nil {
-			slog.Warn("failed to create agent, skipping", "agent", name, "error", err)
-			continue
+			slog.Error("load gateway config", "path", *configPath, "error", err)
+			os.Exit(1)
 		}
-		agents[name] = agent
-		slog.Info("agent ready", "name", name)
+		cfg = *loaded
 	}
 
-	if len(agents) == 0 {
-		slog.Error("no agents available, exiting")
+	// The registry is process-wide: adapter packages register into it from
+	// their init() functions via runtime.Register (see plugin_agent_*.go in
+	// this directory).
+	reg := runtime.DefaultRegistry()
+
+	// The workspace root must exist before the supervisor constructs its
+	// resolver (fail-closed on a missing root).
+	if err := os.MkdirAll(cfg.Workspace.Root, 0o700); err != nil {
+		slog.Error("create workspace root", "root", cfg.Workspace.Root, "error", err)
+		os.Exit(1)
+	}
+	rootAbs, err := filepath.Abs(cfg.Workspace.Root)
+	if err != nil {
+		slog.Error("absolutize workspace root", "error", err)
 		os.Exit(1)
 	}
 
-	cfg := config.GatewayConfig{
-		Port:               *port,
-		Token:              *token,
-		DataDir:            *dataDir,
-		CORSOrigins:        parseCORS(*corsOrigins),
-		UserIDHeader:       *userIDHeader,
-		IdentityMode:       *identityMode,
-		MaxSessionsPerUser: *maxSessionsPerUser,
-		SessionIdleTTL:     *sessionIdleTTL,
+	if *workerExec == "" {
+		*workerExec = envOrDefault("GW_WORKER_EXEC", "gateway-worker")
 	}
 
-	store := server.NewSessionStoreWithLimits(agents, cfg.MaxSessionsPerUser, cfg.SessionIdleTTL)
-	srv := server.NewServer(cfg, store)
+	// The supervisor forks one nsjail-wrapped worker child per session. The
+	// API process never starts an agent CLI directly; all execution flows
+	// through this backend.
+	backend, err := worker.NewLocalExecutionBackend(worker.Config{
+		Mode:            cfg.Mode,
+		Isolation:       cfg.Isolation,
+		WorkspaceRoot:   rootAbs,
+		RuntimeDir:      "gateway-run",
+		WorkerExec:      *workerExec,
+		StartTimeout:    30 * time.Second,
+		ShutdownTimeout: cfg.Server.ShutdownTimeout,
+	})
+	if err != nil {
+		slog.Error("create execution backend", "error", err)
+		os.Exit(1)
+	}
 
-	// Graceful shutdown on SIGINT/SIGTERM.
+	// Surface the nsjail preflight result as readiness (503 when the sandbox
+	// boundary is unavailable) without taking the API process down.
+	if err := backend.Preflight(context.Background()); err != nil {
+		slog.Warn("nsjail preflight failed; readiness will report 503", "error", err)
+	}
+
+	handler := openai.NewHandler(openai.Options{
+		Registry:    reg,
+		Store:       runtime.NewMemorySessionStore(),
+		Backend:     backend,
+		AuthToken:   cfg.Auth.Token,
+		OwnerHeader: "X-User-Id",
+		Enabled: func(name string) bool {
+			agent, ok := cfg.Agents[name]
+			return !ok || agent.Enabled
+		},
+	})
+
+	srv := &http.Server{
+		Addr:    cfg.Server.ListenAddr,
+		Handler: handler.Routes(),
+	}
+
+	slog.Info("gateway starting",
+		"version", version,
+		"mode", cfg.Mode,
+		"listen_addr", cfg.Server.ListenAddr,
+		"workspace_root", rootAbs,
+		"isolation_required", cfg.Isolation.Required,
+		"nsjail_version", cfg.Isolation.NsjailVersion,
+		"nsjail_source", cfg.Isolation.NsjailSource,
+		"worker_exec", *workerExec,
+		"auth_enabled", cfg.Auth.Token != "",
+		"adapters", reg.List(),
+	)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	serveErr := make(chan error, 1)
 	go func() {
-		if err := srv.Start(); err != nil && err != http.ErrServerClosed {
-			slog.Error("server error", "error", err)
-			stop()
-		}
+		slog.Info("gateway listening")
+		serveErr <- srv.ListenAndServe()
 	}()
 
-	<-ctx.Done()
-	slog.Info("shutting down...")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_ = srv.Shutdown(shutdownCtx)
-	slog.Info("stopped")
-}
-
-func parseCORS(s string) []string {
-	if s == "" {
-		return nil
-	}
-	var origins []string
-	for _, o := range strings.Split(s, ",") {
-		o = strings.TrimSpace(o)
-		if o != "" {
-			origins = append(origins, o)
+	select {
+	case <-ctx.Done():
+		slog.Info("gateway shutting down")
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("gateway server failed", "error", err)
+			os.Exit(1)
 		}
 	}
-	return origins
+
+	// Graceful shutdown: drain in-flight HTTP requests (aborting client
+	// disconnects at the worker), then tear the supervisor down so every
+	// worker process group is reaped.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Warn("gateway http shutdown", "error", err)
+	}
+	if err := backend.Supervisor().Close(shutdownCtx); err != nil {
+		slog.Warn("gateway supervisor close", "error", err)
+	}
+	slog.Info("gateway stopped")
+}
+
+func envOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

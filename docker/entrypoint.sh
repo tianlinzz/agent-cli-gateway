@@ -1,48 +1,64 @@
 #!/bin/sh
 #
-# 网关启动入口（在 acg 之前跑）。
+# agent-gateway container entrypoint.
 #
-# 职责：幂等地确保 nb init 已完成（connect-remote，连接已有 NocoBase 实例），
-# 然后 exec 启动网关二进制。
+# The gateway binary is the API process AND the worker Supervisor; the
+# supervisor forks one nsjail-wrapped gateway-worker per session. The
+# entrypoint just prepares the shared runtime dirs, writes a default config
+# when none is mounted, and then exec's the gateway so it is PID 1 and
+# receives SIGTERM directly. Signal propagation API -> worker(nsjail) -> CLI
+# and process-group reaping happen inside the supervisor.
 #
-# 配置由运行时环境变量注入，镜像内不含任何 URL/token：
-#   NB_ENV_NAME      nb env 名字（默认 default）
-#   NB_API_BASE_URL  已有 NocoBase 的 API URL（含 /api，如 https://nocobase.internal/api）
-#   NB_ACCESS_TOKEN  API key / access token
-#
-# 不传 NB_API_BASE_URL / NB_ACCESS_TOKEN → 跳过 nb init，镜像当纯网关用（向后兼容）。
-# 幂等：--force 让 nb init 在 env 已存在时重新配置（connect-remote 只存 API URL+token，
-#   无 DB/服务可冲突），故每次启动都安全；不依赖脆弱的 nb env list 表格解析。
-set -e
+# Runtime dirs (both are created idempotently, so they also work on a fresh
+# persistent volume):
+#   GATEWAY_WORKSPACE_ROOT  controlled workspace root, default /srv/workspaces
+#   GATEWAY_RUNTIME_DIR     per-session sockets/agent-homes/profiles,
+#                           default /gateway-run
+#   GATEWAY_CONFIG          TOML config path, default /etc/gateway/gateway.toml
+#   GATEWAY_TOKEN           optional bearer token (written into the config)
+set -eu
 
-NB_ENV="${NB_ENV_NAME:-default}"
-NB_API_URL="${NB_API_BASE_URL:-}"
-NB_TOKEN="${NB_ACCESS_TOKEN:-}"
+WORKSPACE_ROOT="${GATEWAY_WORKSPACE_ROOT:-/srv/workspaces}"
+RUNTIME_DIR="${GATEWAY_RUNTIME_DIR:-/gateway-run}"
+CONFIG_PATH="${GATEWAY_CONFIG:-/etc/gateway/gateway.toml}"
 
-# /data 是运行时挂载的持久卷，会盖掉镜像层。卷里首次起是空的，需补回两样镜像预置物：
-#   1) .claude.json —— 跳过 claude 首次 onboarding 联网检查（issue #26935）。
-#      模板存在镜像内 /usr/local/share/claude.onboarding-skip.json（不在卷里，不会被盖）。
-#   2) workspace/   —— workDir 根（网关 cwd）。缺失则建。
-# 幂等：卷里已有同名文件/目录则保留，不覆盖。
-if [ ! -f "$HOME/.claude.json" ] && [ -f /usr/local/share/claude.onboarding-skip.json ]; then
-  cp /usr/local/share/claude.onboarding-skip.json "$HOME/.claude.json"
+mkdir -p "$WORKSPACE_ROOT" "$RUNTIME_DIR"
+
+# Write a default config when the deployment did not mount one. The default
+# requires nsjail (fail-closed) at /usr/local/bin/nsjail and pins the same
+# version the image was built from; deployments override by mounting their own
+# config at GATEWAY_CONFIG.
+if [ ! -f "$CONFIG_PATH" ]; then
+  mkdir -p "$(dirname "$CONFIG_PATH")"
+  {
+    printf 'mode = "prod"\n\n'
+    printf '[server]\nlisten_addr = ":4096"\nshutdown_timeout = "10s"\n\n'
+    printf '[auth]\n'
+    if [ -n "${GATEWAY_TOKEN:-}" ]; then
+      printf 'token = "%s"\n' "$GATEWAY_TOKEN"
+    else
+      printf '# token = ""  # auth disabled (dev/test only)\n'
+    fi
+    printf '\n[workspace]\nroot = "%s"\n\n' "$WORKSPACE_ROOT"
+    printf '[isolation]\nrequired = true\nnsjail_version = "0.12.0"\n'
+    printf 'nsjail_source = "https://github.com/google/nsjail"\n'
+    printf 'binary_path = "/usr/local/bin/nsjail"\n\n'
+    printf '[isolation.mounts]\nworkspace_dir = "/workspace"\n'
+    printf 'agent_home_dir = "/agent-home"\ntmp_dir = "/tmp"\n\n'
+    printf '[isolation.user_namespace]\nenabled = true\nuid = 65532\ngid = 65532\n\n'
+    printf '[isolation.seccomp]\npolicy = "kafel"\n'
+  } > "$CONFIG_PATH"
+  echo "[entrypoint] wrote default gateway config to $CONFIG_PATH"
 fi
-mkdir -p "$HOME/workspace"
 
-if [ -n "$NB_API_URL" ] && [ -n "$NB_TOKEN" ]; then
-  echo "[entrypoint] running nb init (connect-remote) for env '${NB_ENV}'"
-  nb init \
-    --env "$NB_ENV" \
-    --yes \
-    --force \
-    --setup-mode connect-remote \
-    --api-base-url "$NB_API_URL" \
-    --auth-type token \
-    --access-token "$NB_TOKEN" \
-    --skip-skills
-else
-  echo "[entrypoint] NB_API_BASE_URL / NB_ACCESS_TOKEN not set; skipping nb init"
+# nsjail must exist and be executable before we hand over to the gateway: the
+# gateway's readiness probe reports 503 when preflight fails, but a missing
+# binary at this stage indicates a broken image, so fail fast here.
+if [ ! -x /usr/local/bin/nsjail ]; then
+  echo "[entrypoint] FATAL: /usr/local/bin/nsjail missing or not executable" >&2
+  exit 1
 fi
 
-# 启动网关（CMD 透传到这里），替换当前进程，让 acg 成为 PID 1 接收信号。
+# exec: the gateway becomes PID 1 and receives SIGTERM/SIGINT directly. The
+# configured CMD ("gateway") and any extra args are forwarded.
 exec "$@"

@@ -1,111 +1,177 @@
 # syntax=docker/dockerfile:1
 #
-# agent-cli-gateway 网关镜像
+# agent-cli-gateway — OpenAI-compatible Agent Gateway (nsjail-isolated workers)
 #
-# 自带完整 agent 运行时（claude CLI + Node + Python + git），通过 HTTP/SSE
-# 对外提供统一的 session/event API，供 f1-web 调用。
+# Multi-stage build:
+#   Stage 1 (nsjail-builder): compiles google/nsjail from a pinned upstream
+#     tag/commit and packages the binary plus its runtime shared-library deps.
+#   Stage 2 (gobuild): builds the `gateway` (API + worker supervisor) and
+#     `gateway-worker` (per-session worker child) binaries from this repo.
+#   Stage 3 (runtime): the deployable image — nsjail + Go binaries + the agent
+#     CLIs the deployment needs. The gateway process is PID 1; it owns the
+#     worker Supervisor, which forks one nsjail-wrapped `gateway-worker` per
+#     session.
 #
-# 两段式构建，builder 和 runtime 共用预构建的 agent-gateway-base 基础镜像：
-#   micr.cloud.mioffice.cn/agent-getaway/agent-gateway-base:go1.25-node22-py3
+# Security model (决策对齐 #5b / the rewrite design spec):
+#   - nsjail runs UNPRIVILEGED: user namespace, NO CAP_SYS_ADMIN, NOT
+#     --privileged. The container itself is non-root when the platform allows
+#     running without the sandbox privileges nsjail needs for user namespaces;
+#     the default k8s securityContext below encodes this.
+#   - Phase 1 keeps the network namespace shared (agents must reach their
+#     providers); egress is controlled by the container/infrastructure.
 #
-# 构建命令（本地 arm64 交叉构建 amd64 并推送）:
-#   docker buildx build --platform linux/amd64 \
-#     -t micr.cloud.mioffice.cn/agent-getaway/agent-gateway:<tag> \
-#     --push .
+# Build:
+#   docker build -t agent-gateway .
 #
-# 部署时挂载（镜像内不含任何敏感信息）:
-#   /data      ← 唯一持久化卷（文件挂载服务一个卷对应一个目录，故全部收敛到此）。
-#                HOME=/data 指到这里，claude / nb CLI 的配置都落在 $HOME 下：
-#     /data/.claude/settings.json  ← claude 的 provider 配置（env 块含 API key 等）。
-#                                     ⚠️ claude CLI 读 $HOME/.claude/settings.json，
-#                                     不是 CLAUDE_CONFIG_DIR（网关代码自定义变量，claude 不认）。
-#                                     部署方把 settings.json 放进这个卷即可。
-#     /data/.claude/projects/      ← claude 会话 transcript（*.jsonl），保证容器重启后
-#                                     多轮 resume 不丢上下文。
-#     /data/.nocobase/             ← nb CLI 的 env 配置。entrypoint 启动时执行
-#                                     `nb init --setup-mode connect-remote --force`
-#                                     连接已有 NocoBase 实例，配置写在此卷；
-#                                     --force 保证幂等（已存在则重配）。
-#     /data/workspace/             ← agent workDir（网关 cwd，读写）。
+# Run (docker):
+#   docker run --rm -it \
+#     --cap-drop=ALL \
+#     -v "$PWD/workspaces:/srv/workspaces" \
+#     -p 4096:4096 agent-gateway
 #
-# 运行时环境变量（nb init 用，镜像内无敏感信息，由部署方注入）:
-#   NB_ENV_NAME      nb env 名字（默认 default）
-#   NB_API_BASE_URL  已有 NocoBase 的 API URL（含 /api，如 https://nocobase.internal/api）
-#   NB_ACCESS_TOKEN  API key / access token
-# 不传 → 跳过 nb init，镜像当纯网关用（向后兼容）。
+# Run (kubernetes, minimal security context):
+#   securityContext:
+#     runAsNonRoot: true
+#     runAsUser: 65532
+#     runAsGroup: 65532
+#     allowPrivilegeEscalation: false
+#     capabilities: { drop: [ALL] }        # nsjail uses unprivileged user ns
+#     seccompProfile: { type: RuntimeDefault }
 #
-# entrypoint.sh 在启动时幂等确保 nb init 完成，再 exec 启动网关（见文件底部）。
+# CI validation hooks (Linux CI only — nsjail cannot run on this darwin dev
+# host):
+#   - `nsjail --version`                    # binary runs
+#   - `ldd /usr/local/bin/nsjail`           # no missing shared libs
+#   - minimal smoke jail, e.g.
+#       echo 'mode: ONCE; clone_newns: true;' | nsjail -Mo --config /dev/stdin -- /bin/true
+#   See docker/nsjail-smoke.sh (runs the above in one script).
 
-# ---- Stage 1: build Go binary ----
-FROM micr.cloud.mioffice.cn/agent-getaway/agent-gateway-base:go1.25-node22-py3 AS builder
-# 内网构建机访问不了 proxy.golang.org，走国内代理拉 Go 模块。
-# 两个代理 fallback，任一可达即可。
-ENV GOPROXY=https://goproxy.cn,https://mirrors.aliyun.com/goproxy/,direct
-ENV GOSUMDB=off
+# ---------------------------------------------------------------------------
+# Stage 1: build nsjail
+# ---------------------------------------------------------------------------
+# Pinned upstream: google/nsjail. Keep in sync with
+# config/gateway.go -> IsolationConfig.NsjailVersion ("0.12.0").
+ARG NSJAIL_VERSION=0.12.0
+ARG NSJAIL_REF=0.12.0
+
+FROM debian:bookworm-slim AS nsjail-builder
+ARG NSJAIL_REF
+
+# Build deps nsjail's Makefile needs (per upstream Dockerfile):
+#   autoconf bison flex libprotobuf-dev libnl-route-3-dev libtool
+#   pkg-config protobuf-compiler, plus gcc/g++/make/git and curl to fetch.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        autoconf \
+        bison \
+        flex \
+        gcc \
+        g++ \
+        git \
+        libprotobuf-dev \
+        libnl-route-3-dev \
+        libtool \
+        make \
+        pkg-config \
+        protobuf-compiler \
+        curl \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /nsjail
+RUN git clone --depth 1 --branch "${NSJAIL_REF}" \
+        https://github.com/google/nsjail.git . \
+    && make clean \
+    && make \
+    && test -x ./nsjail
+
+# ---------------------------------------------------------------------------
+# Stage 2: build the Go binaries
+# ---------------------------------------------------------------------------
+FROM golang:1.25-bookworm AS gobuild
+ARG GOPROXY_DEFAULT=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY_DEFAULT} \
+    CGO_ENABLED=0
+
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-# cmd/gateway 的 plugin_agent_*.go 用 !no_<agent> tag 注册 agent，默认全编入；
-# 网关无 web 依赖，无需任何 build tag（与原 Dockerfile 一致）。
-RUN CGO_ENABLED=0 go build -o /out/acg ./cmd/gateway/
+# gateway (API + supervisor) and gateway-worker (per-session worker child).
+RUN go build -trimpath -ldflags="-s -w" -o /out/gateway ./cmd/gateway \
+    && go build -trimpath -ldflags="-s -w" -o /out/gateway-worker ./cmd/gateway-worker
 
-# ---- Stage 2: runtime (claude CLI + 工具链 + 二进制) ----
-FROM micr.cloud.mioffice.cn/agent-getaway/agent-gateway-base:go1.25-node22-py3
+# ---------------------------------------------------------------------------
+# Stage 3: runtime image
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim
 
-# claude CLI —— npm 全局安装。
-# 不能用官方 native 安装（curl claude.ai/install.sh）：claude.ai 在国内被地区屏蔽，
-# 构建机拉到的会是 "App unavailable in region" HTML 而非脚本。npm registry 国内可达。
-# 设国内镜像源加速；--omit=dev 跳过开发依赖缩小镜像。
-RUN npm config set registry https://registry.npmmirror.com \
-    && npm install -g @anthropic-ai/claude-code
+# Runtime libs nsjail needs (mirrors upstream Dockerfile's runtime stage) plus
+# tools the agent CLIs commonly shell out to (git, python3, curl).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libc6 \
+        libstdc++6 \
+        libprotobuf32 \
+        libnl-route-3-200 \
+        ca-certificates \
+        curl \
+        git \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
 
-# nb CLI（NocoBase CLI）—— 容器启动时 entrypoint 用它 `nb init` 连接已有 NocoBase 实例。
-# 走公司内网 npm 源（@nocobase/cli 在公网 npmmirror 不一定收录；内网源可达）。
-RUN npm install -g @nocobase/cli --registry=https://im-f1.test.mi.com/npm/
+# nsjail + its runtime shared-lib deps. ldd is used so the image never carries
+# stale/copied libs that drift from the compiled binary. The explicit apt
+# runtime libs above cover the same set; the ldd copy is the source of truth.
+COPY --from=nsjail-builder /nsjail/nsjail /usr/local/bin/nsjail
+RUN set -eux; \
+    mkdir -p /opt/nsjail-libs; \
+    for lib in $(ldd /usr/local/bin/nsjail | awk '/=> \//{print $3}' | sort -u); do \
+        cp "$lib" /opt/nsjail-libs/; \
+    done; \
+    chmod 0755 /usr/local/bin/nsjail
 
-# license-kit 平台二进制变体（必需补装，否则 nb 命令报 MODULE_NOT_FOUND）。
-# @nocobase/cli 依赖的 @nocobase/license-kit 是 napi-rs 平台包，运行时按 process.platform/arch
-# require 对应变体。cli 通过 buildx 在 arm64 构建机上交叉构建时，npm 因该变体声明的
-# os/cpu/libc 约束（linux/x64/glibc）与构建机（arm64）不匹配，用 notsup 拒装它，
-# 导致容器（linux-x64）运行时 require 失败。--force 绕过平台检查强制装上目标变体。
-# ⚠️ 这个变体内网源（im-f1.test.mi.com）没有，只有 npm 官方 registry 有，故不走内网源。
-RUN npm install -g @nocobase/license-kit-linux-x64-gnu --force
+# Go binaries: gateway (API + supervisor) and gateway-worker (worker child).
+COPY --from=gobuild /out/gateway /usr/local/bin/gateway
+COPY --from=gobuild /out/gateway-worker /usr/local/bin/gateway-worker
 
-# 网关二进制
-COPY --from=builder /out/acg /usr/local/bin/acg
+# --- Agent CLIs (per deployment model) --------------------------------------
+# The deployment model ships the CLIs the enabled agents need. Examples
+# (network-dependent; enable what the deployment uses and pin versions):
+#
+#   # Codex (npm):
+#   RUN npm install -g @openai/codex@<pin>
+#
+#   # Claude Code (npm):
+#   RUN npm install -g @anthropic-ai/claude-code@<pin>
+#
+#   # Kimi CLI (npm):
+#   RUN npm install -g <kimi-cli-package>@<pin>
+#
+# These are intentionally left commented: the exact packages/pins vary by
+# deployment, they need network at build time, and this image's base runtime
+# is validated by the Go + nsjail smoke path regardless.
 
-# HOME 指向可挂载卷 /data（/root 无法挂载）。claude CLI 的 .claude/（config + projects
-# transcript）和 nb CLI 的 .nocobase/（env 配置）都硬编码落在 $HOME 下，把 HOME 设到
-# /data 后两者自动写进同一个卷；workDir 锚点（网关 cwd）也挪到 /data/workspace 下，
-# 这样「claude 配置 + nb 配置 + agent 工作目录」全部收敛到一个卷，挂 /data 即可。
-ENV HOME=/data
-RUN mkdir -p /data/workspace
-
-# 预设 .claude.json 跳过 claude 首次 onboarding 检查。
-# ⚠️ 关键：claude 首次启动若 hasCompletedOnboarding!=true，会忽略 ANTHROPIC_BASE_URL
-# 直连 api.anthropic.com 做联网 onboarding 检查（github issue #26935），在内网容器里
-# 会 ERR_BAD_REQUEST。预设此文件后 claude 直接读 settings.json 的 provider 配置。
-# claude 读 $HOME/.claude.json（HOME=/data → /data/.claude.json），不是 .claude/ 文件夹里。
-# 模板放镜像内固定路径（不在 /data 卷里，不会被挂载覆盖）；entrypoint 启动时若卷里
-# 还没有 .claude.json 就拷过去——因为 /data 卷会盖掉镜像层，直接 COPY 到 /data 不可靠。
-COPY docker/base/claude.json /usr/local/share/claude.onboarding-skip.json
-
-# workDir 根 = 网关进程 cwd（server/session_store.go 的 resolveWorkDir 以 os.Getwd() 为锚）。
-# 第一步：单目录；第二步：按用户隔离成 /data/workspace/users/<uid>/project。
-# 放在 HOME=/data 下，与 .claude / .nocobase 共享同一个挂载卷。
-WORKDIR /data/workspace
+# --- Runtime layout ---------------------------------------------------------
+# The gateway and its worker children share:
+#   /srv/workspaces  <- controlled workspace root (all workspace_ids resolve
+#                       under it; bind-mount a persistent volume here)
+#   /gateway-run     <- per-session sockets/agent-homes/profiles (tmpfs OK)
+# Both are created at boot by the entrypoint (idempotent, works on a fresh
+# mounted volume).
+ENV GW_WORKER_EXEC=/usr/local/bin/gateway-worker \
+    GATEWAY_CONFIG=/etc/gateway/gateway.toml
 
 EXPOSE 4096
 
-# 健康检查：/health 不需要认证，返回 agent 列表。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS http://localhost:4096/health || exit 1
+    CMD curl -fsS http://localhost:4096/health/live || exit 1
 
-# entrypoint 包装脚本：启动时幂等执行 nb init（connect-remote，连接已有 NocoBase），
-# 完成后 exec 启动网关。配置由 NB_* 环境变量注入，未配置则跳过 nb init 直接启网关。
+# Minimal signal-aware entrypoint: it exec's the gateway binary so the gateway
+# (which owns the worker Supervisor) is PID 1 and receives SIGTERM directly.
+# SIGTERM propagation API -> worker(nsjail) -> CLI is handled inside the
+# supervisor (CloseSession RPC, SIGTERM to the process group, SIGKILL
+# escalation, group reap).
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["acg", "-port", "4096"]
+CMD ["gateway"]

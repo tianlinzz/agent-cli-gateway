@@ -12,6 +12,11 @@ cc-connect.bak-*
 *.out
 *.old
 
+# agent-cli-gateway build artifacts and runtime state
+/gateway
+/gateway-worker
+/gateway-run/
+
 # ============================================================================
 # Go workspace & tooling
 # ============================================================================

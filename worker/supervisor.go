@@ -582,7 +582,20 @@ func (ws *workerSession) bridge() {
 				// Termination initiated by us; nothing more to report.
 				ws.terminate(nil)
 			default:
-				// Transport failure: the worker likely crashed.
+				// Transport failure: the worker likely crashed. But if we
+				// are already tearing this session down (Close in progress),
+				// the process was killed by us and the abrupt stream end is
+				// the expected result — not a session error. Without this
+				// guard a Close that escalates to SIGKILL (worker ignoring
+				// SIGTERM) would surface "event stream ended" as the
+				// terminal error of a successfully-torn-down session.
+				ws.mu.Lock()
+				closing := ws.closing
+				ws.mu.Unlock()
+				if closing {
+					ws.terminate(nil)
+					return
+				}
 				ws.terminate(fmt.Errorf("event stream ended: %w", err))
 			}
 			return
@@ -632,21 +645,11 @@ func (ws *workerSession) terminate(err error) {
 	})
 }
 
-// killGroup signals the whole process group (nsjail + worker + agent CLI).
-// The worker PID is signaled directly too as a defensive measure in case it
-// escaped the group (e.g. a wrapper that calls setsid).
-func (ws *workerSession) killGroup(sig syscall.Signal) {
-	if ws.pgid > 0 {
-		if err := syscall.Kill(-ws.pgid, sig); err != nil && !errors.Is(err, syscall.ESRCH) {
-			slog.Warn("worker: kill process group", "pgid", ws.pgid, "signal", sig, "error", err)
-		}
-	}
-	if ws.workerPID > 0 && ws.workerPID != ws.pgid {
-		if err := syscall.Kill(ws.workerPID, sig); err != nil && !errors.Is(err, syscall.ESRCH) {
-			slog.Warn("worker: signal worker pid", "pid", ws.workerPID, "signal", sig, "error", err)
-		}
-	}
-}
+// killGroup is defined in the platform files:
+//   - spawn_unix.go (!windows): POSIX process-group signals (nsjail + worker +
+//     agent CLI) via syscall.Kill.
+//   - spawn_windows.go (windows): taskkill /T /F process-tree kill (no POSIX
+//     process groups; nsjail is Linux-only so Windows is dev-only).
 
 // handshake waits for the worker socket to appear, dials, performs the
 // Health handshake, and starts the session. It is bounded by ctx.
