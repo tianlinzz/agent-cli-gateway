@@ -479,6 +479,13 @@ func (cs *claudeSession) handleControlRequest(raw map[string]any) {
 
 	toolName, _ := request["tool_name"].(string)
 	input, _ := request["input"].(map[string]any)
+	if toolName == "AskUserQuestion" {
+		cs.emit(runtime.Event{Type: runtime.EventError, Error: "AskUserQuestion is disabled in unattended gateway mode"})
+		if err := cs.respondPermission(requestID, false, "Interactive questions are not supported by this gateway."); err != nil {
+			slog.Warn("claudeSession: deny AskUserQuestion", "request_id", requestID, "error", err)
+		}
+		return
+	}
 
 	// The canonical permission event surface is preserved regardless of the
 	// deployment's auto-approve policy: the worker/config layer decides whether

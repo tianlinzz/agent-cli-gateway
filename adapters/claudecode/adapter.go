@@ -103,7 +103,23 @@ func NewAdapter(opts Options) (*ClaudeCodeAdapter, error) {
 	if strings.TrimSpace(opts.Command) == "" {
 		opts.Command = "claude"
 	}
+	// AskUserQuestion requires an interactive answer channel that the
+	// unattended OpenAI gateway does not expose. Always deny it at the CLI
+	// capability level; the protocol handler also rejects any request emitted
+	// by a future Claude Code version as a defense in depth.
+	if !containsTool(opts.DisallowedTools, "AskUserQuestion") {
+		opts.DisallowedTools = append(opts.DisallowedTools, "AskUserQuestion")
+	}
 	return &ClaudeCodeAdapter{opts: opts}, nil
+}
+
+func containsTool(tools []string, want string) bool {
+	for _, tool := range tools {
+		if strings.TrimSpace(tool) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // Describe returns the static descriptor: model id "claude-code",

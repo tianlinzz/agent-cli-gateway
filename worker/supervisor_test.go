@@ -499,25 +499,26 @@ func TestSupervisor_AbortReachesWorker(t *testing.T) {
 	if err := ws.Abort(context.Background()); err != nil {
 		t.Fatalf("Abort: %v", err)
 	}
-	// The worker must both log the abort RPC and emit the "aborted" status.
-	if ev := waitEvent(t, ws, grt.EventStatus, 5*time.Second); ev.Status != "aborted" {
-		t.Errorf("expected aborted status event, got %+v", ev)
-	}
+	// Persistent sessions are closed by abort, so the worker's event stream may
+	// close before it can emit a status event.
 	data, rerr := os.ReadFile(logPath)
 	if rerr != nil {
 		t.Fatalf("read worker log: %v", rerr)
 	}
-	if !strings.Contains(string(data), "abort") {
-		t.Errorf("worker log missing abort RPC:\n%s", data)
+	if !strings.Contains(string(data), "close") {
+		t.Errorf("worker log missing close RPC:\n%s", data)
 	}
 
-	// Persistent-process sessions survive an abort: the process must still be
-	// alive and usable.
-	if !pidAlive(ws.outerPID) {
-		t.Error("persistent_process worker must survive an abort")
+	// Persistent-process sessions are terminated on abort. Claude's native
+	// stream-json protocol cannot interrupt an in-flight turn; keeping the
+	// process alive would leave the gateway session permanently busy.
+	select {
+	case <-ws.reaped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("persistent_process worker did not terminate after abort")
 	}
-	if err := ws.Close(context.Background()); err != nil {
-		t.Fatalf("Close after abort: %v", err)
+	if pidAlive(ws.outerPID) {
+		t.Error("persistent_process worker still alive after abort")
 	}
 }
 

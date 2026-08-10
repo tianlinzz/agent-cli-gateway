@@ -138,6 +138,9 @@ func (h *stubHandler) StartSession(_ context.Context, req worker.StartSessionReq
 		return "persistent_process", nil
 	}
 	h.emit(runtime.Event{Type: runtime.EventStatus, Status: "started"})
+	if req.ModelID == "codex" {
+		return "resume_per_turn", nil
+	}
 	return "persistent_process", nil
 }
 

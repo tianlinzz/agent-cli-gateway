@@ -163,6 +163,37 @@ func TestBuildClaudeArgs_Fresh(t *testing.T) {
 	}
 }
 
+func TestNewAdapter_DisablesInteractiveAskUserQuestion(t *testing.T) {
+	a, err := NewAdapter(Options{})
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
+	}
+	if !containsString(a.opts.DisallowedTools, "AskUserQuestion") {
+		t.Fatalf("disallowed tools = %v, want AskUserQuestion", a.opts.DisallowedTools)
+	}
+}
+
+func TestNewAdapter_PreservesConfiguredDisallowedTools(t *testing.T) {
+	a, err := NewAdapter(Options{DisallowedTools: []string{"Bash", "Edit"}})
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
+	}
+	for _, tool := range []string{"Bash", "Edit", "AskUserQuestion"} {
+		if !containsString(a.opts.DisallowedTools, tool) {
+			t.Fatalf("disallowed tools = %v, want %s", a.opts.DisallowedTools, tool)
+		}
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 // TestBuildClaudeArgs_Resume passes a native session id — --resume must be
 // emitted and no default mode flag added.
 func TestBuildClaudeArgs_Resume(t *testing.T) {
@@ -969,7 +1000,7 @@ func TestAdapterStart_ResumeIDFromMetadata(t *testing.T) {
 	sess, err := a.Start(context.Background(), gwrt.StartRequest{
 		ModelID:     "claude-code",
 		SessionID:   "sess-1",
-		CallerID:     "owner-1",
+		CallerID:    "owner-1",
 		WorkspaceID: "ws-1",
 		Metadata:    map[string]string{"claude_session_id": "native-sess"},
 	})

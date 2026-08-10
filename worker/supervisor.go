@@ -520,13 +520,20 @@ func (ws *workerSession) Send(ctx context.Context, input runtime.Input) error {
 // starts a fresh process on the next turn.
 func (ws *workerSession) Abort(ctx context.Context) error {
 	ws.mu.Lock()
-	state, err := ws.state, ws.err
+	state, err, lifecycle := ws.state, ws.err, ws.lifecycle
 	ws.mu.Unlock()
 	if state != stateRunning {
 		if err != nil {
 			return err
 		}
 		return nil
+	}
+	if lifecycle == runtime.LifecyclePersistentProcess {
+		// Persistent stream-json CLIs have no turn-level interrupt message.
+		// Closing the execution is the only reliable way to stop an in-flight
+		// turn (including AskUserQuestion waits); the next request can resume
+		// from the adapter's native transcript/session id.
+		return ws.Close(ctx)
 	}
 	return ws.client.Abort(ctx, ws.req.SessionID)
 }
