@@ -7,7 +7,21 @@
 // package.
 package runtime
 
-import "context"
+import (
+	"context"
+	"time"
+)
+
+// AgentExecutionConfig is the trusted, deployment-owned configuration passed
+// from the gateway to a worker. It is never populated from request metadata.
+type AgentExecutionConfig struct {
+	Command        string
+	DefaultModel   string
+	Permission     string
+	TurnTimeout    time.Duration
+	MaxConcurrency int
+	Env            map[string]string
+}
 
 // Descriptor is the static description of an adapter as seen by the model
 // registry and the public /v1/models discovery endpoint.

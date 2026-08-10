@@ -170,7 +170,6 @@ jobs:
     # is deterministic (pinned nsjail tag + pinned debian base).
     runs-on: ubuntu-latest
     needs: lint
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v4
@@ -181,5 +180,6 @@ jobs:
       - name: Run nsjail smoke validation
         run: |
           docker run --rm --entrypoint /bin/sh \
+            --privileged \
             -v "$PWD/docker/nsjail-smoke.sh:/nsjail-smoke.sh:ro" \
             agent-gateway:ci /nsjail-smoke.sh

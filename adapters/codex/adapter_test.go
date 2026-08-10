@@ -1062,7 +1062,7 @@ func TestAdapterStart_ResumeIDFromMetadata(t *testing.T) {
 	sess, err := a.Start(context.Background(), gwrt.StartRequest{
 		ModelID:     "codex",
 		SessionID:   "sess-1",
-		OwnerID:     "owner-1",
+		CallerID:     "owner-1",
 		WorkspaceID: "ws-1",
 		Metadata:    map[string]string{"codex_thread_id": "thread-native"},
 	})
@@ -1086,7 +1086,7 @@ func TestAdapterStart_RejectsAppServerBackend(t *testing.T) {
 		t.Fatalf("NewAdapter: %v", err)
 	}
 	_, err = a.Start(context.Background(), gwrt.StartRequest{
-		ModelID: "codex", SessionID: "s", OwnerID: "o", WorkspaceID: "w",
+		ModelID: "codex", SessionID: "s", CallerID: "o", WorkspaceID: "w",
 	})
 	if err == nil || !strings.Contains(err.Error(), "app_server") {
 		t.Fatalf("Start(app_server) err = %v, want app_server not supported", err)

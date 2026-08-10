@@ -20,7 +20,8 @@ const (
 	EventFinish EventType = "finish"
 	// EventStatus reports a session lifecycle change (e.g. "started",
 	// "closed").
-	EventStatus EventType = "status"
+	EventStatus        EventType = "status"
+	EventNativeSession EventType = "native_session"
 )
 
 // Event is the canonical runtime event emitted by sessions and executions.
@@ -50,6 +51,9 @@ type Event struct {
 
 	// Status is set for EventStatus, e.g. "started" or "closed".
 	Status string
+	// NativeSessionID is emitted when an adapter learns the resumable native
+	// conversation/thread identifier.
+	NativeSessionID string
 }
 
 // PermissionRequest is a canonical permission request raised by an agent.

@@ -40,7 +40,7 @@ if [ ! -f "$CONFIG_PATH" ]; then
       printf '# token = ""  # auth disabled (dev/test only)\n'
     fi
     printf '\n[workspace]\nroot = "%s"\n\n' "$WORKSPACE_ROOT"
-    printf '[isolation]\nrequired = true\nnsjail_version = "0.12.0"\n'
+    printf '[isolation]\nrequired = true\nnsjail_version = "3.6"\n'
     printf 'nsjail_source = "https://github.com/google/nsjail"\n'
     printf 'binary_path = "/usr/local/bin/nsjail"\n\n'
     printf '[isolation.mounts]\nworkspace_dir = "/workspace"\n'

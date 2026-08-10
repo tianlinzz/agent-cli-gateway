@@ -19,17 +19,9 @@ import (
 // mount namespaces, and the base seccomp policy actually work on this host.
 // Any failure is fail-closed.
 func platformPreflight(ctx context.Context, iso config.IsolationConfig) error {
-	// 1. Version pin.
-	out, err := exec.CommandContext(ctx, iso.BinaryPath, "--version").Output()
-	if err != nil {
-		return fmt.Errorf("nsjail: preflight: run %q --version: %w", iso.BinaryPath, err)
-	}
-	version := strings.TrimSpace(string(out))
-	if iso.NsjailVersion != "" && !strings.Contains(version, iso.NsjailVersion) {
-		return fmt.Errorf("nsjail: preflight: binary version %q does not match pinned version %q", version, iso.NsjailVersion)
-	}
-
-	// 2. Minimal jail: user namespace + mount namespace + seccomp must work.
+	// Validate the actual configured binary by executing a minimal jail. nsjail
+	// does not provide a stable --version flag across upstream releases, so
+	// version pinning is enforced at image/build time rather than guessed here.
 	return minimalJail(ctx, iso)
 }
 

@@ -42,6 +42,8 @@ type Config struct {
 	WorkerExec string
 	// WorkerArgs are extra argv passed to the worker child.
 	WorkerArgs []string
+	// Agents contains trusted per-agent execution settings keyed by model ID.
+	Agents map[string]runtime.AgentExecutionConfig
 	// StartTimeout bounds the socket + handshake. Default 30s.
 	StartTimeout time.Duration
 	// ShutdownTimeout bounds graceful shutdown (CloseSession RPC + SIGTERM)
@@ -106,6 +108,7 @@ type Supervisor struct {
 	resolver *workspace.Resolver
 	spawn    spawnFunc
 	sessions map[string]*workerSession
+	slots    map[string]chan struct{}
 }
 
 // Option customizes a Supervisor. Options are applied after construction and
@@ -148,6 +151,12 @@ func NewSupervisor(cfg Config, opts ...Option) (*Supervisor, error) {
 		resolver: resolver,
 		spawn:    defaultSpawner(cfg),
 		sessions: make(map[string]*workerSession),
+		slots:    make(map[string]chan struct{}),
+	}
+	for name, a := range cfg.Agents {
+		if a.MaxConcurrency > 0 {
+			s.slots[name] = make(chan struct{}, a.MaxConcurrency)
+		}
 	}
 	for _, o := range opts {
 		o(s)
@@ -175,6 +184,22 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 		return nil, fmt.Errorf("worker: session %q already running", req.SessionID)
 	}
 	s.mu.Unlock()
+	slotHeld := false
+	if slot := s.slots[req.ModelID]; slot != nil {
+		select {
+		case slot <- struct{}{}:
+			slotHeld = true
+		case <-ctx.Done():
+			return nil, fmt.Errorf("worker: acquire %s concurrency slot: %w", req.ModelID, ctx.Err())
+		}
+	}
+	defer func() {
+		if slotHeld {
+			if slot := s.slots[req.ModelID]; slot != nil {
+				<-slot
+			}
+		}
+	}()
 
 	// Resolve the opaque workspace_id to the real controlled directory. The
 	// resolver guarantees the result stays inside the configured root, and the
@@ -266,6 +291,10 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 		socketPath:  socketPath,
 		profilePath: profilePath,
 		state:       stateStarting,
+	}
+	if slot := s.slots[req.ModelID]; slot != nil {
+		ws.releaseSlot = func() { <-slot }
+		slotHeld = false
 	}
 	ws.ctx, ws.cancel = context.WithCancel(context.Background())
 	go ws.monitor()
@@ -407,7 +436,8 @@ const (
 // wraps the gRPC client, the process-group lifecycle, and the canonical event
 // bridge. All state is guarded by mu; termination is idempotent via once.
 type workerSession struct {
-	once sync.Once
+	once        sync.Once
+	releaseSlot func()
 
 	sup    *Supervisor
 	req    runtime.StartRequest
@@ -643,6 +673,9 @@ func (ws *workerSession) terminate(err error) {
 			ws.client.Close()
 		}
 		ws.sup.removeSession(ws.req.SessionID)
+		if ws.releaseSlot != nil {
+			ws.releaseSlot()
+		}
 		if ws.sessionDir != "" {
 			if err := os.RemoveAll(ws.sessionDir); err != nil {
 				slog.Warn("worker: cleanup session dir", "session", ws.req.SessionID, "error", err)
@@ -715,7 +748,11 @@ dial:
 		}
 	}
 
-	mode, err := c.StartSession(ctx, toStartSessionReq(ws.req))
+	startReq := toStartSessionReq(ws.req)
+	if cfg, ok := ws.sup.cfg.Agents[ws.req.ModelID]; ok {
+		startReq.AgentConfig = cfg
+	}
+	mode, err := c.StartSession(ctx, startReq)
 	if err != nil {
 		c.Close()
 		ws.client = nil

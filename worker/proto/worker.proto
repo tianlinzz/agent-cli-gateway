@@ -63,6 +63,16 @@ message StartSessionRequest {
   string workspace_id = 4;
   map<string, string> metadata = 5;
   Input first_input = 6;
+  AgentExecutionConfig agent_config = 7;
+}
+
+message AgentExecutionConfig {
+  string command = 1;
+  string default_model = 2;
+  string permission = 3;
+  int64 turn_timeout_nanos = 4;
+  int32 max_concurrency = 5;
+  map<string, string> env = 6;
 }
 
 message StartSessionResponse {
@@ -152,4 +162,5 @@ message EventFrame {
   string error = 6;
   string finish_reason = 7;
   string status = 8;
+  string native_session_id = 9;
 }

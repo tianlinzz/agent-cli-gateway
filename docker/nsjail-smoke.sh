@@ -4,9 +4,8 @@
 # built image on Linux CI, NOT on the darwin dev host.
 #
 # Validates:
-#   1. `nsjail --version` — the binary runs.
-#   2. `ldd` — every shared-library dependency resolves.
-#   3. A minimal smoke jail (`mode: ONCE` + private mount namespace) executes
+#   1. `ldd` — every shared-library dependency resolves.
+#   2. A minimal smoke jail (`mode: ONCE` + private mount namespace) executes
 #      a trivial command inside the jail.
 #
 # Usage: docker/nsjail-smoke.sh   (must run inside the runtime image, or on a
@@ -14,9 +13,6 @@
 set -eu
 
 NSJAIL_BIN="${NSJAIL_BIN:-/usr/local/bin/nsjail}"
-
-echo "== nsjail --version =="
-"$NSJAIL_BIN" --version
 
 echo "== ldd =="
 ldd "$NSJAIL_BIN"
@@ -32,11 +28,13 @@ clone_newpid: false;
 clone_newipc: true;
 clone_newuts: true;
 clone_newnet: false;
-uidmap: { inside_id: "65532"; outside_id: "65532"; count: "1"; };
-gidmap: { inside_id: "65532"; outside_id: "65532"; count: "1"; };
-user: "65532";
-group: "65532";
-tmpfs: { dst: "/tmp"; rw: true; };
+uidmap: { inside_id: "65532"; outside_id: "65532"; count: 1; };
+gidmap: { inside_id: "65532"; outside_id: "65532"; count: 1; };
+mount: { dst: "/tmp"; fstype: "tmpfs"; options: "size=64m"; rw: true; mandatory: true; };
+mount: { src: "/bin"; dst: "/bin"; is_bind: true; rw: false; mandatory: true; };
+mount: { src: "/usr"; dst: "/usr"; is_bind: true; rw: false; mandatory: true; };
+mount: { src: "/lib"; dst: "/lib"; is_bind: true; rw: false; mandatory: true; };
+mount: { src: "/etc"; dst: "/etc"; is_bind: true; rw: false; mandatory: true; };
 EOF
 
 echo "OK: nsjail smoke validation passed"

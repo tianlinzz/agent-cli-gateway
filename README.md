@@ -24,7 +24,7 @@ OpenAI-compatible surface and a process-isolation-first execution model.
   mount namespace are the two boundaries).
 - **SSE streaming** — canonical runtime events are translated to OpenAI
   `chat.completion.chunk` frames terminated by `data: [DONE]`.
-- **Owner isolation** — sessions are scoped by `X-User-Id`; unknown and
+- **Caller isolation** — sessions are scoped by the authenticated caller API key; unknown and
   wrong-owner session ids collapse to the same generic 404.
 
 ## Quick Start
@@ -80,7 +80,7 @@ curl http://localhost:4096/v1/models \
 
 # Streaming completion (SSE, ends with data: [DONE])
 curl -N http://localhost:4096/v1/chat/completions \
-  -H "Authorization: Bearer TOKEN" -H "X-User-Id: alice" \
+  -H "Authorization: Bearer TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "codex",
@@ -92,7 +92,7 @@ curl -N http://localhost:4096/v1/chat/completions \
 # Abort the in-flight turn of a session (session id from the
 # X-Gateway-Session-Id response header of the create request)
 curl -X POST http://localhost:4096/v1/sessions/sess_abc/abort \
-  -H "Authorization: Bearer TOKEN" -H "X-User-Id: alice"
+  -H "Authorization: Bearer TOKEN"
 ```
 
 Sessions are created implicitly by the first chat request (no session id
@@ -148,10 +148,10 @@ See [`config.example.toml`](config.example.toml) for a full annotated example.
 | (root) | `mode` | `prod` | `prod` / `dev` / `test`. Only `test` may disable nsjail |
 | `[server]` | `listen_addr` | `:4096` | HTTP listen address |
 | `[server]` | `shutdown_timeout` | `10s` | Graceful shutdown bound |
-| `[auth]` | `token` | *(empty)* | Bearer token; empty disables auth |
+| `[auth]` | `callers` | *(empty)* | Bearer token to caller ID mappings |
 | `[workspace]` | `root` | `workspaces` | Root all workspace ids resolve under |
 | `[isolation]` | `required` | `true` | Must be true outside the test profile |
-| `[isolation]` | `nsjail_version` / `nsjail_source` | `0.12.0` / upstream URL | Pinned build provenance |
+| `[isolation]` | `nsjail_version` / `nsjail_source` | `3.6` / upstream URL | Pinned build provenance |
 | `[isolation]` | `binary_path` | `/usr/local/bin/nsjail` | nsjail executable |
 | `[isolation.mounts]` | `workspace_dir` / `agent_home_dir` / `tmp_dir` | `/workspace` / `/agent-home` / `/tmp` | Sandbox mount layout |
 | `[isolation.user_namespace]` | `enabled`, `uid`, `gid` | `true`, `1000`, `1000` | Unprivileged user namespace |
@@ -159,13 +159,8 @@ See [`config.example.toml`](config.example.toml) for a full annotated example.
 | `[agents.<id>]` | `enabled` | `true` | Whether the agent is available |
 | `[agents.<id>]` | `permission` | `auto` | `auto` / `ask` / `deny` |
 
-> **Phase-1 limitation:** `[agents.<id>]` settings and `CC_GATEWAY_*` env
-> knobs are parsed/validated by the gateway but are not yet threaded through
-> the nsjail boundary into the worker process — the worker's adapters build
-> their options from the process environment, which nsjail `KeepEnv` strips to
-> a fixed allowlist. Agents currently run with adapter built-in defaults,
-> `permission` is auto-approve inside the controlled workspace, and full
-> per-agent config wiring is a follow-up.
+Agent settings are passed to the single-session worker over the canonical RPC
+contract; provider secrets remain worker/container environment configuration.
 
 ## Architecture
 

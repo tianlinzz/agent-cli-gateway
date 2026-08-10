@@ -264,7 +264,7 @@ func (ks *kimiSession) readLoop(ctx context.Context, cmd *exec.Cmd, stdout io.Re
 
 	// Flush any remaining pending messages as text and send the finish event.
 	ks.flushPendingAsText()
-	ks.emit(runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"})
+	ks.emit(runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn", NativeSessionID: ks.CurrentSessionID()})
 }
 
 // Kimi CLI stream-json message roles:

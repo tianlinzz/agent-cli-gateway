@@ -143,6 +143,7 @@ type StartSessionRequest struct {
 	WorkspaceId   string                 `protobuf:"bytes,4,opt,name=workspace_id,json=workspaceId,proto3" json:"workspace_id,omitempty"`
 	Metadata      map[string]string      `protobuf:"bytes,5,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	FirstInput    *Input                 `protobuf:"bytes,6,opt,name=first_input,json=firstInput,proto3" json:"first_input,omitempty"`
+	AgentConfig   *AgentExecutionConfig  `protobuf:"bytes,7,opt,name=agent_config,json=agentConfig,proto3" json:"agent_config,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -219,6 +220,97 @@ func (x *StartSessionRequest) GetFirstInput() *Input {
 	return nil
 }
 
+func (x *StartSessionRequest) GetAgentConfig() *AgentExecutionConfig {
+	if x != nil {
+		return x.AgentConfig
+	}
+	return nil
+}
+
+type AgentExecutionConfig struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Command          string                 `protobuf:"bytes,1,opt,name=command,proto3" json:"command,omitempty"`
+	DefaultModel     string                 `protobuf:"bytes,2,opt,name=default_model,json=defaultModel,proto3" json:"default_model,omitempty"`
+	Permission       string                 `protobuf:"bytes,3,opt,name=permission,proto3" json:"permission,omitempty"`
+	TurnTimeoutNanos int64                  `protobuf:"varint,4,opt,name=turn_timeout_nanos,json=turnTimeoutNanos,proto3" json:"turn_timeout_nanos,omitempty"`
+	MaxConcurrency   int32                  `protobuf:"varint,5,opt,name=max_concurrency,json=maxConcurrency,proto3" json:"max_concurrency,omitempty"`
+	Env              map[string]string      `protobuf:"bytes,6,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *AgentExecutionConfig) Reset() {
+	*x = AgentExecutionConfig{}
+	mi := &file_worker_proto_worker_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AgentExecutionConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AgentExecutionConfig) ProtoMessage() {}
+
+func (x *AgentExecutionConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_worker_proto_worker_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AgentExecutionConfig.ProtoReflect.Descriptor instead.
+func (*AgentExecutionConfig) Descriptor() ([]byte, []int) {
+	return file_worker_proto_worker_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *AgentExecutionConfig) GetCommand() string {
+	if x != nil {
+		return x.Command
+	}
+	return ""
+}
+
+func (x *AgentExecutionConfig) GetDefaultModel() string {
+	if x != nil {
+		return x.DefaultModel
+	}
+	return ""
+}
+
+func (x *AgentExecutionConfig) GetPermission() string {
+	if x != nil {
+		return x.Permission
+	}
+	return ""
+}
+
+func (x *AgentExecutionConfig) GetTurnTimeoutNanos() int64 {
+	if x != nil {
+		return x.TurnTimeoutNanos
+	}
+	return 0
+}
+
+func (x *AgentExecutionConfig) GetMaxConcurrency() int32 {
+	if x != nil {
+		return x.MaxConcurrency
+	}
+	return 0
+}
+
+func (x *AgentExecutionConfig) GetEnv() map[string]string {
+	if x != nil {
+		return x.Env
+	}
+	return nil
+}
+
 type StartSessionResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// lifecycle_mode mirrors runtime.Descriptor.LifecycleMode
@@ -231,7 +323,7 @@ type StartSessionResponse struct {
 
 func (x *StartSessionResponse) Reset() {
 	*x = StartSessionResponse{}
-	mi := &file_worker_proto_worker_proto_msgTypes[3]
+	mi := &file_worker_proto_worker_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -243,7 +335,7 @@ func (x *StartSessionResponse) String() string {
 func (*StartSessionResponse) ProtoMessage() {}
 
 func (x *StartSessionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_worker_proto_worker_proto_msgTypes[3]
+	mi := &file_worker_proto_worker_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -256,7 +348,7 @@ func (x *StartSessionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartSessionResponse.ProtoReflect.Descriptor instead.
 func (*StartSessionResponse) Descriptor() ([]byte, []int) {
-	return file_worker_proto_worker_proto_rawDescGZIP(), []int{3}
+	return file_worker_proto_worker_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *StartSessionResponse) GetLifecycleMode() string {
@@ -276,7 +368,7 @@ type SendInputRequest struct {
 
 func (x *SendInputRequest) Reset() {
 	*x = SendInputRequest{}
-	mi := &file_worker_proto_worker_proto_msgTypes[4]
+	mi := &file_worker_proto_worker_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -288,7 +380,7 @@ func (x *SendInputRequest) String() string {
 func (*SendInputRequest) ProtoMessage() {}
 
 func (x *SendInputRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_worker_proto_worker_proto_msgTypes[4]
+	mi := &file_worker_proto_worker_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -301,7 +393,7 @@ func (x *SendInputRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SendInputRequest.ProtoReflect.Descriptor instead.
 func (*SendInputRequest) Descriptor() ([]byte, []int) {
-	return file_worker_proto_worker_proto_rawDescGZIP(), []int{4}
+	return file_worker_proto_worker_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *SendInputRequest) GetSessionId() string {
@@ -326,7 +418,7 @@ type SendInputResponse struct {
 
 func (x *SendInputResponse) Reset() {
 	*x = SendInputResponse{}
-	mi := &file_worker_proto_worker_proto_msgTypes[5]
+	mi := &file_worker_proto_worker_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -338,7 +430,7 @@ func (x *SendInputResponse) String() string {
 func (*SendInputResponse) ProtoMessage() {}
 
 func (x *SendInputResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_worker_proto_worker_proto_msgTypes[5]
+	mi := &file_worker_proto_worker_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -351,7 +443,7 @@ func (x *SendInputResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SendInputResponse.ProtoReflect.Descriptor instead.
 func (*SendInputResponse) Descriptor() ([]byte, []int) {
-	return file_worker_proto_worker_proto_rawDescGZIP(), []int{5}
+	return file_worker_proto_worker_proto_rawDescGZIP(), []int{6}
 }
 
 type StreamEventsRequest struct {
@@ -363,7 +455,7 @@ type StreamEventsRequest struct {
 
 func (x *StreamEventsRequest) Reset() {
 	*x = StreamEventsRequest{}
-	mi := &file_worker_proto_worker_proto_msgTypes[6]
+	mi := &file_worker_proto_worker_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -375,7 +467,7 @@ func (x *StreamEventsRequest) String() string {
 func (*StreamEventsRequest) ProtoMessage() {}
 
 func (x *StreamEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_worker_proto_worker_proto_msgTypes[6]
+	mi := &file_worker_proto_worker_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -388,7 +480,7 @@ func (x *StreamEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamEventsRequest.ProtoReflect.Descriptor instead.
 func (*StreamEventsRequest) Descriptor() ([]byte, []int) {
-	return file_worker_proto_worker_proto_rawDescGZIP(), []int{6}
+	return file_worker_proto_worker_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *StreamEventsRequest) GetSessionId() string {
@@ -407,7 +499,7 @@ type AbortSessionRequest struct {
 
 func (x *AbortSessionRequest) Reset() {
 	*x = AbortSessionRequest{}
-	mi := &file_worker_proto_worker_proto_msgTypes[7]
+	mi := &file_worker_proto_worker_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -419,7 +511,7 @@ func (x *AbortSessionRequest) String() string {
 func (*AbortSessionRequest) ProtoMessage() {}
 
 func (x *AbortSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_worker_proto_worker_proto_msgTypes[7]
+	mi := &file_worker_proto_worker_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -432,7 +524,7 @@ func (x *AbortSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AbortSessionRequest.ProtoReflect.Descriptor instead.
 func (*AbortSessionRequest) Descriptor() ([]byte, []int) {
-	return file_worker_proto_worker_proto_rawDescGZIP(), []int{7}
+	return file_worker_proto_worker_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *AbortSessionRequest) GetSessionId() string {
@@ -450,7 +542,7 @@ type AbortSessionResponse struct {
 
 func (x *AbortSessionResponse) Reset() {
 	*x = AbortSessionResponse{}
-	mi := &file_worker_proto_worker_proto_msgTypes[8]
+	mi := &file_worker_proto_worker_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -462,7 +554,7 @@ func (x *AbortSessionResponse) String() string {
 func (*AbortSessionResponse) ProtoMessage() {}
 
 func (x *AbortSessionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_worker_proto_worker_proto_msgTypes[8]
+	mi := &file_worker_proto_worker_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -475,7 +567,7 @@ func (x *AbortSessionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AbortSessionResponse.ProtoReflect.Descriptor instead.
 func (*AbortSessionResponse) Descriptor() ([]byte, []int) {
-	return file_worker_proto_worker_proto_rawDescGZIP(), []int{8}
+	return file_worker_proto_worker_proto_rawDescGZIP(), []int{9}
 }
 
 type CloseSessionRequest struct {
@@ -487,7 +579,7 @@ type CloseSessionRequest struct {
 
 func (x *CloseSessionRequest) Reset() {
 	*x = CloseSessionRequest{}
-	mi := &file_worker_proto_worker_proto_msgTypes[9]
+	mi := &file_worker_proto_worker_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -499,7 +591,7 @@ func (x *CloseSessionRequest) String() string {
 func (*CloseSessionRequest) ProtoMessage() {}
 
 func (x *CloseSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_worker_proto_worker_proto_msgTypes[9]
+	mi := &file_worker_proto_worker_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -512,7 +604,7 @@ func (x *CloseSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CloseSessionRequest.ProtoReflect.Descriptor instead.
 func (*CloseSessionRequest) Descriptor() ([]byte, []int) {
-	return file_worker_proto_worker_proto_rawDescGZIP(), []int{9}
+	return file_worker_proto_worker_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *CloseSessionRequest) GetSessionId() string {
@@ -530,7 +622,7 @@ type CloseSessionResponse struct {
 
 func (x *CloseSessionResponse) Reset() {
 	*x = CloseSessionResponse{}
-	mi := &file_worker_proto_worker_proto_msgTypes[10]
+	mi := &file_worker_proto_worker_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -542,7 +634,7 @@ func (x *CloseSessionResponse) String() string {
 func (*CloseSessionResponse) ProtoMessage() {}
 
 func (x *CloseSessionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_worker_proto_worker_proto_msgTypes[10]
+	mi := &file_worker_proto_worker_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -555,7 +647,7 @@ func (x *CloseSessionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CloseSessionResponse.ProtoReflect.Descriptor instead.
 func (*CloseSessionResponse) Descriptor() ([]byte, []int) {
-	return file_worker_proto_worker_proto_rawDescGZIP(), []int{10}
+	return file_worker_proto_worker_proto_rawDescGZIP(), []int{11}
 }
 
 // Input is one canonical turn (runtime.Input).
@@ -570,7 +662,7 @@ type Input struct {
 
 func (x *Input) Reset() {
 	*x = Input{}
-	mi := &file_worker_proto_worker_proto_msgTypes[11]
+	mi := &file_worker_proto_worker_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -582,7 +674,7 @@ func (x *Input) String() string {
 func (*Input) ProtoMessage() {}
 
 func (x *Input) ProtoReflect() protoreflect.Message {
-	mi := &file_worker_proto_worker_proto_msgTypes[11]
+	mi := &file_worker_proto_worker_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -595,7 +687,7 @@ func (x *Input) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Input.ProtoReflect.Descriptor instead.
 func (*Input) Descriptor() ([]byte, []int) {
-	return file_worker_proto_worker_proto_rawDescGZIP(), []int{11}
+	return file_worker_proto_worker_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *Input) GetMessages() []*Message {
@@ -633,7 +725,7 @@ type Message struct {
 
 func (x *Message) Reset() {
 	*x = Message{}
-	mi := &file_worker_proto_worker_proto_msgTypes[12]
+	mi := &file_worker_proto_worker_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -645,7 +737,7 @@ func (x *Message) String() string {
 func (*Message) ProtoMessage() {}
 
 func (x *Message) ProtoReflect() protoreflect.Message {
-	mi := &file_worker_proto_worker_proto_msgTypes[12]
+	mi := &file_worker_proto_worker_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -658,7 +750,7 @@ func (x *Message) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Message.ProtoReflect.Descriptor instead.
 func (*Message) Descriptor() ([]byte, []int) {
-	return file_worker_proto_worker_proto_rawDescGZIP(), []int{12}
+	return file_worker_proto_worker_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *Message) GetRole() string {
@@ -708,7 +800,7 @@ type Tool struct {
 
 func (x *Tool) Reset() {
 	*x = Tool{}
-	mi := &file_worker_proto_worker_proto_msgTypes[13]
+	mi := &file_worker_proto_worker_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -720,7 +812,7 @@ func (x *Tool) String() string {
 func (*Tool) ProtoMessage() {}
 
 func (x *Tool) ProtoReflect() protoreflect.Message {
-	mi := &file_worker_proto_worker_proto_msgTypes[13]
+	mi := &file_worker_proto_worker_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -733,7 +825,7 @@ func (x *Tool) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Tool.ProtoReflect.Descriptor instead.
 func (*Tool) Descriptor() ([]byte, []int) {
-	return file_worker_proto_worker_proto_rawDescGZIP(), []int{13}
+	return file_worker_proto_worker_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *Tool) GetName() string {
@@ -771,7 +863,7 @@ type ToolCall struct {
 
 func (x *ToolCall) Reset() {
 	*x = ToolCall{}
-	mi := &file_worker_proto_worker_proto_msgTypes[14]
+	mi := &file_worker_proto_worker_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -783,7 +875,7 @@ func (x *ToolCall) String() string {
 func (*ToolCall) ProtoMessage() {}
 
 func (x *ToolCall) ProtoReflect() protoreflect.Message {
-	mi := &file_worker_proto_worker_proto_msgTypes[14]
+	mi := &file_worker_proto_worker_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -796,7 +888,7 @@ func (x *ToolCall) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ToolCall.ProtoReflect.Descriptor instead.
 func (*ToolCall) Descriptor() ([]byte, []int) {
-	return file_worker_proto_worker_proto_rawDescGZIP(), []int{14}
+	return file_worker_proto_worker_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *ToolCall) GetId() string {
@@ -846,7 +938,7 @@ type PermissionRequest struct {
 
 func (x *PermissionRequest) Reset() {
 	*x = PermissionRequest{}
-	mi := &file_worker_proto_worker_proto_msgTypes[15]
+	mi := &file_worker_proto_worker_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -858,7 +950,7 @@ func (x *PermissionRequest) String() string {
 func (*PermissionRequest) ProtoMessage() {}
 
 func (x *PermissionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_worker_proto_worker_proto_msgTypes[15]
+	mi := &file_worker_proto_worker_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -871,7 +963,7 @@ func (x *PermissionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PermissionRequest.ProtoReflect.Descriptor instead.
 func (*PermissionRequest) Descriptor() ([]byte, []int) {
-	return file_worker_proto_worker_proto_rawDescGZIP(), []int{15}
+	return file_worker_proto_worker_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *PermissionRequest) GetId() string {
@@ -907,7 +999,7 @@ type Usage struct {
 
 func (x *Usage) Reset() {
 	*x = Usage{}
-	mi := &file_worker_proto_worker_proto_msgTypes[16]
+	mi := &file_worker_proto_worker_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -919,7 +1011,7 @@ func (x *Usage) String() string {
 func (*Usage) ProtoMessage() {}
 
 func (x *Usage) ProtoReflect() protoreflect.Message {
-	mi := &file_worker_proto_worker_proto_msgTypes[16]
+	mi := &file_worker_proto_worker_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -932,7 +1024,7 @@ func (x *Usage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Usage.ProtoReflect.Descriptor instead.
 func (*Usage) Descriptor() ([]byte, []int) {
-	return file_worker_proto_worker_proto_rawDescGZIP(), []int{16}
+	return file_worker_proto_worker_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *Usage) GetInputTokens() int32 {
@@ -959,22 +1051,23 @@ func (x *Usage) GetTotalTokens() int32 {
 // EventFrame is one canonical runtime event (runtime.Event) serialized over
 // the wire. type is the runtime.EventType string.
 type EventFrame struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Type          string                 `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"`
-	Text          string                 `protobuf:"bytes,2,opt,name=text,proto3" json:"text,omitempty"`
-	Tool          *ToolCall              `protobuf:"bytes,3,opt,name=tool,proto3" json:"tool,omitempty"`
-	Permission    *PermissionRequest     `protobuf:"bytes,4,opt,name=permission,proto3" json:"permission,omitempty"`
-	Usage         *Usage                 `protobuf:"bytes,5,opt,name=usage,proto3" json:"usage,omitempty"`
-	Error         string                 `protobuf:"bytes,6,opt,name=error,proto3" json:"error,omitempty"`
-	FinishReason  string                 `protobuf:"bytes,7,opt,name=finish_reason,json=finishReason,proto3" json:"finish_reason,omitempty"`
-	Status        string                 `protobuf:"bytes,8,opt,name=status,proto3" json:"status,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Type            string                 `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"`
+	Text            string                 `protobuf:"bytes,2,opt,name=text,proto3" json:"text,omitempty"`
+	Tool            *ToolCall              `protobuf:"bytes,3,opt,name=tool,proto3" json:"tool,omitempty"`
+	Permission      *PermissionRequest     `protobuf:"bytes,4,opt,name=permission,proto3" json:"permission,omitempty"`
+	Usage           *Usage                 `protobuf:"bytes,5,opt,name=usage,proto3" json:"usage,omitempty"`
+	Error           string                 `protobuf:"bytes,6,opt,name=error,proto3" json:"error,omitempty"`
+	FinishReason    string                 `protobuf:"bytes,7,opt,name=finish_reason,json=finishReason,proto3" json:"finish_reason,omitempty"`
+	Status          string                 `protobuf:"bytes,8,opt,name=status,proto3" json:"status,omitempty"`
+	NativeSessionId string                 `protobuf:"bytes,9,opt,name=native_session_id,json=nativeSessionId,proto3" json:"native_session_id,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *EventFrame) Reset() {
 	*x = EventFrame{}
-	mi := &file_worker_proto_worker_proto_msgTypes[17]
+	mi := &file_worker_proto_worker_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -986,7 +1079,7 @@ func (x *EventFrame) String() string {
 func (*EventFrame) ProtoMessage() {}
 
 func (x *EventFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_worker_proto_worker_proto_msgTypes[17]
+	mi := &file_worker_proto_worker_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -999,7 +1092,7 @@ func (x *EventFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EventFrame.ProtoReflect.Descriptor instead.
 func (*EventFrame) Descriptor() ([]byte, []int) {
-	return file_worker_proto_worker_proto_rawDescGZIP(), []int{17}
+	return file_worker_proto_worker_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *EventFrame) GetType() string {
@@ -1058,6 +1151,13 @@ func (x *EventFrame) GetStatus() string {
 	return ""
 }
 
+func (x *EventFrame) GetNativeSessionId() string {
+	if x != nil {
+		return x.NativeSessionId
+	}
+	return ""
+}
+
 var File_worker_proto_worker_proto protoreflect.FileDescriptor
 
 const file_worker_proto_worker_proto_rawDesc = "" +
@@ -1067,7 +1167,7 @@ const file_worker_proto_worker_proto_rawDesc = "" +
 	"\x0eHealthResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x12\x10\n" +
-	"\x03pid\x18\x03 \x01(\x05R\x03pid\"\xd3\x02\n" +
+	"\x03pid\x18\x03 \x01(\x05R\x03pid\"\x9c\x03\n" +
 	"\x13StartSessionRequest\x12\x19\n" +
 	"\bmodel_id\x18\x01 \x01(\tR\amodelId\x12\x1d\n" +
 	"\n" +
@@ -1076,8 +1176,21 @@ const file_worker_proto_worker_proto_rawDesc = "" +
 	"\fworkspace_id\x18\x04 \x01(\tR\vworkspaceId\x12M\n" +
 	"\bmetadata\x18\x05 \x03(\v21.gateway.worker.StartSessionRequest.MetadataEntryR\bmetadata\x126\n" +
 	"\vfirst_input\x18\x06 \x01(\v2\x15.gateway.worker.InputR\n" +
-	"firstInput\x1a;\n" +
+	"firstInput\x12G\n" +
+	"\fagent_config\x18\a \x01(\v2$.gateway.worker.AgentExecutionConfigR\vagentConfig\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xc5\x02\n" +
+	"\x14AgentExecutionConfig\x12\x18\n" +
+	"\acommand\x18\x01 \x01(\tR\acommand\x12#\n" +
+	"\rdefault_model\x18\x02 \x01(\tR\fdefaultModel\x12\x1e\n" +
+	"\n" +
+	"permission\x18\x03 \x01(\tR\n" +
+	"permission\x12,\n" +
+	"\x12turn_timeout_nanos\x18\x04 \x01(\x03R\x10turnTimeoutNanos\x12'\n" +
+	"\x0fmax_concurrency\x18\x05 \x01(\x05R\x0emaxConcurrency\x12?\n" +
+	"\x03env\x18\x06 \x03(\v2-.gateway.worker.AgentExecutionConfig.EnvEntryR\x03env\x1a6\n" +
+	"\bEnvEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"=\n" +
 	"\x14StartSessionResponse\x12%\n" +
@@ -1132,7 +1245,7 @@ const file_worker_proto_worker_proto_rawDesc = "" +
 	"\x05Usage\x12!\n" +
 	"\finput_tokens\x18\x01 \x01(\x05R\vinputTokens\x12#\n" +
 	"\routput_tokens\x18\x02 \x01(\x05R\foutputTokens\x12!\n" +
-	"\ftotal_tokens\x18\x03 \x01(\x05R\vtotalTokens\"\xa5\x02\n" +
+	"\ftotal_tokens\x18\x03 \x01(\x05R\vtotalTokens\"\xd1\x02\n" +
 	"\n" +
 	"EventFrame\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x12\n" +
@@ -1144,7 +1257,8 @@ const file_worker_proto_worker_proto_rawDesc = "" +
 	"\x05usage\x18\x05 \x01(\v2\x15.gateway.worker.UsageR\x05usage\x12\x14\n" +
 	"\x05error\x18\x06 \x01(\tR\x05error\x12#\n" +
 	"\rfinish_reason\x18\a \x01(\tR\ffinishReason\x12\x16\n" +
-	"\x06status\x18\b \x01(\tR\x06status2\x87\x04\n" +
+	"\x06status\x18\b \x01(\tR\x06status\x12*\n" +
+	"\x11native_session_id\x18\t \x01(\tR\x0fnativeSessionId2\x87\x04\n" +
 	"\x06Worker\x12G\n" +
 	"\x06Health\x12\x1d.gateway.worker.HealthRequest\x1a\x1e.gateway.worker.HealthResponse\x12Y\n" +
 	"\fStartSession\x12#.gateway.worker.StartSessionRequest\x1a$.gateway.worker.StartSessionResponse\x12P\n" +
@@ -1165,60 +1279,64 @@ func file_worker_proto_worker_proto_rawDescGZIP() []byte {
 	return file_worker_proto_worker_proto_rawDescData
 }
 
-var file_worker_proto_worker_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
+var file_worker_proto_worker_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
 var file_worker_proto_worker_proto_goTypes = []any{
 	(*HealthRequest)(nil),        // 0: gateway.worker.HealthRequest
 	(*HealthResponse)(nil),       // 1: gateway.worker.HealthResponse
 	(*StartSessionRequest)(nil),  // 2: gateway.worker.StartSessionRequest
-	(*StartSessionResponse)(nil), // 3: gateway.worker.StartSessionResponse
-	(*SendInputRequest)(nil),     // 4: gateway.worker.SendInputRequest
-	(*SendInputResponse)(nil),    // 5: gateway.worker.SendInputResponse
-	(*StreamEventsRequest)(nil),  // 6: gateway.worker.StreamEventsRequest
-	(*AbortSessionRequest)(nil),  // 7: gateway.worker.AbortSessionRequest
-	(*AbortSessionResponse)(nil), // 8: gateway.worker.AbortSessionResponse
-	(*CloseSessionRequest)(nil),  // 9: gateway.worker.CloseSessionRequest
-	(*CloseSessionResponse)(nil), // 10: gateway.worker.CloseSessionResponse
-	(*Input)(nil),                // 11: gateway.worker.Input
-	(*Message)(nil),              // 12: gateway.worker.Message
-	(*Tool)(nil),                 // 13: gateway.worker.Tool
-	(*ToolCall)(nil),             // 14: gateway.worker.ToolCall
-	(*PermissionRequest)(nil),    // 15: gateway.worker.PermissionRequest
-	(*Usage)(nil),                // 16: gateway.worker.Usage
-	(*EventFrame)(nil),           // 17: gateway.worker.EventFrame
-	nil,                          // 18: gateway.worker.StartSessionRequest.MetadataEntry
-	nil,                          // 19: gateway.worker.Input.MetadataEntry
-	(*structpb.Struct)(nil),      // 20: google.protobuf.Struct
+	(*AgentExecutionConfig)(nil), // 3: gateway.worker.AgentExecutionConfig
+	(*StartSessionResponse)(nil), // 4: gateway.worker.StartSessionResponse
+	(*SendInputRequest)(nil),     // 5: gateway.worker.SendInputRequest
+	(*SendInputResponse)(nil),    // 6: gateway.worker.SendInputResponse
+	(*StreamEventsRequest)(nil),  // 7: gateway.worker.StreamEventsRequest
+	(*AbortSessionRequest)(nil),  // 8: gateway.worker.AbortSessionRequest
+	(*AbortSessionResponse)(nil), // 9: gateway.worker.AbortSessionResponse
+	(*CloseSessionRequest)(nil),  // 10: gateway.worker.CloseSessionRequest
+	(*CloseSessionResponse)(nil), // 11: gateway.worker.CloseSessionResponse
+	(*Input)(nil),                // 12: gateway.worker.Input
+	(*Message)(nil),              // 13: gateway.worker.Message
+	(*Tool)(nil),                 // 14: gateway.worker.Tool
+	(*ToolCall)(nil),             // 15: gateway.worker.ToolCall
+	(*PermissionRequest)(nil),    // 16: gateway.worker.PermissionRequest
+	(*Usage)(nil),                // 17: gateway.worker.Usage
+	(*EventFrame)(nil),           // 18: gateway.worker.EventFrame
+	nil,                          // 19: gateway.worker.StartSessionRequest.MetadataEntry
+	nil,                          // 20: gateway.worker.AgentExecutionConfig.EnvEntry
+	nil,                          // 21: gateway.worker.Input.MetadataEntry
+	(*structpb.Struct)(nil),      // 22: google.protobuf.Struct
 }
 var file_worker_proto_worker_proto_depIdxs = []int32{
-	18, // 0: gateway.worker.StartSessionRequest.metadata:type_name -> gateway.worker.StartSessionRequest.MetadataEntry
-	11, // 1: gateway.worker.StartSessionRequest.first_input:type_name -> gateway.worker.Input
-	11, // 2: gateway.worker.SendInputRequest.input:type_name -> gateway.worker.Input
-	12, // 3: gateway.worker.Input.messages:type_name -> gateway.worker.Message
-	13, // 4: gateway.worker.Input.tools:type_name -> gateway.worker.Tool
-	19, // 5: gateway.worker.Input.metadata:type_name -> gateway.worker.Input.MetadataEntry
-	14, // 6: gateway.worker.Message.tool_calls:type_name -> gateway.worker.ToolCall
-	20, // 7: gateway.worker.Tool.parameters:type_name -> google.protobuf.Struct
-	20, // 8: gateway.worker.ToolCall.arguments:type_name -> google.protobuf.Struct
-	14, // 9: gateway.worker.EventFrame.tool:type_name -> gateway.worker.ToolCall
-	15, // 10: gateway.worker.EventFrame.permission:type_name -> gateway.worker.PermissionRequest
-	16, // 11: gateway.worker.EventFrame.usage:type_name -> gateway.worker.Usage
-	0,  // 12: gateway.worker.Worker.Health:input_type -> gateway.worker.HealthRequest
-	2,  // 13: gateway.worker.Worker.StartSession:input_type -> gateway.worker.StartSessionRequest
-	4,  // 14: gateway.worker.Worker.SendInput:input_type -> gateway.worker.SendInputRequest
-	6,  // 15: gateway.worker.Worker.StreamEvents:input_type -> gateway.worker.StreamEventsRequest
-	7,  // 16: gateway.worker.Worker.AbortSession:input_type -> gateway.worker.AbortSessionRequest
-	9,  // 17: gateway.worker.Worker.CloseSession:input_type -> gateway.worker.CloseSessionRequest
-	1,  // 18: gateway.worker.Worker.Health:output_type -> gateway.worker.HealthResponse
-	3,  // 19: gateway.worker.Worker.StartSession:output_type -> gateway.worker.StartSessionResponse
-	5,  // 20: gateway.worker.Worker.SendInput:output_type -> gateway.worker.SendInputResponse
-	17, // 21: gateway.worker.Worker.StreamEvents:output_type -> gateway.worker.EventFrame
-	8,  // 22: gateway.worker.Worker.AbortSession:output_type -> gateway.worker.AbortSessionResponse
-	10, // 23: gateway.worker.Worker.CloseSession:output_type -> gateway.worker.CloseSessionResponse
-	18, // [18:24] is the sub-list for method output_type
-	12, // [12:18] is the sub-list for method input_type
-	12, // [12:12] is the sub-list for extension type_name
-	12, // [12:12] is the sub-list for extension extendee
-	0,  // [0:12] is the sub-list for field type_name
+	19, // 0: gateway.worker.StartSessionRequest.metadata:type_name -> gateway.worker.StartSessionRequest.MetadataEntry
+	12, // 1: gateway.worker.StartSessionRequest.first_input:type_name -> gateway.worker.Input
+	3,  // 2: gateway.worker.StartSessionRequest.agent_config:type_name -> gateway.worker.AgentExecutionConfig
+	20, // 3: gateway.worker.AgentExecutionConfig.env:type_name -> gateway.worker.AgentExecutionConfig.EnvEntry
+	12, // 4: gateway.worker.SendInputRequest.input:type_name -> gateway.worker.Input
+	13, // 5: gateway.worker.Input.messages:type_name -> gateway.worker.Message
+	14, // 6: gateway.worker.Input.tools:type_name -> gateway.worker.Tool
+	21, // 7: gateway.worker.Input.metadata:type_name -> gateway.worker.Input.MetadataEntry
+	15, // 8: gateway.worker.Message.tool_calls:type_name -> gateway.worker.ToolCall
+	22, // 9: gateway.worker.Tool.parameters:type_name -> google.protobuf.Struct
+	22, // 10: gateway.worker.ToolCall.arguments:type_name -> google.protobuf.Struct
+	15, // 11: gateway.worker.EventFrame.tool:type_name -> gateway.worker.ToolCall
+	16, // 12: gateway.worker.EventFrame.permission:type_name -> gateway.worker.PermissionRequest
+	17, // 13: gateway.worker.EventFrame.usage:type_name -> gateway.worker.Usage
+	0,  // 14: gateway.worker.Worker.Health:input_type -> gateway.worker.HealthRequest
+	2,  // 15: gateway.worker.Worker.StartSession:input_type -> gateway.worker.StartSessionRequest
+	5,  // 16: gateway.worker.Worker.SendInput:input_type -> gateway.worker.SendInputRequest
+	7,  // 17: gateway.worker.Worker.StreamEvents:input_type -> gateway.worker.StreamEventsRequest
+	8,  // 18: gateway.worker.Worker.AbortSession:input_type -> gateway.worker.AbortSessionRequest
+	10, // 19: gateway.worker.Worker.CloseSession:input_type -> gateway.worker.CloseSessionRequest
+	1,  // 20: gateway.worker.Worker.Health:output_type -> gateway.worker.HealthResponse
+	4,  // 21: gateway.worker.Worker.StartSession:output_type -> gateway.worker.StartSessionResponse
+	6,  // 22: gateway.worker.Worker.SendInput:output_type -> gateway.worker.SendInputResponse
+	18, // 23: gateway.worker.Worker.StreamEvents:output_type -> gateway.worker.EventFrame
+	9,  // 24: gateway.worker.Worker.AbortSession:output_type -> gateway.worker.AbortSessionResponse
+	11, // 25: gateway.worker.Worker.CloseSession:output_type -> gateway.worker.CloseSessionResponse
+	20, // [20:26] is the sub-list for method output_type
+	14, // [14:20] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_worker_proto_worker_proto_init() }
@@ -1232,7 +1350,7 @@ func file_worker_proto_worker_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_worker_proto_worker_proto_rawDesc), len(file_worker_proto_worker_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   20,
+			NumMessages:   22,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -294,6 +294,12 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		WorkspaceID: workspaceID,
 		Metadata:    input.Metadata,
 	}
+	if rec.NativeSessionID != "" {
+		if startReq.Metadata == nil {
+			startReq.Metadata = make(map[string]string)
+		}
+		startReq.Metadata["native_session_id"] = rec.NativeSessionID
+	}
 	handle := h.getHandle(sessionID)
 	if handle == nil {
 		var err error
@@ -323,10 +329,10 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 	if req.Stream {
 		includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
-		h.streamTurn(w, r, turnCtx, req.Model, sessionID, handle, includeUsage)
+		h.streamTurn(w, r, turnCtx, req.Model, sessionID, callerID, handle, includeUsage)
 		return
 	}
-	res := h.aggregateTurn(turnCtx, sessionID, handle)
+	res := h.aggregateTurn(turnCtx, sessionID, callerID, handle)
 	h.writeCompletion(w, r, req.Model, res)
 }
 
@@ -455,7 +461,7 @@ type turnResult struct {
 // into an OpenAI-shaped completion result. A closed events channel means the
 // execution terminated; the dead handle is dropped so a later resume starts a
 // fresh execution instead of calling Send on a dead session.
-func (h *Handler) aggregateTurn(ctx context.Context, sessionID string, handle runtime.ExecutionHandle) turnResult {
+func (h *Handler) aggregateTurn(ctx context.Context, sessionID, callerID string, handle runtime.ExecutionHandle) turnResult {
 	var res turnResult
 	finishSeen := false
 	var grace <-chan time.Time
@@ -486,6 +492,10 @@ func (h *Handler) aggregateTurn(ctx context.Context, sessionID string, handle ru
 					continue
 				}
 				res.content += ev.Text
+			case runtime.EventNativeSession:
+				if ev.NativeSessionID != "" {
+					_, _ = h.store.Update(context.Background(), sessionID, callerID, func(rec *runtime.SessionRecord) { rec.NativeSessionID = ev.NativeSessionID })
+				}
 			case runtime.EventToolUse:
 				if ev.Tool != nil {
 					res.toolCalls = append(res.toolCalls, toOpenAIToolCall(*ev.Tool, len(res.toolCalls)))
@@ -501,6 +511,9 @@ func (h *Handler) aggregateTurn(ctx context.Context, sessionID string, handle ru
 				res.errMsg = ev.Error
 				return res
 			case runtime.EventFinish:
+				if ev.NativeSessionID != "" {
+					_, _ = h.store.Update(context.Background(), sessionID, callerID, func(rec *runtime.SessionRecord) { rec.NativeSessionID = ev.NativeSessionID })
+				}
 				res.finishReason = ev.FinishReason
 				finishSeen = true
 				// Usage may arrive right after the finish marker; drain briefly.

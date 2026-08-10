@@ -453,7 +453,7 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 	_ = cacheCreationTokens
 	_ = cacheReadTokens
 
-	cs.emit(runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"})
+	cs.emit(runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn", NativeSessionID: cs.CurrentSessionID()})
 
 	total := inputTokens + outputTokens
 	if total > 0 {

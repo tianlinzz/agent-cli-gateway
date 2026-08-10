@@ -969,7 +969,7 @@ func TestAdapterStart_ResumeIDFromMetadata(t *testing.T) {
 	sess, err := a.Start(context.Background(), gwrt.StartRequest{
 		ModelID:     "claude-code",
 		SessionID:   "sess-1",
-		OwnerID:     "owner-1",
+		CallerID:     "owner-1",
 		WorkspaceID: "ws-1",
 		Metadata:    map[string]string{"claude_session_id": "native-sess"},
 	})

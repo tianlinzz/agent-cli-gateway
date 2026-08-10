@@ -141,6 +141,9 @@ func (a *ClaudeCodeAdapter) Start(ctx context.Context, req runtime.StartRequest)
 
 	bin, extraArgs := splitCommand(a.opts.Command)
 	resumeID := strings.TrimSpace(req.Metadata["claude_session_id"])
+	if resumeID == "" {
+		resumeID = strings.TrimSpace(req.Metadata["native_session_id"])
+	}
 
 	cs, err := newClaudeSession(ctx, workDir, bin, extraArgs, a.opts.Model,
 		a.opts.ReasoningEffort, resumeID, a.opts.Mode, a.opts.SystemPrompt,

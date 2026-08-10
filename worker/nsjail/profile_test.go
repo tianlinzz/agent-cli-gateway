@@ -43,11 +43,11 @@ func TestBuildProfile_KafelDefaults(t *testing.T) {
 		"mode: ONCE;",
 		"time_limit: 0;",
 		"clone_newns: true;",
+		"clone_newroot: true;",
 		"clone_newpid: false;",
 		"clone_newnet: false;",
-		`uidmap: { inside_id: "1000"; outside_id: "1000"; count: "1"; };`,
-		`gidmap: { inside_id: "1000"; outside_id: "1000"; count: "1"; };`,
-		"user: \"1000\";",
+		`uidmap: { inside_id: "1000"; outside_id: "1000"; count: 1; };`,
+		`gidmap: { inside_id: "1000"; outside_id: "1000"; count: 1; };`,
 		"rlimit_nofile: 1024;",
 		"rlimit_nproc: 256;",
 		`mount: { src: "` + layout.WorkspaceDir + `"; dst: "/workspace"; is_bind: true; rw: true; mandatory: true; };`,
@@ -117,10 +117,13 @@ func TestBuildProfile_MountsScopedToThisSession(t *testing.T) {
 			t.Errorf("profile must not mount sibling session dir %q", bad)
 		}
 	}
-	// Exactly three bind mounts (workspace, agent-home, socket dir); /tmp is a
-	// tmpfs, not a bind mount.
-	if got := strings.Count(c, "is_bind: true"); got != 3 {
-		t.Errorf("bind mounts = %d, want exactly 3 (workspace, agent-home, socket dir)", got)
+	// The private root also exposes only read-only runtime libraries; session
+	// mounts remain the only writable bind mounts.
+	if got := strings.Count(c, "is_bind: true"); got < 3 {
+		t.Errorf("bind mounts = %d, want at least the three session mounts", got)
+	}
+	if !strings.Contains(c, "clone_newroot: true") {
+		t.Fatal("profile must create a private root filesystem")
 	}
 }
 
@@ -150,11 +153,8 @@ func TestBuildProfile_CustomMountDirs(t *testing.T) {
 	if strings.Contains(c, "rlimit_nofile") {
 		t.Error("zero rlimits must emit no rlimit lines")
 	}
-	if !strings.Contains(c, `uidmap: { inside_id: "4242"; outside_id: "4242"; count: "1"; };`) {
+	if !strings.Contains(c, `uidmap: { inside_id: "4242"; outside_id: "4242"; count: 1; };`) {
 		t.Errorf("custom uid mapping missing: %s", c)
-	}
-	if !strings.Contains(c, `user: "4242";`) {
-		t.Errorf("custom user missing: %s", c)
 	}
 	if !strings.Contains(c, `env: { key: "HOME"; value: "/var/agent-home"; };`) {
 		t.Errorf("HOME env must point at the agent home: %s", c)

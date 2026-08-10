@@ -69,6 +69,7 @@ type StartSessionReq struct {
 	WorkspaceID string
 	Metadata    map[string]string
 	FirstInput  *runtime.Input
+	AgentConfig runtime.AgentExecutionConfig
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +304,7 @@ func toProtoStartRequest(req StartSessionReq) (*workerpb.StartSessionRequest, er
 		CallerId:    req.CallerID,
 		WorkspaceId: req.WorkspaceID,
 		Metadata:    req.Metadata,
+		AgentConfig: toProtoAgentConfig(req.AgentConfig),
 	}
 	if req.FirstInput != nil {
 		in, err := toProtoInput(*req.FirstInput)
@@ -321,6 +323,7 @@ func fromProtoStartRequest(p *workerpb.StartSessionRequest) (StartSessionReq, er
 		CallerID:    p.CallerId,
 		WorkspaceID: p.WorkspaceId,
 		Metadata:    p.Metadata,
+		AgentConfig: fromProtoAgentConfig(p.AgentConfig),
 	}
 	if p.FirstInput != nil {
 		in, err := fromProtoInput(p.FirstInput)
@@ -330,6 +333,21 @@ func fromProtoStartRequest(p *workerpb.StartSessionRequest) (StartSessionReq, er
 		req.FirstInput = &in
 	}
 	return req, nil
+}
+
+func toProtoAgentConfig(c runtime.AgentExecutionConfig) *workerpb.AgentExecutionConfig {
+	return &workerpb.AgentExecutionConfig{Command: c.Command, DefaultModel: c.DefaultModel,
+		Permission: c.Permission, TurnTimeoutNanos: c.TurnTimeout.Nanoseconds(),
+		MaxConcurrency: int32(c.MaxConcurrency), Env: c.Env}
+}
+
+func fromProtoAgentConfig(c *workerpb.AgentExecutionConfig) runtime.AgentExecutionConfig {
+	if c == nil {
+		return runtime.AgentExecutionConfig{}
+	}
+	return runtime.AgentExecutionConfig{Command: c.Command, DefaultModel: c.DefaultModel,
+		Permission: c.Permission, TurnTimeout: time.Duration(c.TurnTimeoutNanos),
+		MaxConcurrency: int(c.MaxConcurrency), Env: c.Env}
 }
 
 func toProtoInput(in runtime.Input) (*workerpb.Input, error) {
@@ -452,11 +470,12 @@ func fromProtoToolCall(ptc *workerpb.ToolCall) (runtime.ToolCall, error) {
 
 func toFrame(ev runtime.Event) (*workerpb.EventFrame, error) {
 	f := &workerpb.EventFrame{
-		Type:         string(ev.Type),
-		Text:         ev.Text,
-		Error:        ev.Error,
-		FinishReason: ev.FinishReason,
-		Status:       ev.Status,
+		Type:            string(ev.Type),
+		Text:            ev.Text,
+		Error:           ev.Error,
+		FinishReason:    ev.FinishReason,
+		Status:          ev.Status,
+		NativeSessionId: ev.NativeSessionID,
 	}
 	var err error
 	if ev.Tool != nil {
@@ -483,11 +502,12 @@ func toFrame(ev runtime.Event) (*workerpb.EventFrame, error) {
 
 func fromFrame(f *workerpb.EventFrame) runtime.Event {
 	ev := runtime.Event{
-		Type:         runtime.EventType(f.Type),
-		Text:         f.Text,
-		Error:        f.Error,
-		FinishReason: f.FinishReason,
-		Status:       f.Status,
+		Type:            runtime.EventType(f.Type),
+		Text:            f.Text,
+		Error:           f.Error,
+		FinishReason:    f.FinishReason,
+		Status:          f.Status,
+		NativeSessionID: f.NativeSessionId,
 	}
 	if f.Tool != nil {
 		tc := runtime.ToolCall{

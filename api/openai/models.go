@@ -48,7 +48,15 @@ func (c *modelCatalog) has(name string) bool {
 	if !found {
 		return false
 	}
-	return c.enabled == nil || c.enabled(name)
+	if c.enabled != nil && !c.enabled(name) {
+		return false
+	}
+	adapter, err := c.reg.Resolve(context.Background(), name)
+	if err != nil {
+		return false
+	}
+	_, err = adapter.Describe(context.Background())
+	return err == nil
 }
 
 // discover resolves every enabled adapter and returns the descriptors whose

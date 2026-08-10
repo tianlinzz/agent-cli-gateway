@@ -145,6 +145,9 @@ func (a *CodexAdapter) Start(ctx context.Context, req runtime.StartRequest) (run
 	}
 
 	resumeID := strings.TrimSpace(req.Metadata["codex_thread_id"])
+	if resumeID == "" {
+		resumeID = strings.TrimSpace(req.Metadata["native_session_id"])
+	}
 
 	return newCodexSession(ctx, a.opts.Command, nil, workDir, a.opts.Model,
 		a.opts.ReasoningEffort, a.opts.Mode, resumeID, "", env, "",

@@ -50,9 +50,9 @@
 # Stage 1: build nsjail
 # ---------------------------------------------------------------------------
 # Pinned upstream: google/nsjail. Keep in sync with
-# config/gateway.go -> IsolationConfig.NsjailVersion ("0.12.0").
-ARG NSJAIL_VERSION=0.12.0
-ARG NSJAIL_REF=0.12.0
+# config/gateway.go -> IsolationConfig.NsjailVersion ("3.6").
+ARG NSJAIL_VERSION=3.6
+ARG NSJAIL_REF=3.6
 
 FROM debian:bookworm-slim AS nsjail-builder
 ARG NSJAIL_REF

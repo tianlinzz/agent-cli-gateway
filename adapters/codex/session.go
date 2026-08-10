@@ -278,7 +278,7 @@ func (cs *codexSession) handleEvent(raw map[string]any) {
 	case "turn.completed":
 		cs.refreshContextUsageFromRollout()
 		cs.flushPendingAsText()
-		cs.emit(runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"})
+		cs.emit(runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn", NativeSessionID: cs.CurrentSessionID()})
 		if usage := cs.LastUsage(); usage != nil {
 			cs.emit(runtime.Event{Type: runtime.EventUsage, Usage: usage})
 		}

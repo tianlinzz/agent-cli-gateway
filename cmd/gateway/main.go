@@ -33,6 +33,19 @@ var (
 	buildTime = "unknown"
 )
 
+func agentExecutionConfigs(in map[string]config.AgentConfig) map[string]runtime.AgentExecutionConfig {
+	out := make(map[string]runtime.AgentExecutionConfig, len(in))
+	for name, c := range in {
+		env := make(map[string]string, len(c.Env))
+		for k, v := range c.Env {
+			env[k] = v
+		}
+		out[name] = runtime.AgentExecutionConfig{Command: c.Command, DefaultModel: c.DefaultModel,
+			Permission: c.Permission, TurnTimeout: c.Timeout, MaxConcurrency: c.MaxConcurrency, Env: env}
+	}
+	return out
+}
+
 func main() {
 	// -config defaults to $GATEWAY_CONFIG (set by the container entrypoint to
 	// the runtime config path) so a mounted/entrypoint-written config is loaded
@@ -90,6 +103,7 @@ func main() {
 		WorkerExec:      *workerExec,
 		StartTimeout:    30 * time.Second,
 		ShutdownTimeout: cfg.Server.ShutdownTimeout,
+		Agents:          agentExecutionConfigs(cfg.Agents),
 	})
 	if err != nil {
 		slog.Error("create execution backend", "error", err)

@@ -149,6 +149,9 @@ func (a *KimiAdapter) Start(ctx context.Context, req runtime.StartRequest) (runt
 
 	bin, extraArgs := splitCommand(a.opts.Command)
 	resumeID := strings.TrimSpace(req.Metadata["kimi_session_id"])
+	if resumeID == "" {
+		resumeID = strings.TrimSpace(req.Metadata["native_session_id"])
+	}
 
 	return newKimiSession(ctx, bin, extraArgs, workDir, a.opts.Model,
 		a.opts.Mode, resumeID, env, a.opts.Timeout, a.flagSupport)

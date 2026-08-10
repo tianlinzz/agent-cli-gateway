@@ -358,7 +358,9 @@ func TestProbeKimiFlags_DetectsPrintFromFakeCLI(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	support := probeKimiFlags(context.Background(), "kimi", 2*time.Second)
+	// Race instrumentation can make process startup substantially slower on
+	// loaded CI runners; keep this an execution probe, not a timing test.
+	support := probeKimiFlags(context.Background(), "kimi", 10*time.Second)
 	if !support.Print {
 		t.Fatal("probe against fake legacy kimi should detect --print support")
 	}
@@ -617,7 +619,7 @@ func TestAdapterStart_ResumeIDFromMetadata(t *testing.T) {
 	sess, err := a.Start(context.Background(), gwrt.StartRequest{
 		ModelID:     "kimi",
 		SessionID:   "sess-1",
-		OwnerID:     "owner-1",
+		CallerID:    "owner-1",
 		WorkspaceID: "ws-1",
 		Metadata:    map[string]string{"kimi_session_id": "native-sess"},
 	})

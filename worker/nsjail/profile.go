@@ -57,22 +57,9 @@ var defaultKeepEnv = []string{"PATH", "HOME", "GW_WORKER_SOCKET", "GW_WORKER_SES
 // when enabled, and the seccomp policy must be "kafel" (inlined whitelist) or
 // "off" (test profile only).
 //
-// PHASE-1 ISOLATION BOUNDARY — READ BEFORE ASSUMING HOST INVISIBILITY.
-// This profile implements the mount-namespace model chosen for phase 1
-// (decision alignment #5 / the design spec): a private mount namespace
-// (clone_newns: true) with PER-SESSION bind mounts — THIS session's workspace
-// at /workspace, THIS session's agent-home at /agent-home, THIS session's
-// socket dir mounted in place — plus a per-session tmpfs at /tmp and an
-// unprivileged user namespace (no CAP_SYS_ADMIN).
-//
-// It deliberately does NOT chroot into a minimal rootfs: clone_newroot is NOT
-// set, so the HOST ROOT FILESYSTEM REMAINS VISIBLE inside the jail. The worker
-// can see the host's system paths and any other directory the host uid can
-// reach (including sibling sessions' agent-homes under the gateway runtime
-// dir); the per-session mounts only pin the writable paths and hide sibling
-// sockets/agent-homes from the mount namespace's *primary* view. Full
-// host-invisible isolation (clone_newroot + a minimal base-image rootfs, so
-// the host rootfs is unreachable) is a LATER phase and is NOT claimed here.
+// The profile uses a private mount namespace and a new root filesystem. Only
+// the read-only runtime directories needed by the worker/CLI are exposed; the
+// caller workspace, agent home, socket, and tmp are per-session mounts.
 //
 // The resulting config drives `nsjail -Mo --config <file> -- <worker>`:
 // workspace and agent-home are real bind mounts (persistence across turns),
@@ -112,6 +99,7 @@ func Build(iso config.IsolationConfig, layout SessionLayout, sessionID string) (
 	// namespace stays shared so the worker PID observed by the supervisor is
 	// the host PID.
 	b.WriteString("clone_newns: true;\n")
+	b.WriteString("clone_newroot: true;\n")
 	b.WriteString("clone_newpid: false;\n")
 	b.WriteString("clone_newipc: true;\n")
 	b.WriteString("clone_newuts: true;\n")
@@ -123,12 +111,8 @@ func Build(iso config.IsolationConfig, layout SessionLayout, sessionID string) (
 	b.WriteString("\n")
 
 	if iso.UserNamespace.Enabled {
-		fmt.Fprintf(&b, "uidmap: { inside_id: %q; outside_id: %q; count: \"1\"; };\n",
-			itoa(iso.UserNamespace.UID), itoa(iso.UserNamespace.UID))
-		fmt.Fprintf(&b, "gidmap: { inside_id: %q; outside_id: %q; count: \"1\"; };\n",
-			itoa(iso.UserNamespace.GID), itoa(iso.UserNamespace.GID))
-		fmt.Fprintf(&b, "user: %q;\n", itoa(iso.UserNamespace.UID))
-		fmt.Fprintf(&b, "group: %q;\n", itoa(iso.UserNamespace.GID))
+		fmt.Fprintf(&b, "uidmap: { inside_id: %q; outside_id: %q; count: 1; };\n", itoa(iso.UserNamespace.UID), itoa(iso.UserNamespace.UID))
+		fmt.Fprintf(&b, "gidmap: { inside_id: %q; outside_id: %q; count: 1; };\n", itoa(iso.UserNamespace.GID), itoa(iso.UserNamespace.GID))
 		b.WriteString("\n")
 	}
 
@@ -141,7 +125,15 @@ func Build(iso config.IsolationConfig, layout SessionLayout, sessionID string) (
 	writeMount(&b, layout.WorkspaceDir, mounts.WorkspaceDir)
 	writeMount(&b, layout.AgentHomeDir, mounts.AgentHomeDir)
 	writeMount(&b, layout.SocketDir, layout.SocketDir)
-	fmt.Fprintf(&b, "tmpfs: { dst: %q; rw: true; };\n", mounts.TmpDir)
+	// Runtime dependencies are read-only mounts into the private root. No
+	// gateway runtime/config/workspace parent is mounted, so sibling sessions
+	// and gateway secrets remain outside the jail view.
+	for _, dir := range []string{"/bin", "/usr", "/usr/local", "/lib", "/etc"} {
+		if _, err := os.Stat(dir); err == nil {
+			fmt.Fprintf(&b, "mount: { src: %q; dst: %q; is_bind: true; rw: false; mandatory: true; } ;\n", dir, dir)
+		}
+	}
+	fmt.Fprintf(&b, "mount: { dst: %q; fstype: \"tmpfs\"; options: \"size=256m\"; rw: true; mandatory: true; };\n", mounts.TmpDir)
 	b.WriteString("\n")
 
 	switch iso.Seccomp.Policy {

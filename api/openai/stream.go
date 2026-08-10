@@ -56,7 +56,7 @@ func (c streamChunk) withChoices(choices ...streamChoice) streamChunk {
 // "data: [DONE]" frame. Client disconnect and explicit abort cancel the turn
 // and terminate the stream. A closed events channel (execution terminated)
 // drops the dead handle so a later resume starts fresh.
-func (h *Handler) streamTurn(w http.ResponseWriter, r *http.Request, ctx context.Context, model, sessionID string, handle runtime.ExecutionHandle, includeUsage bool) {
+func (h *Handler) streamTurn(w http.ResponseWriter, r *http.Request, ctx context.Context, model, sessionID, callerID string, handle runtime.ExecutionHandle, includeUsage bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, serverError("streaming not supported by the response writer"))
@@ -169,6 +169,10 @@ loop:
 						return
 					}
 				}
+			case runtime.EventNativeSession:
+				if ev.NativeSessionID != "" {
+					_, _ = h.store.Update(context.Background(), sessionID, callerID, func(rec *runtime.SessionRecord) { rec.NativeSessionID = ev.NativeSessionID })
+				}
 			case runtime.EventToolResult:
 				// Tool results are not surfaced in OpenAI chat responses.
 			case runtime.EventUsage:
@@ -182,6 +186,9 @@ loop:
 				status = "error"
 				break loop
 			case runtime.EventFinish:
+				if ev.NativeSessionID != "" {
+					_, _ = h.store.Update(context.Background(), sessionID, callerID, func(rec *runtime.SessionRecord) { rec.NativeSessionID = ev.NativeSessionID })
+				}
 				finish = ev.FinishReason
 				finishSeen = true
 				// Usage may arrive just after the finish marker; drain briefly.
