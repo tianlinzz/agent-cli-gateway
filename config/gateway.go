@@ -60,11 +60,22 @@ type ServerConfig struct {
 	ShutdownTimeout time.Duration `toml:"shutdown_timeout"`
 }
 
-// AuthConfig configures HTTP API authentication.
+// AuthConfig configures HTTP API authentication. A token authenticates a
+// caller, never an end user. Workspace selection remains an opaque caller
+// responsibility and is scoped by the authenticated caller ID.
 type AuthConfig struct {
-	// Token is the shared bearer token accepted by the API. Empty disables
-	// authentication (dev/test only; production deployments should set it).
-	Token string `toml:"token"`
+	// Required rejects requests without a configured caller token. It defaults
+	// to true in production and may be disabled only for test mode.
+	Required bool `toml:"required"`
+	// Callers is the configured caller/key allowlist. Tokens are never logged or
+	// persisted in session records.
+	Callers []CallerConfig `toml:"callers"`
+}
+
+// CallerConfig binds one or more rotatable bearer tokens to a caller.
+type CallerConfig struct {
+	ID     string   `toml:"id"`
+	Tokens []string `toml:"tokens"`
 }
 
 // WorkspaceConfig configures server-side workspace resolution.
@@ -196,6 +207,7 @@ func DefaultGatewayConfig() GatewayConfig {
 			ListenAddr:      ":4096",
 			ShutdownTimeout: 10 * time.Second,
 		},
+		Auth: AuthConfig{Required: true},
 		Workspace: WorkspaceConfig{
 			Root: "workspaces",
 		},
@@ -267,6 +279,13 @@ func (c *GatewayConfig) normalize() {
 		}
 		c.Agents[name] = agent
 	}
+	for i := range c.Auth.Callers {
+		caller := &c.Auth.Callers[i]
+		caller.ID = strings.TrimSpace(caller.ID)
+		for j := range caller.Tokens {
+			caller.Tokens[j] = strings.TrimSpace(caller.Tokens[j])
+		}
+	}
 }
 
 // Validate checks the gateway runtime config for consistency.
@@ -276,7 +295,6 @@ func (c *GatewayConfig) Validate() error {
 	default:
 		return fmt.Errorf("config: gateway mode must be one of %q, %q, %q", ModeProd, ModeDev, ModeTest)
 	}
-
 	if !c.Isolation.Required && c.Mode != ModeTest {
 		return fmt.Errorf("config: isolation.required must be true in mode %q; only the test profile may disable nsjail", c.Mode)
 	}
@@ -312,6 +330,37 @@ func (c *GatewayConfig) Validate() error {
 		default:
 			return fmt.Errorf("config: agents.%s.permission %q invalid (want %q, %q, or %q)",
 				name, agent.Permission, PermissionAuto, PermissionAsk, PermissionDeny)
+		}
+	}
+	if c.Mode == ModeProd {
+		if !c.Auth.Required {
+			return fmt.Errorf("config: auth.required must be true in production")
+		}
+		if len(c.Auth.Callers) == 0 {
+			return fmt.Errorf("config: auth.callers must contain at least one caller in production")
+		}
+	}
+	callerIDs := make(map[string]struct{}, len(c.Auth.Callers))
+	tokens := make(map[string]string)
+	for _, caller := range c.Auth.Callers {
+		if caller.ID == "" {
+			return fmt.Errorf("config: auth.callers contains an empty id")
+		}
+		if _, ok := callerIDs[caller.ID]; ok {
+			return fmt.Errorf("config: auth.callers duplicate id %q", caller.ID)
+		}
+		callerIDs[caller.ID] = struct{}{}
+		if len(caller.Tokens) == 0 {
+			return fmt.Errorf("config: auth.callers[%q] must contain at least one token", caller.ID)
+		}
+		for _, token := range caller.Tokens {
+			if token == "" {
+				return fmt.Errorf("config: auth.callers[%q] contains an empty token", caller.ID)
+			}
+			if previous, ok := tokens[token]; ok {
+				return fmt.Errorf("config: auth.callers duplicate token shared by %q and %q", previous, caller.ID)
+			}
+			tokens[token] = caller.ID
 		}
 	}
 	return nil

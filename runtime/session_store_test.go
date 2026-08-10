@@ -15,7 +15,7 @@ func sessionRec(id, owner string) runtime.SessionRecord {
 	return runtime.SessionRecord{
 		ID:          id,
 		ModelID:     "alpha",
-		OwnerID:     owner,
+		CallerID:    owner,
 		WorkspaceID: "ws-1",
 		Status:      runtime.SessionActive,
 	}
@@ -35,7 +35,7 @@ func TestSessionStoreCreateAndGet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if got.ID != "s1" || got.OwnerID != "alice" || got.ModelID != "alpha" {
+	if got.ID != "s1" || got.CallerID != "alice" || got.ModelID != "alpha" {
 		t.Fatalf("Get returned wrong record: %+v", got)
 	}
 	if got.NativeSessionID != "native-1" {
@@ -63,7 +63,7 @@ func TestSessionStoreGetReturnsCopy(t *testing.T) {
 	got.Status = runtime.SessionClosed
 	got.ModelID = "hacked"
 	got.WorkspaceID = "escaped"
-	got.OwnerID = "mallory"
+	got.CallerID = "mallory"
 
 	again, err := store.Get(ctx, "s1", "alice")
 	if err != nil {
@@ -72,7 +72,7 @@ func TestSessionStoreGetReturnsCopy(t *testing.T) {
 	if again.Status != runtime.SessionActive || again.ModelID != "alpha" {
 		t.Fatalf("store state leaked after mutating returned record: %+v", again)
 	}
-	if again.WorkspaceID != "ws-1" || again.OwnerID != "alice" {
+	if again.WorkspaceID != "ws-1" || again.CallerID != "alice" {
 		t.Fatalf("store state leaked after mutating returned record: %+v", again)
 	}
 }

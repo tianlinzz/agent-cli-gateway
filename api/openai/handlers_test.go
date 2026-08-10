@@ -180,6 +180,7 @@ func newFakeBackend() *fakeBackend {
 
 const (
 	testToken     = "test-secret-token"
+	testTokenB    = "test-secret-token-b"
 	testOwner     = "owner-a"
 	testOwnerB    = "owner-b"
 	testWorkspace = "ws-default"
@@ -233,12 +234,11 @@ func newTestServer(t *testing.T, mut ...func(*Options)) (*httptest.Server, *Hand
 	t.Helper()
 	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
 	opts := &Options{
-		AuthToken:   testToken,
-		OwnerHeader: "X-User-Id",
-		TurnTimeout: 5 * time.Second,
-		UsageGrace:  15 * time.Millisecond,
-		Now:         func() time.Time { return now },
-		Enabled:     func(name string) bool { return name != "disabled" },
+		CallerTokens: map[string]string{testToken: testOwner, testTokenB: testOwnerB},
+		TurnTimeout:  5 * time.Second,
+		UsageGrace:   15 * time.Millisecond,
+		Now:          func() time.Time { return now },
+		Enabled:      func(name string) bool { return name != "disabled" },
 	}
 	for _, m := range mut {
 		m(opts)
@@ -269,10 +269,10 @@ func doAuthJSONH(t *testing.T, method, url, token, owner string, body any, heade
 		t.Fatalf("new request: %v", err)
 	}
 	if token != "" {
+		if owner == testOwnerB && token == testToken {
+			token = testTokenB
+		}
 		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	if owner != "" {
-		req.Header.Set("X-User-Id", owner)
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -286,6 +286,16 @@ func doAuthJSONH(t *testing.T, method, url, token, owner string, body any, heade
 	}
 	t.Cleanup(func() { resp.Body.Close() })
 	return resp
+}
+
+func TestAuthDerivesCallerFromBearerToken(t *testing.T) {
+	ts, _, _ := newTestServer(t)
+	resp := doAuthJSONH(t, "GET", ts.URL+"/v1/models", testToken, "spoofed-user", nil, map[string]string{
+		"X-User-Id": "spoofed-user",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, string(readBody(t, resp)))
+	}
 }
 
 func readBody(t *testing.T, resp *http.Response) []byte {
@@ -839,7 +849,7 @@ func TestAuth_Required(t *testing.T) {
 }
 
 func TestAuth_DisabledWhenNoTokenConfigured(t *testing.T) {
-	ts, _, _ := newTestServer(t, func(o *Options) { o.AuthToken = "" })
+	ts, _, _ := newTestServer(t, func(o *Options) { o.CallerTokens = nil })
 	resp := doAuthJSON(t, "GET", ts.URL+"/v1/models", "", testOwner, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want 200 when auth disabled", resp.StatusCode)
@@ -1269,7 +1279,7 @@ func TestNormalizer_NoWorkDirInjection(t *testing.T) {
 	if sr.Metadata["trace_id"] != "abc" {
 		t.Errorf("trace_id metadata lost: %v", sr.Metadata)
 	}
-	if sr.ModelID != "codex" || sr.OwnerID != testOwner {
+	if sr.ModelID != "codex" || sr.CallerID != testOwner {
 		t.Errorf("start request = %+v, want model codex owner %s", sr, testOwner)
 	}
 	if h := backend.Handle(sid); h == nil {

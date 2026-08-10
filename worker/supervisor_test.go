@@ -109,7 +109,7 @@ func testRequest(sessionID string) grt.StartRequest {
 	return grt.StartRequest{
 		ModelID:     "test-model",
 		SessionID:   sessionID,
-		OwnerID:     "owner-1",
+		CallerID:    "owner-1",
 		WorkspaceID: "ws-1",
 	}
 }
@@ -673,10 +673,10 @@ func TestSupervisor_SendAfterCloseFails(t *testing.T) {
 func TestSupervisor_StartValidation(t *testing.T) {
 	sup := newTestSupervisor(t, nil)
 	cases := map[string]grt.StartRequest{
-		"empty session":   {ModelID: "m", OwnerID: "o", WorkspaceID: "w"},
-		"empty model":     {SessionID: "s", OwnerID: "o", WorkspaceID: "w"},
+		"empty session":   {ModelID: "m", CallerID: "o", WorkspaceID: "w"},
+		"empty model":     {SessionID: "s", CallerID: "o", WorkspaceID: "w"},
 		"empty owner":     {SessionID: "s", ModelID: "m", WorkspaceID: "w"},
-		"empty workspace": {SessionID: "s", ModelID: "m", OwnerID: "o"},
+		"empty workspace": {SessionID: "s", ModelID: "m", CallerID: "o"},
 	}
 	for name, req := range cases {
 		if _, err := sup.StartSession(context.Background(), req); err == nil {

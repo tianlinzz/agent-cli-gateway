@@ -65,7 +65,7 @@ func (u unixSocket) DialContext(ctx context.Context) (net.Conn, error) {
 type StartSessionReq struct {
 	ModelID     string
 	SessionID   string
-	OwnerID     string
+	CallerID    string
 	WorkspaceID string
 	Metadata    map[string]string
 	FirstInput  *runtime.Input
@@ -300,7 +300,7 @@ func toProtoStartRequest(req StartSessionReq) (*workerpb.StartSessionRequest, er
 	p := &workerpb.StartSessionRequest{
 		ModelId:     req.ModelID,
 		SessionId:   req.SessionID,
-		OwnerId:     req.OwnerID,
+		CallerId:    req.CallerID,
 		WorkspaceId: req.WorkspaceID,
 		Metadata:    req.Metadata,
 	}
@@ -318,7 +318,7 @@ func fromProtoStartRequest(p *workerpb.StartSessionRequest) (StartSessionReq, er
 	req := StartSessionReq{
 		ModelID:     p.ModelId,
 		SessionID:   p.SessionId,
-		OwnerID:     p.OwnerId,
+		CallerID:    p.CallerId,
 		WorkspaceID: p.WorkspaceId,
 		Metadata:    p.Metadata,
 	}

@@ -2,7 +2,7 @@
 // supervisor (API process) and one per-session worker process.
 //
 // The contract deliberately carries only canonical runtime fields (see
-// runtime/contract.go and runtime/events.go): model/session/owner/workspace
+// runtime/contract.go and runtime/events.go): model/session/caller/workspace
 // identifiers, canonical messages, tools, and canonical events. There is NO
 // OpenAI JSON and NO agent-specific field anywhere in this contract. nsjail is
 // a worker-side startup detail and never appears here — the supervisor

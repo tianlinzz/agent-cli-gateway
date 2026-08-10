@@ -126,7 +126,7 @@ func (h *stubHandler) Health(_ context.Context) (string, error) {
 }
 
 func (h *stubHandler) StartSession(_ context.Context, req worker.StartSessionReq) (string, error) {
-	h.logf("start-session model=%s session=%s owner=%s workspace=%s", req.ModelID, req.SessionID, req.OwnerID, req.WorkspaceID)
+	h.logf("start-session model=%s session=%s owner=%s workspace=%s", req.ModelID, req.SessionID, req.CallerID, req.WorkspaceID)
 	switch h.behavior {
 	case "reject-start":
 		return "", errors.New("stub: start rejected")

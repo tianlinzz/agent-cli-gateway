@@ -102,12 +102,17 @@ func main() {
 		slog.Warn("nsjail preflight failed; readiness will report 503", "error", err)
 	}
 
+	callerTokens := make(map[string]string)
+	for _, caller := range cfg.Auth.Callers {
+		for _, token := range caller.Tokens {
+			callerTokens[token] = caller.ID
+		}
+	}
 	handler := openai.NewHandler(openai.Options{
-		Registry:    reg,
-		Store:       runtime.NewMemorySessionStore(),
-		Backend:     backend,
-		AuthToken:   cfg.Auth.Token,
-		OwnerHeader: "X-User-Id",
+		Registry:     reg,
+		Store:        runtime.NewMemorySessionStore(),
+		Backend:      backend,
+		CallerTokens: callerTokens,
 		Enabled: func(name string) bool {
 			agent, ok := cfg.Agents[name]
 			return !ok || agent.Enabled
@@ -130,7 +135,7 @@ func main() {
 		"nsjail_version", cfg.Isolation.NsjailVersion,
 		"nsjail_source", cfg.Isolation.NsjailSource,
 		"worker_exec", *workerExec,
-		"auth_enabled", cfg.Auth.Token != "",
+		"auth_enabled", len(callerTokens) > 0,
 		"adapters", reg.List(),
 	)
 

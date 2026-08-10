@@ -169,14 +169,13 @@ func newHarness(t *testing.T, mutCfg func(*worker.Config)) *harness {
 	registerFake(t, reg, "kimi", "Kimi")
 
 	h := openai.NewHandler(openai.Options{
-		Registry:    reg,
-		Store:       runtime.NewMemorySessionStore(),
-		Backend:     backend,
-		AuthToken:   intToken,
-		OwnerHeader: "X-User-Id",
-		TurnTimeout: 15 * time.Second,
-		UsageGrace:  40 * time.Millisecond,
-		Enabled:     func(name string) bool { return true },
+		Registry:     reg,
+		Store:        runtime.NewMemorySessionStore(),
+		Backend:      backend,
+		CallerTokens: map[string]string{intToken: "integration-caller"},
+		TurnTimeout:  15 * time.Second,
+		UsageGrace:   40 * time.Millisecond,
+		Enabled:      func(name string) bool { return true },
 	})
 	ts := httptest.NewServer(h.Routes())
 

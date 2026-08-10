@@ -168,11 +168,12 @@ func firstNonEmpty(vals ...string) string {
 // handleChatCompletions serves POST /v1/chat/completions for both streaming
 // and non-streaming requests.
 func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	ownerID := h.ownerID(r)
-	if ownerID == "" {
-		writeError(w, http.StatusUnauthorized, authError("missing owner identity header "+h.ownerHeader))
+	caller, ok := callerFromRequest(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, authError("missing authenticated caller"))
 		return
 	}
+	callerID := caller.ID
 
 	var req ChatCompletionRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxBodyBytes)).Decode(&req); err != nil {
@@ -222,7 +223,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		rec = runtime.SessionRecord{
 			ID:          sessionID,
 			ModelID:     req.Model,
-			OwnerID:     ownerID,
+			CallerID:    callerID,
 			WorkspaceID: workspaceID,
 		}
 		if err := h.store.Create(r.Context(), rec); err != nil {
@@ -231,7 +232,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		}
 	} else {
 		var err error
-		rec, err = h.store.Get(r.Context(), sessionID, ownerID)
+		rec, err = h.store.Get(r.Context(), sessionID, callerID)
 		if err != nil {
 			if errors.Is(err, runtime.ErrSessionNotFound) || errors.Is(err, runtime.ErrSessionForbidden) {
 				writeError(w, http.StatusNotFound, sessionNotFound())
@@ -255,9 +256,9 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set(h.sessionHeader, sessionID)
 
 	// Single active turn per session (the store's BeginTurn is the arbiter).
-	if err := h.store.BeginTurn(r.Context(), sessionID, ownerID); err != nil {
+	if err := h.store.BeginTurn(r.Context(), sessionID, callerID); err != nil {
 		if created {
-			h.deleteSession(r.Context(), sessionID, ownerID)
+			h.deleteSession(r.Context(), sessionID, callerID)
 		}
 		switch {
 		case errors.Is(err, runtime.ErrSessionBusy):
@@ -278,9 +279,9 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 	failed := false
 	defer func() {
-		h.clearTurn(sessionID, ownerID, ts)
+		h.clearTurn(sessionID, callerID, ts)
 		if created && failed {
-			h.deleteSession(context.Background(), sessionID, ownerID)
+			h.deleteSession(context.Background(), sessionID, callerID)
 		}
 	}()
 
@@ -289,7 +290,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	startReq := runtime.StartRequest{
 		ModelID:     req.Model,
 		SessionID:   sessionID,
-		OwnerID:     ownerID,
+		CallerID:    callerID,
 		WorkspaceID: workspaceID,
 		Metadata:    input.Metadata,
 	}
@@ -382,10 +383,10 @@ func (h *Handler) deadHandle(handle runtime.ExecutionHandle) bool {
 	return false
 }
 
-func (h *Handler) deleteSession(ctx context.Context, id, ownerID string) {
+func (h *Handler) deleteSession(ctx context.Context, id, callerID string) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := h.store.Delete(ctx, id, ownerID); err != nil {
+	if err := h.store.Delete(ctx, id, callerID); err != nil {
 		slog.Debug("openai: delete session", "session", id, "error", err)
 	}
 }
@@ -394,17 +395,18 @@ func (h *Handler) deleteSession(ctx context.Context, id, ownerID string) {
 // turn (propagating to the worker -> CLI process group) and waits for the turn
 // to settle.
 func (h *Handler) handleAbort(w http.ResponseWriter, r *http.Request) {
-	ownerID := h.ownerID(r)
-	if ownerID == "" {
-		writeError(w, http.StatusUnauthorized, authError("missing owner identity header "+h.ownerHeader))
+	caller, ok := callerFromRequest(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, authError("missing authenticated caller"))
 		return
 	}
+	callerID := caller.ID
 	sessionID := strings.TrimSpace(r.PathValue("id"))
 	if sessionID == "" {
 		writeError(w, http.StatusBadRequest, invalidRequest("missing session id"))
 		return
 	}
-	if _, err := h.store.Get(r.Context(), sessionID, ownerID); err != nil {
+	if _, err := h.store.Get(r.Context(), sessionID, callerID); err != nil {
 		if errors.Is(err, runtime.ErrSessionNotFound) || errors.Is(err, runtime.ErrSessionForbidden) {
 			writeError(w, http.StatusNotFound, sessionNotFound())
 			return

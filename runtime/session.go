@@ -34,7 +34,7 @@ func (s SessionStatus) Valid() bool {
 // slices, or pointers — a value copy is a deep copy, so the store can hand out
 // records without leaking internal state. Workers bind the workspace directory
 // by WorkspaceID (via the workspace.Resolver), and the API layer scopes every
-// access by OwnerID.
+// access by CallerID.
 type SessionRecord struct {
 	// ID is the gateway-assigned session identifier (StartRequest.SessionID).
 	ID string
@@ -43,9 +43,9 @@ type SessionRecord struct {
 	// NativeSessionID is the agent-native session ID used to resume a
 	// resume_per_turn adapter.
 	NativeSessionID string
-	// OwnerID is the tenant/user that owns the session. All access is scoped
+	// CallerID is the tenant/user that owns the session. All access is scoped
 	// to it.
-	OwnerID string
+	CallerID string
 	// WorkspaceID is the opaque client-supplied workspace identifier the
 	// worker resolves to a controlled directory.
 	WorkspaceID string

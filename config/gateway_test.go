@@ -42,6 +42,25 @@ func TestDefaultGatewayConfig_IsolationRequired(t *testing.T) {
 	}
 }
 
+func TestGatewayConfigRejectsProdWithoutCallers(t *testing.T) {
+	c := DefaultGatewayConfig()
+	c.Auth.Callers = nil
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "auth.callers") {
+		t.Fatalf("Validate() = %v, want auth.callers error", err)
+	}
+}
+
+func TestGatewayConfigRejectsDuplicateCallerToken(t *testing.T) {
+	c := DefaultGatewayConfig()
+	c.Auth.Callers = []CallerConfig{
+		{ID: "a", Tokens: []string{"same"}},
+		{ID: "b", Tokens: []string{"same"}},
+	}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "duplicate token") {
+		t.Fatalf("Validate() = %v, want duplicate token error", err)
+	}
+}
+
 func TestDefaultGatewayConfig_ThreeAgentsEnabled(t *testing.T) {
 	c := DefaultGatewayConfig()
 	for _, name := range []string{"codex", "claude-code", "kimi"} {

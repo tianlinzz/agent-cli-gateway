@@ -2,7 +2,7 @@
 // supervisor (API process) and one per-session worker process.
 //
 // The contract deliberately carries only canonical runtime fields (see
-// runtime/contract.go and runtime/events.go): model/session/owner/workspace
+// runtime/contract.go and runtime/events.go): model/session/caller/workspace
 // identifiers, canonical messages, tools, and canonical events. There is NO
 // OpenAI JSON and NO agent-specific field anywhere in this contract. nsjail is
 // a worker-side startup detail and never appears here — the supervisor
@@ -139,7 +139,7 @@ type StartSessionRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ModelId       string                 `protobuf:"bytes,1,opt,name=model_id,json=modelId,proto3" json:"model_id,omitempty"`
 	SessionId     string                 `protobuf:"bytes,2,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
-	OwnerId       string                 `protobuf:"bytes,3,opt,name=owner_id,json=ownerId,proto3" json:"owner_id,omitempty"`
+	CallerId      string                 `protobuf:"bytes,3,opt,name=caller_id,json=callerId,proto3" json:"caller_id,omitempty"`
 	WorkspaceId   string                 `protobuf:"bytes,4,opt,name=workspace_id,json=workspaceId,proto3" json:"workspace_id,omitempty"`
 	Metadata      map[string]string      `protobuf:"bytes,5,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	FirstInput    *Input                 `protobuf:"bytes,6,opt,name=first_input,json=firstInput,proto3" json:"first_input,omitempty"`
@@ -191,9 +191,9 @@ func (x *StartSessionRequest) GetSessionId() string {
 	return ""
 }
 
-func (x *StartSessionRequest) GetOwnerId() string {
+func (x *StartSessionRequest) GetCallerId() string {
 	if x != nil {
-		return x.OwnerId
+		return x.CallerId
 	}
 	return ""
 }
@@ -1067,12 +1067,12 @@ const file_worker_proto_worker_proto_rawDesc = "" +
 	"\x0eHealthResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x12\x10\n" +
-	"\x03pid\x18\x03 \x01(\x05R\x03pid\"\xd1\x02\n" +
+	"\x03pid\x18\x03 \x01(\x05R\x03pid\"\xd3\x02\n" +
 	"\x13StartSessionRequest\x12\x19\n" +
 	"\bmodel_id\x18\x01 \x01(\tR\amodelId\x12\x1d\n" +
 	"\n" +
-	"session_id\x18\x02 \x01(\tR\tsessionId\x12\x19\n" +
-	"\bowner_id\x18\x03 \x01(\tR\aownerId\x12!\n" +
+	"session_id\x18\x02 \x01(\tR\tsessionId\x12\x1b\n" +
+	"\tcaller_id\x18\x03 \x01(\tR\bcallerId\x12!\n" +
 	"\fworkspace_id\x18\x04 \x01(\tR\vworkspaceId\x12M\n" +
 	"\bmetadata\x18\x05 \x03(\v21.gateway.worker.StartSessionRequest.MetadataEntryR\bmetadata\x126\n" +
 	"\vfirst_input\x18\x06 \x01(\v2\x15.gateway.worker.InputR\n" +

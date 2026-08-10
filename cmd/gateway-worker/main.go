@@ -72,7 +72,7 @@ func (h *adapterHandler) StartSession(ctx context.Context, req worker.StartSessi
 	sess, err := adapter.Start(ctx, runtime.StartRequest{
 		ModelID:     req.ModelID,
 		SessionID:   req.SessionID,
-		OwnerID:     req.OwnerID,
+		CallerID:    req.CallerID,
 		WorkspaceID: req.WorkspaceID,
 		Metadata:    req.Metadata,
 		FirstInput:  req.FirstInput,

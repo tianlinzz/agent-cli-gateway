@@ -75,6 +75,24 @@ func TestResolverResolvesValidID(t *testing.T) {
 	}
 }
 
+func TestResolverHashesCallerAndWorkspaceIDs(t *testing.T) {
+	r, _ := newTestResolver(t)
+	got, err := r.Resolve("caller-a", "project-secret-name")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if strings.Contains(got, "caller-a") || strings.Contains(got, "project-secret-name") {
+		t.Fatalf("resolved path leaks external identifiers: %q", got)
+	}
+	otherCaller, err := r.Resolve("caller-b", "project-secret-name")
+	if err != nil {
+		t.Fatalf("Resolve(other caller): %v", err)
+	}
+	if got == otherCaller {
+		t.Fatalf("different callers resolved to same workspace: %q", got)
+	}
+}
+
 func TestResolverRejectsInvalidIDs(t *testing.T) {
 	r, _ := newTestResolver(t)
 
@@ -167,11 +185,11 @@ func TestResolverRejectsEmptyRoot(t *testing.T) {
 	}
 }
 
-// TestResolverScopesByOwner is the owner-binding regression: the same opaque
-// workspace_id under different owners must resolve to different, non-overlapping
+// TestResolverScopesByCaller is the caller-binding regression: the same opaque
+// workspace_id under different callers must resolve to different, non-overlapping
 // directories, and both must stay inside the root. No cross-owner collision and
 // no cross-owner path can ever be produced.
-func TestResolverScopesByOwner(t *testing.T) {
+func TestResolverScopesByCaller(t *testing.T) {
 	r, root := newTestResolver(t)
 
 	a, err := r.Resolve("alice", "default")
@@ -213,11 +231,17 @@ func TestResolverRejectsSymlinkEscape(t *testing.T) {
 		t.Fatalf("mkdir outside: %v", err)
 	}
 
-	if err := os.MkdirAll(filepath.Join(root, "alice"), 0o700); err != nil {
-		t.Fatalf("mkdir alice: %v", err)
+	// Resolve once to discover the server-generated path, then replace the
+	// leaf/parent with hostile symlinks as an attacker would.
+	seed, err := r.Resolve("alice", "evil")
+	if err != nil {
+		t.Fatalf("seed resolve: %v", err)
+	}
+	if err := os.Remove(seed); err != nil {
+		t.Fatalf("remove seed: %v", err)
 	}
 	// Symlink escape via the workspace leaf.
-	if err := os.Symlink(outside, filepath.Join(root, "alice", "evil")); err != nil {
+	if err := os.Symlink(outside, seed); err != nil {
 		t.Skipf("symlink unsupported: %v", err)
 	}
 	if _, err := r.Resolve("alice", "evil"); err == nil {
@@ -225,7 +249,15 @@ func TestResolverRejectsSymlinkEscape(t *testing.T) {
 	}
 
 	// Symlink escape via the owner component.
-	if err := os.Symlink(outside, filepath.Join(root, "mallory")); err != nil {
+	ownerPath, err := r.Resolve("mallory", "ws1")
+	if err != nil {
+		t.Fatalf("seed owner resolve: %v", err)
+	}
+	callerDir := filepath.Dir(filepath.Dir(ownerPath))
+	if err := os.RemoveAll(callerDir); err != nil {
+		t.Fatalf("remove caller dir: %v", err)
+	}
+	if err := os.Symlink(outside, callerDir); err != nil {
 		t.Skipf("symlink unsupported: %v", err)
 	}
 	if _, err := r.Resolve("mallory", "ws1"); err == nil {
@@ -248,12 +280,16 @@ func TestResolver_RejectsPathEqualToRoot(t *testing.T) {
 		t.Fatalf("NewResolver: %v", err)
 	}
 
-	if err := os.MkdirAll(filepath.Join(root, "alice"), 0o700); err != nil {
-		t.Fatalf("mkdir alice: %v", err)
+	seed, err := r.Resolve("alice", "back-to-root")
+	if err != nil {
+		t.Fatalf("seed resolve: %v", err)
+	}
+	if err := os.Remove(seed); err != nil {
+		t.Fatalf("remove seed: %v", err)
 	}
 	// A workspace symlink pointing back at the root itself. The resolved path
 	// equals the root, so it must be rejected as an escape.
-	if err := os.Symlink(root, filepath.Join(root, "alice", "back-to-root")); err != nil {
+	if err := os.Symlink(root, seed); err != nil {
 		t.Skipf("symlink unsupported: %v", err)
 	}
 	if _, err := r.Resolve("alice", "back-to-root"); !errors.Is(err, workspace.ErrPathEscape) {

@@ -90,14 +90,13 @@ func newThreeAgentServer(t *testing.T) (*httptest.Server, *threeAgentBackend) {
 
 	backend := &threeAgentBackend{handles: make(map[string]*fakeHandle)}
 	h := NewHandler(Options{
-		Registry:    reg,
-		Store:       runtime.NewMemorySessionStore(),
-		Backend:     backend,
-		AuthToken:   testToken,
-		OwnerHeader: "X-User-Id",
-		TurnTimeout: 5 * time.Second,
-		UsageGrace:  15 * time.Millisecond,
-		Enabled:     func(name string) bool { return true },
+		Registry:     reg,
+		Store:        runtime.NewMemorySessionStore(),
+		Backend:      backend,
+		CallerTokens: map[string]string{testToken: testOwner},
+		TurnTimeout:  5 * time.Second,
+		UsageGrace:   15 * time.Millisecond,
+		Enabled:      func(name string) bool { return true },
 	})
 	ts := httptest.NewServer(h.Routes())
 	t.Cleanup(ts.Close)

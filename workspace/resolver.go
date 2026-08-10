@@ -6,6 +6,8 @@
 package workspace
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -15,10 +17,10 @@ import (
 
 // Sentinel errors callers can match with errors.Is.
 var (
-	// ErrInvalidOwnerID is returned when the owner id is empty or contains
+	// ErrInvalidCallerID is returned when the owner id is empty or contains
 	// characters that could affect the resolved path (separators, NUL, dot
 	// segments).
-	ErrInvalidOwnerID = errors.New("workspace: invalid owner id")
+	ErrInvalidCallerID = errors.New("workspace: invalid owner id")
 	// ErrInvalidWorkspaceID is returned when the workspace id is empty or
 	// contains characters that could affect the resolved path.
 	ErrInvalidWorkspaceID = errors.New("workspace: invalid workspace id")
@@ -27,12 +29,13 @@ var (
 	ErrPathEscape = errors.New("workspace: resolved path escapes workspace root")
 )
 
-// Resolver maps (ownerID, workspaceID) pairs to controlled absolute
+// Resolver maps (callerID, workspaceID) pairs to controlled absolute
 // directories under a fixed root. It is safe for concurrent use.
 //
-// Layout: <root>/<ownerID>/<workspaceID>. Scoping by owner means the same
-// opaque workspace_id used by two tenants resolves to two non-overlapping
-// directories, so tenants can never collide on or observe each other's files.
+// Layout: <root>/callers/<caller-key>/workspaces/<workspace-key>. Keys are
+// stable, domain-separated hashes so external IDs never leak into paths. The
+// same workspace ID used by two callers resolves to two non-overlapping
+// directories.
 //
 // Symlink policy (fail-closed): the root is canonicalized (EvalSymlinks) once
 // at construction. At resolve time the lexical candidate is verified against
@@ -83,21 +86,27 @@ func (r *Resolver) Root() string {
 // under the root, creating it (and the owner directory) on demand with 0700
 // permissions. The returned path is always inside Root and always absolute.
 //
-// ownerID and workspaceID are opaque tokens: they must be non-empty, must not
+// callerID and workspaceID are opaque tokens: they must be non-empty, must not
 // contain path separators ('/' or the Windows '\' as a robustness check), must
 // not be "." or "..", and must not contain a NUL byte. URL-encoded traversal
 // sequences (e.g. "..%2f") are treated as literal characters, never decoded,
 // so they are inert. Containment is verified both lexically (before mkdir) and
 // after symlink resolution (after mkdir).
-func (r *Resolver) Resolve(ownerID, workspaceID string) (string, error) {
-	if err := validateToken(ownerID, ErrInvalidOwnerID); err != nil {
+func (r *Resolver) Resolve(callerID, workspaceID string) (string, error) {
+	if err := validateToken(callerID, ErrInvalidCallerID); err != nil {
 		return "", err
 	}
 	if err := validateToken(workspaceID, ErrInvalidWorkspaceID); err != nil {
 		return "", err
 	}
 
-	candidate := filepath.Join(r.root, ownerID, workspaceID)
+	candidate := filepath.Join(
+		r.root,
+		"callers",
+		pathKey("caller", callerID),
+		"workspaces",
+		pathKey("workspace", workspaceID),
+	)
 	if err := ensureInside(r.root, candidate); err != nil {
 		return "", err
 	}
@@ -116,6 +125,11 @@ func (r *Resolver) Resolve(ownerID, workspaceID string) (string, error) {
 		return "", fmt.Errorf("workspace: resolve %q: %w", workspaceID, err)
 	}
 	return real, nil
+}
+
+func pathKey(domain, value string) string {
+	sum := sha256.Sum256([]byte(domain + "\x00" + value))
+	return domain + "-" + hex.EncodeToString(sum[:16])
 }
 
 // validateToken rejects tokens that could alter the resolved path. Separators

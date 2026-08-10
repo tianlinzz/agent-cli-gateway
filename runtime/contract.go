@@ -56,8 +56,8 @@ type StartRequest struct {
 	ModelID string
 	// SessionID is the gateway-assigned session identifier.
 	SessionID string
-	// OwnerID identifies the tenant/user that owns the session.
-	OwnerID string
+	// CallerID identifies the tenant/user that owns the session.
+	CallerID string
 	// WorkspaceID is an opaque client-supplied identifier. The server maps it
 	// to a controlled directory; clients can never inject an absolute path.
 	WorkspaceID string

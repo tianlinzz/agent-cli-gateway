@@ -40,12 +40,10 @@ type Options struct {
 	// Backend is the API layer's ONLY execution path. Required.
 	Backend runtime.ExecutionBackend
 
-	// AuthToken is the bearer token accepted by /v1/* endpoints. Empty
-	// disables authentication (dev/test only).
-	AuthToken string
-	// OwnerHeader is the request header carrying the owner/tenant identity.
-	// Default "X-User-Id".
-	OwnerHeader string
+	// CallerTokens maps bearer tokens to trusted caller IDs. An empty map
+	// disables authentication for tests only; production wiring must reject an
+	// empty configured caller set before constructing the handler.
+	CallerTokens map[string]string
 	// SessionHeader is the request header carrying the gateway session id on
 	// resume. Default "X-Gateway-Session-Id".
 	SessionHeader string
@@ -79,8 +77,7 @@ type Handler struct {
 	backend  runtime.ExecutionBackend
 	catalog  *modelCatalog
 
-	authToken       string
-	ownerHeader     string
+	callerTokens    map[string]string
 	sessionHeader   string
 	workspaceHeader string
 
@@ -128,9 +125,6 @@ func NewHandler(opts Options) *Handler {
 	if opts.Store == nil {
 		opts.Store = runtime.NewMemorySessionStore()
 	}
-	if opts.OwnerHeader == "" {
-		opts.OwnerHeader = "X-User-Id"
-	}
 	if opts.SessionHeader == "" {
 		opts.SessionHeader = "X-Gateway-Session-Id"
 	}
@@ -151,8 +145,7 @@ func NewHandler(opts Options) *Handler {
 		registry:        opts.Registry,
 		store:           opts.Store,
 		backend:         opts.Backend,
-		authToken:       opts.AuthToken,
-		ownerHeader:     opts.OwnerHeader,
+		callerTokens:    cloneStringMap(opts.CallerTokens),
 		sessionHeader:   opts.SessionHeader,
 		workspaceHeader: opts.WorkspaceHeader,
 		turnTimeout:     opts.TurnTimeout,
@@ -183,19 +176,50 @@ func (h *Handler) Routes() http.Handler {
 // disabled.
 func (h *Handler) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if h.authToken == "" || strings.HasPrefix(r.URL.Path, "/health/") {
+		if strings.HasPrefix(r.URL.Path, "/health/") {
 			next.ServeHTTP(w, r)
+			return
+		}
+		if len(h.callerTokens) == 0 {
+			ctx := context.WithValue(r.Context(), callerContextKey{}, Caller{ID: "anonymous"})
+			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
 		const prefix = "Bearer "
 		authz := r.Header.Get("Authorization")
 		token := strings.TrimPrefix(authz, prefix)
-		if token == authz || !constantTimeEqual(h.authToken, token) {
+		callerID, ok := h.authenticateCaller(token)
+		if token == authz || !ok {
 			writeError(w, http.StatusUnauthorized, authError("invalid or missing bearer token"))
 			return
 		}
-		next.ServeHTTP(w, r)
+		ctx := context.WithValue(r.Context(), callerContextKey{}, Caller{ID: callerID})
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func (h *Handler) authenticateCaller(token string) (string, bool) {
+	var callerID string
+	found := 0
+	for candidate, caller := range h.callerTokens {
+		match := subtle.ConstantTimeCompare([]byte(candidate), []byte(token))
+		if match == 1 {
+			callerID = caller
+		}
+		found |= match
+	}
+	return callerID, found == 1
+}
+
+type callerContextKey struct{}
+
+// Caller is the authenticated service caller. It is derived from the bearer
+// token and cannot be overridden by request headers.
+type Caller struct{ ID string }
+
+func callerFromRequest(r *http.Request) (Caller, bool) {
+	caller, ok := r.Context().Value(callerContextKey{}).(Caller)
+	return caller, ok && strings.TrimSpace(caller.ID) != ""
 }
 
 // handleHealthLive is a liveness probe: the process is up.
@@ -229,9 +253,15 @@ func (h *Handler) handleHealthReady(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// ownerID extracts the owner identity from the request.
-func (h *Handler) ownerID(r *http.Request) string {
-	return strings.TrimSpace(r.Header.Get(h.ownerHeader))
+func cloneStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 // registerHandle stores a live execution handle for a session, returning any
@@ -278,7 +308,7 @@ func (h *Handler) registerTurn(sessionID string) *turnState {
 
 // clearTurn ends a turn, running EndTurn on the store and closing ts.done so
 // an abort endpoint waiting on the turn unblocks.
-func (h *Handler) clearTurn(sessionID, ownerID string, ts *turnState) {
+func (h *Handler) clearTurn(sessionID, callerID string, ts *turnState) {
 	h.mu.Lock()
 	if cur, ok := h.turns[sessionID]; ok && cur == ts {
 		delete(h.turns, sessionID)
@@ -287,7 +317,7 @@ func (h *Handler) clearTurn(sessionID, ownerID string, ts *turnState) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := h.store.EndTurn(ctx, sessionID, ownerID); err != nil {
+	if err := h.store.EndTurn(ctx, sessionID, callerID); err != nil {
 		slog.Debug("openai: end turn", "session", sessionID, "error", err)
 	}
 	close(ts.done)

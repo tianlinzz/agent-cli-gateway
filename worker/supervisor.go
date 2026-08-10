@@ -179,7 +179,7 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 	// Resolve the opaque workspace_id to the real controlled directory. The
 	// resolver guarantees the result stays inside the configured root, and the
 	// nsjail mount namespace is the second boundary.
-	wsDir, err := s.resolver.Resolve(req.OwnerID, req.WorkspaceID)
+	wsDir, err := s.resolver.Resolve(req.CallerID, req.WorkspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("worker: start session %q: resolve workspace: %w", req.SessionID, err)
 	}
@@ -314,7 +314,7 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 	slog.Info("worker: session started",
 		"session", req.SessionID,
 		"model", req.ModelID,
-		"owner", req.OwnerID,
+		"owner", req.CallerID,
 		"workspace_id", req.WorkspaceID,
 		"pid", ws.outerPID,
 		"worker_pid", ws.workerPID,
@@ -370,7 +370,7 @@ func validateStartRequest(req runtime.StartRequest) error {
 	if strings.TrimSpace(req.ModelID) == "" {
 		return fmt.Errorf("worker: start session %q: empty model id", req.SessionID)
 	}
-	if strings.TrimSpace(req.OwnerID) == "" {
+	if strings.TrimSpace(req.CallerID) == "" {
 		return fmt.Errorf("worker: start session %q: empty owner id", req.SessionID)
 	}
 	if strings.TrimSpace(req.WorkspaceID) == "" {
@@ -731,7 +731,7 @@ func toStartSessionReq(req runtime.StartRequest) StartSessionReq {
 	r := StartSessionReq{
 		ModelID:     req.ModelID,
 		SessionID:   req.SessionID,
-		OwnerID:     req.OwnerID,
+		CallerID:    req.CallerID,
 		WorkspaceID: req.WorkspaceID,
 		Metadata:    req.Metadata,
 	}
