@@ -54,9 +54,11 @@ func main() {
 type adapterHandler struct {
 	reg *runtime.Registry
 
-	mu        sync.Mutex
-	session   runtime.Session
-	lifecycle string
+	mu            sync.Mutex
+	session       runtime.Session
+	lifecycle     string
+	sessionCtx    context.Context
+	sessionCancel context.CancelFunc
 }
 
 func (h *adapterHandler) Health(context.Context) (string, error) {
@@ -77,7 +79,8 @@ func (h *adapterHandler) StartSession(ctx context.Context, req worker.StartSessi
 	if err != nil {
 		return "", fmt.Errorf("gateway-worker: describe %q: %w", req.ModelID, err)
 	}
-	sess, err := adapter.Start(ctx, runtime.StartRequest{
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	sess, err := adapter.Start(sessionCtx, runtime.StartRequest{
 		ModelID:     req.ModelID,
 		SessionID:   req.SessionID,
 		CallerID:    req.CallerID,
@@ -86,11 +89,14 @@ func (h *adapterHandler) StartSession(ctx context.Context, req worker.StartSessi
 		FirstInput:  req.FirstInput,
 	})
 	if err != nil {
+		sessionCancel()
 		return "", fmt.Errorf("gateway-worker: start %q: %w", req.ModelID, err)
 	}
 	h.mu.Lock()
 	h.session = sess
 	h.lifecycle = desc.LifecycleMode
+	h.sessionCtx = sessionCtx
+	h.sessionCancel = sessionCancel
 	h.mu.Unlock()
 	return desc.LifecycleMode, nil
 }
@@ -160,6 +166,9 @@ func (h *adapterHandler) Close(ctx context.Context) error {
 	h.mu.Unlock()
 	if s == nil {
 		return nil
+	}
+	if h.sessionCancel != nil {
+		h.sessionCancel()
 	}
 	return s.Close(ctx)
 }
