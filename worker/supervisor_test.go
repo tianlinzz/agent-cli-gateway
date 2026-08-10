@@ -267,6 +267,54 @@ func TestSupervisor_DevProfileUsesNsjailWrapper(t *testing.T) {
 	}
 }
 
+func TestSupervisor_DirectSpawnMapsWorkspaceAndPreservesHostHome(t *testing.T) {
+	var got spawnSpec
+	sup := newTestSupervisor(t, nil, WithSpawner(func(ctx context.Context, spec spawnSpec) (*exec.Cmd, error) {
+		got = spec
+		return spawnDirect(ctx, spec)
+	}))
+
+	ws, err := sup.StartSession(context.Background(), testRequest("direct-paths-1"))
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := ws.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	wantWorkspace, err := sup.resolver.Resolve("owner-1", "ws-1")
+	if err != nil {
+		t.Fatalf("resolve workspace: %v", err)
+	}
+	assertEnvValue(t, got.env, "GW_WORKSPACE_DIR", wantWorkspace)
+	assertEnvValue(t, got.env, "HOME", os.Getenv("HOME"))
+	assertEnvMissing(t, got.env, "GW_AGENT_HOME")
+}
+
+func assertEnvValue(t *testing.T, env []string, key, want string) {
+	t.Helper()
+	prefix := key + "="
+	for i := len(env) - 1; i >= 0; i-- {
+		if strings.HasPrefix(env[i], prefix) {
+			if got := strings.TrimPrefix(env[i], prefix); got != want {
+				t.Fatalf("%s = %q, want %q", key, got, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("%s is missing from worker environment", key)
+}
+
+func assertEnvMissing(t *testing.T, env []string, key string) {
+	t.Helper()
+	prefix := key + "="
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			t.Fatalf("%s must not be overridden for a direct worker", key)
+		}
+	}
+}
+
 func TestSupervisor_NsjailCommandLine(t *testing.T) {
 	got := buildNsjailCommand("/usr/bin/nsjail", "/profiles/s1.conf", "/bin/worker", []string{"--flag"})
 	want := []string{"/usr/bin/nsjail", "-Mo", "--config", "/profiles/s1.conf", "--", "/bin/worker", "--flag"}

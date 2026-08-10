@@ -253,10 +253,28 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 		}
 	}
 
+	workerWorkspaceDir := wsDir
+	if isolated {
+		workerWorkspaceDir = s.cfg.Isolation.Mounts.WorkspaceDir
+		if strings.TrimSpace(workerWorkspaceDir) == "" {
+			workerWorkspaceDir = "/workspace"
+		}
+	}
 	env := append(os.Environ(),
 		"GW_WORKER_SOCKET="+socketPath,
 		"GW_WORKER_SESSION_ID="+req.SessionID,
+		"GW_WORKSPACE_DIR="+workerWorkspaceDir,
 	)
+	if isolated {
+		workerAgentHomeDir := s.cfg.Isolation.Mounts.AgentHomeDir
+		if strings.TrimSpace(workerAgentHomeDir) == "" {
+			workerAgentHomeDir = "/agent-home"
+		}
+		env = append(env,
+			"GW_AGENT_HOME="+workerAgentHomeDir,
+			"HOME="+workerAgentHomeDir,
+		)
+	}
 	spec := spawnSpec{
 		isolated:     isolated,
 		nsjailBinary: s.cfg.Isolation.BinaryPath,
