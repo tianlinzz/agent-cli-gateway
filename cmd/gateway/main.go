@@ -99,7 +99,7 @@ func main() {
 		Mode:            cfg.Mode,
 		Isolation:       cfg.Isolation,
 		WorkspaceRoot:   rootAbs,
-		RuntimeDir:      "gateway-run",
+		RuntimeDir:      envOrDefault("GATEWAY_RUNTIME_DIR", "gateway-run"),
 		WorkerExec:      *workerExec,
 		StartTimeout:    30 * time.Second,
 		ShutdownTimeout: cfg.Server.ShutdownTimeout,

@@ -14,7 +14,7 @@ LDFLAGS := -s -w \
   -X main.commit=$(COMMIT) \
   -X main.buildTime=$(BUILD_TIME)
 
-.PHONY: build build-worker run clean vet fmt test test-race test-integration \
+.PHONY: build build-worker dev run clean vet fmt test test-race test-integration \
         generate docker
 
 # ---------------------------------------------------------------------------
@@ -28,6 +28,9 @@ build:
 # Build the per-session worker child binary into bin/.
 build-worker:
 	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/$(WORKER_APP) $(WORKER_CMD)
+
+dev:
+	./scripts/dev.sh
 
 run: build
 	./bin/$(APP)

@@ -53,7 +53,7 @@ func TestBuildProfile_KafelDefaults(t *testing.T) {
 		`mount: { src: "` + layout.WorkspaceDir + `"; dst: "/workspace"; is_bind: true; rw: true; mandatory: true; };`,
 		`mount: { src: "` + layout.AgentHomeDir + `"; dst: "/agent-home"; is_bind: true; rw: true; mandatory: true; };`,
 		`mount: { src: "` + layout.SocketDir + `"; dst: "` + layout.SocketDir + `"; is_bind: true; rw: true; mandatory: true; };`,
-		`tmpfs: { dst: "/tmp"; rw: true; };`,
+		`mount: { dst: "/tmp"; fstype: "tmpfs"; options: "size=256m"; rw: true; mandatory: true; };`,
 		"seccomp_string: \"POLICY x86_64 {",
 		`keep_env: "GW_WORKER_SOCKET";`,
 		`env: { key: "HOME"; value: "/agent-home"; };`,
@@ -147,7 +147,7 @@ func TestBuildProfile_CustomMountDirs(t *testing.T) {
 	if !strings.Contains(c, `dst: "/var/agent-home";`) {
 		t.Errorf("custom agent home mount missing: %s", c)
 	}
-	if !strings.Contains(c, `tmpfs: { dst: "/var/tmp"; rw: true; };`) {
+	if !strings.Contains(c, `mount: { dst: "/var/tmp"; fstype: "tmpfs"; options: "size=256m"; rw: true; mandatory: true; };`) {
 		t.Errorf("custom tmpfs missing: %s", c)
 	}
 	if strings.Contains(c, "rlimit_nofile") {

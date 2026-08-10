@@ -1,51 +1,84 @@
 #!/usr/bin/env bash
-# dev.sh — 本地开发：构建网关二进制并在前台运行。
-#
-# 用途：开发者本地调试网关。编译二进制，然后直接运行，
-# 监听 4096 端口。需要本地已装 Go（不需要 make）。
-#
-# 可选环境变量：
-#   PORT   监听端口（默认 4096）
-#   TOKEN  网关 Bearer token（默认空 = 不鉴权）
-#   DATA_DIR  会话数据目录（默认 ~/.cc-connect）
-#
-# 用法：
-#   ./scripts/dev.sh                 # 默认 4096 端口启动
-#   PORT=8080 TOKEN=secret ./scripts/dev.sh
-#
-# 跨平台：在 Linux/macOS/Windows(Git Bash) 下均可运行。Windows 下自动
-# 生成并执行带 .exe 后缀的二进制，不依赖 make。
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 PORT="${PORT:-4096}"
-TOKEN="${TOKEN:-}"
-DATA_DIR="${DATA_DIR:-}"
+DEV_DIR="${DEV_DIR:-$PWD/.gateway-dev}"
+WORKSPACE_ROOT="${WORKSPACE_ROOT:-$DEV_DIR/workspaces}"
+RUNTIME_DIR="${RUNTIME_DIR:-$DEV_DIR/runtime}"
+CONFIG="${GATEWAY_CONFIG:-$DEV_DIR/gateway.toml}"
+WORKER_EXEC="${GW_WORKER_EXEC:-$PWD/bin/gateway-worker}"
+mkdir -p "$DEV_DIR" "$WORKSPACE_ROOT" "$RUNTIME_DIR" bin
 
-# --- 选择目标二进制名（Windows/Git Bash 需要 .exe 后缀） ---------------
-APP="acg"
-BIN="bin/${APP}"
-case "$(uname -s)" in
-  MINGW*|MSYS*|CYGWIN*) BIN="${BIN}.exe" ;;
-esac
-
-# --- 版本信息注入（与 Makefile 保持一致） ------------------------------
 VERSION="${VERSION:-dev}"
-COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo "none")"
+COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo none)"
 BUILD_TIME="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildTime=${BUILD_TIME}"
+echo "==> 构建 Gateway"
+CGO_ENABLED=0 go build -trimpath -ldflags "$LDFLAGS" -o bin/gateway ./cmd/gateway
+echo "==> 构建 Gateway Worker"
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/gateway-worker ./cmd/gateway-worker
 
-echo "==> 构建网关二进制 (${BIN})"
-CGO_ENABLED=0 go build -ldflags "${LDFLAGS}" -o "${BIN}" ./cmd/gateway
+TOKEN_FILE="$DEV_DIR/dev-token"
+if [[ -n "${DEV_TOKEN:-}" ]]; then
+  printf '%s' "$DEV_TOKEN" > "$TOKEN_FILE"
+elif [[ ! -s "$TOKEN_FILE" ]]; then
+  openssl rand -hex 24 > "$TOKEN_FILE"
+fi
+chmod 600 "$TOKEN_FILE"
+TOKEN="$(<"$TOKEN_FILE")"
 
-echo "==> 启动网关 (端口 ${PORT})"
-echo "    Token: ${TOKEN:-<无，开发模式不鉴权>}"
+OS="$(uname -s)"
+if [[ "$OS" == "Linux" && "${DEV_ISOLATION:-on}" != "off" ]]; then
+  MODE="dev"; REQUIRED="true"; SECCOMP="kafel"; WORKER_MODE="nsjail"
+else
+  MODE="test"; REQUIRED="false"; SECCOMP="off"; WORKER_MODE="direct"
+fi
+
+toml_quote() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+cat > "$CONFIG" <<EOF
+mode = "$MODE"
+
+[server]
+listen_addr = "127.0.0.1:$PORT"
+shutdown_timeout = "10s"
+
+[auth]
+required = true
+callers = [{ id = "local-dev", tokens = ["$(toml_quote "$TOKEN")"] }]
+
+[workspace]
+root = "$(toml_quote "$WORKSPACE_ROOT")"
+
+[isolation]
+required = $REQUIRED
+nsjail_version = "3.6"
+nsjail_source = "https://github.com/google/nsjail"
+binary_path = "/usr/local/bin/nsjail"
+
+[isolation.seccomp]
+policy = "$SECCOMP"
+
+[agents.codex]
+enabled = true
+permission = "auto"
+
+[agents.claude-code]
+enabled = true
+permission = "auto"
+
+[agents.kimi]
+enabled = true
+permission = "auto"
+EOF
+
+echo "==> 启动 Gateway"
+echo "    地址: http://127.0.0.1:$PORT"
+echo "    Worker: $WORKER_MODE"
+if [[ "$REQUIRED" == true ]]; then echo "    nsjail: enabled"; else echo "    nsjail: disabled (local development only)"; fi
+echo "    Token 文件: $TOKEN_FILE"
+echo "    配置文件: $CONFIG"
 echo "    按 Ctrl+C 停止"
-echo
-
-ARGS=("-port" "${PORT}")
-[ -n "${TOKEN}" ]    && ARGS+=("-token" "${TOKEN}")
-[ -n "${DATA_DIR}" ] && ARGS+=("-data-dir" "${DATA_DIR}")
-
-exec "${BIN}" "${ARGS[@]}"
+export GATEWAY_RUNTIME_DIR="$RUNTIME_DIR"
+exec "$PWD/bin/gateway" -config "$CONFIG" -worker-exec "$WORKER_EXEC"
