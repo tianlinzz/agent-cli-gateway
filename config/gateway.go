@@ -185,7 +185,8 @@ type AgentConfig struct {
 	// MaxConcurrency caps concurrent sessions for this agent; 0 = unlimited.
 	MaxConcurrency int `toml:"max_concurrency"`
 	// Env adds environment variables for the agent CLI.
-	Env map[string]string `toml:"env"`
+	Env    map[string]string `toml:"env"`
+	Models []string          `toml:"models"`
 }
 
 // DefaultGatewayConfig returns the recommended defaults. nsjail
@@ -265,6 +266,16 @@ func (c *GatewayConfig) normalize() {
 		c.Isolation.Seccomp.Policy = SeccompKafel
 	}
 	for name, agent := range c.Agents {
+		seen := make(map[string]bool)
+		models := make([]string, 0, len(agent.Models))
+		for _, model := range agent.Models {
+			model = strings.TrimSpace(model)
+			if model != "" && !seen[model] {
+				seen[model] = true
+				models = append(models, model)
+			}
+		}
+		agent.Models = models
 		agent.Permission = strings.ToLower(strings.TrimSpace(agent.Permission))
 		if agent.Permission == "" {
 			agent.Permission = PermissionAuto

@@ -184,7 +184,8 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, invalidRequest("model is required"))
 		return
 	}
-	if !h.catalog.has(req.Model) {
+	route, ok := h.catalog.route(req.Model)
+	if !ok {
 		writeError(w, http.StatusNotFound, modelNotFound(req.Model))
 		return
 	}
@@ -288,11 +289,12 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	// Execution goes through the runtime.ExecutionBackend — the API never
 	// starts a CLI itself. A live session reuses its existing execution.
 	startReq := runtime.StartRequest{
-		ModelID:     req.Model,
-		SessionID:   sessionID,
-		CallerID:    callerID,
-		WorkspaceID: workspaceID,
-		Metadata:    input.Metadata,
+		ModelID:       route.AdapterID,
+		ProviderModel: route.ProviderModel,
+		SessionID:     sessionID,
+		CallerID:      callerID,
+		WorkspaceID:   workspaceID,
+		Metadata:      input.Metadata,
 	}
 	if rec.NativeSessionID != "" {
 		if startReq.Metadata == nil {

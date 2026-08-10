@@ -54,6 +54,7 @@ type Options struct {
 	// Enabled reports whether a model/agent id is enabled by configuration.
 	// When nil every registered adapter is enabled.
 	Enabled func(name string) bool
+	Models  map[string][]string
 
 	// TurnTimeout bounds a single turn. Zero means no hard API-side bound
 	// (the adapter/worker own their timeouts). NewHandler defaults this to a
@@ -155,7 +156,7 @@ func NewHandler(opts Options) *Handler {
 		handles:         make(map[string]runtime.ExecutionHandle),
 		turns:           make(map[string]*turnState),
 	}
-	h.catalog = &modelCatalog{reg: opts.Registry, enabled: opts.Enabled}
+	h.catalog = &modelCatalog{reg: opts.Registry, enabled: opts.Enabled, models: opts.Models}
 	return h
 }
 

@@ -63,13 +63,14 @@ func (u unixSocket) DialContext(ctx context.Context) (net.Conn, error) {
 // runtime.StartRequest but stays in the worker package so the transport layer
 // owns its own request shape.
 type StartSessionReq struct {
-	ModelID     string
-	SessionID   string
-	CallerID    string
-	WorkspaceID string
-	Metadata    map[string]string
-	FirstInput  *runtime.Input
-	AgentConfig runtime.AgentExecutionConfig
+	ModelID       string
+	SessionID     string
+	CallerID      string
+	WorkspaceID   string
+	Metadata      map[string]string
+	FirstInput    *runtime.Input
+	AgentConfig   runtime.AgentExecutionConfig
+	ProviderModel string
 }
 
 // ---------------------------------------------------------------------------
@@ -299,12 +300,13 @@ func (s *workerServer) CloseSession(ctx context.Context, _ *workerpb.CloseSessio
 
 func toProtoStartRequest(req StartSessionReq) (*workerpb.StartSessionRequest, error) {
 	p := &workerpb.StartSessionRequest{
-		ModelId:     req.ModelID,
-		SessionId:   req.SessionID,
-		CallerId:    req.CallerID,
-		WorkspaceId: req.WorkspaceID,
-		Metadata:    req.Metadata,
-		AgentConfig: toProtoAgentConfig(req.AgentConfig),
+		ModelId:       req.ModelID,
+		SessionId:     req.SessionID,
+		CallerId:      req.CallerID,
+		WorkspaceId:   req.WorkspaceID,
+		Metadata:      req.Metadata,
+		AgentConfig:   toProtoAgentConfig(req.AgentConfig),
+		ProviderModel: req.ProviderModel,
 	}
 	if req.FirstInput != nil {
 		in, err := toProtoInput(*req.FirstInput)
@@ -318,12 +320,13 @@ func toProtoStartRequest(req StartSessionReq) (*workerpb.StartSessionRequest, er
 
 func fromProtoStartRequest(p *workerpb.StartSessionRequest) (StartSessionReq, error) {
 	req := StartSessionReq{
-		ModelID:     p.ModelId,
-		SessionID:   p.SessionId,
-		CallerID:    p.CallerId,
-		WorkspaceID: p.WorkspaceId,
-		Metadata:    p.Metadata,
-		AgentConfig: fromProtoAgentConfig(p.AgentConfig),
+		ModelID:       p.ModelId,
+		SessionID:     p.SessionId,
+		CallerID:      p.CallerId,
+		WorkspaceID:   p.WorkspaceId,
+		Metadata:      p.Metadata,
+		AgentConfig:   fromProtoAgentConfig(p.AgentConfig),
+		ProviderModel: p.ProviderModel,
 	}
 	if p.FirstInput != nil {
 		in, err := fromProtoInput(p.FirstInput)

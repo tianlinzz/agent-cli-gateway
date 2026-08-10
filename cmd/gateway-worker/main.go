@@ -64,7 +64,11 @@ func (h *adapterHandler) Health(context.Context) (string, error) {
 }
 
 func (h *adapterHandler) StartSession(ctx context.Context, req worker.StartSessionReq) (string, error) {
-	applyAgentConfig(req.ModelID, req.AgentConfig)
+	agentConfig := req.AgentConfig
+	if req.ProviderModel != "" {
+		agentConfig.DefaultModel = req.ProviderModel
+	}
+	applyAgentConfig(req.ModelID, agentConfig)
 	adapter, err := h.reg.Resolve(ctx, req.ModelID)
 	if err != nil {
 		return "", fmt.Errorf("gateway-worker: resolve %q: %w", req.ModelID, err)

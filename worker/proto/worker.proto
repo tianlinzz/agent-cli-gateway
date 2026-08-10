@@ -64,6 +64,7 @@ message StartSessionRequest {
   map<string, string> metadata = 5;
   Input first_input = 6;
   AgentExecutionConfig agent_config = 7;
+  string provider_model = 8;
 }
 
 message AgentExecutionConfig {

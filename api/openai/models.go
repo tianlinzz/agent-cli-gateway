@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"sort"
+	"strings"
 
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
 )
@@ -29,6 +30,33 @@ type modelList struct {
 type modelCatalog struct {
 	reg     *runtime.Registry
 	enabled func(name string) bool
+	models  map[string][]string
+}
+
+type modelRoute struct{ PublicID, AdapterID, ProviderModel string }
+
+func parseModelRoute(id string, models map[string][]string) (modelRoute, bool) {
+	parts := strings.SplitN(strings.TrimSpace(id), "/", 2)
+	if len(parts) == 1 {
+		return modelRoute{PublicID: id, AdapterID: id}, id != ""
+	}
+	if parts[0] == "" || parts[1] == "" {
+		return modelRoute{}, false
+	}
+	for _, m := range models[parts[0]] {
+		if m == parts[1] {
+			return modelRoute{PublicID: id, AdapterID: parts[0], ProviderModel: parts[1]}, true
+		}
+	}
+	return modelRoute{}, false
+}
+
+func (c *modelCatalog) route(id string) (modelRoute, bool) {
+	r, ok := parseModelRoute(id, c.models)
+	if !ok || !c.has(id) {
+		return modelRoute{}, false
+	}
+	return r, true
 }
 
 // has reports whether name is a known and enabled model. This is the cheap
@@ -38,9 +66,13 @@ func (c *modelCatalog) has(name string) bool {
 	if c == nil || c.reg == nil {
 		return false
 	}
+	route, ok := parseModelRoute(name, c.models)
+	if !ok {
+		return false
+	}
 	found := false
 	for _, n := range c.reg.List() {
-		if n == name {
+		if n == route.AdapterID {
 			found = true
 			break
 		}
@@ -48,10 +80,10 @@ func (c *modelCatalog) has(name string) bool {
 	if !found {
 		return false
 	}
-	if c.enabled != nil && !c.enabled(name) {
+	if c.enabled != nil && !c.enabled(route.AdapterID) {
 		return false
 	}
-	adapter, err := c.reg.Resolve(context.Background(), name)
+	adapter, err := c.reg.Resolve(context.Background(), route.AdapterID)
 	if err != nil {
 		return false
 	}
@@ -80,7 +112,15 @@ func (c *modelCatalog) discover(ctx context.Context) []runtime.Descriptor {
 		if err != nil {
 			continue
 		}
-		out = append(out, desc)
+		if configured := c.models[name]; len(configured) > 0 {
+			for _, model := range configured {
+				d := desc
+				d.ModelID = name + "/" + model
+				out = append(out, d)
+			}
+		} else {
+			out = append(out, desc)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ModelID < out[j].ModelID })
 	return out

@@ -67,6 +67,8 @@ permission = "auto"
 [agents.claude-code]
 enabled = true
 permission = "auto"
+default_model = "sonnet"
+models = ["sonnet", "opus", "haiku"]
 
 [agents.kimi]
 enabled = true

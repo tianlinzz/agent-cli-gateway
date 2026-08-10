@@ -144,6 +144,7 @@ type StartSessionRequest struct {
 	Metadata      map[string]string      `protobuf:"bytes,5,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	FirstInput    *Input                 `protobuf:"bytes,6,opt,name=first_input,json=firstInput,proto3" json:"first_input,omitempty"`
 	AgentConfig   *AgentExecutionConfig  `protobuf:"bytes,7,opt,name=agent_config,json=agentConfig,proto3" json:"agent_config,omitempty"`
+	ProviderModel string                 `protobuf:"bytes,8,opt,name=provider_model,json=providerModel,proto3" json:"provider_model,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -225,6 +226,13 @@ func (x *StartSessionRequest) GetAgentConfig() *AgentExecutionConfig {
 		return x.AgentConfig
 	}
 	return nil
+}
+
+func (x *StartSessionRequest) GetProviderModel() string {
+	if x != nil {
+		return x.ProviderModel
+	}
+	return ""
 }
 
 type AgentExecutionConfig struct {
@@ -1167,7 +1175,7 @@ const file_worker_proto_worker_proto_rawDesc = "" +
 	"\x0eHealthResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x12\x10\n" +
-	"\x03pid\x18\x03 \x01(\x05R\x03pid\"\x9c\x03\n" +
+	"\x03pid\x18\x03 \x01(\x05R\x03pid\"\xc3\x03\n" +
 	"\x13StartSessionRequest\x12\x19\n" +
 	"\bmodel_id\x18\x01 \x01(\tR\amodelId\x12\x1d\n" +
 	"\n" +
@@ -1177,7 +1185,8 @@ const file_worker_proto_worker_proto_rawDesc = "" +
 	"\bmetadata\x18\x05 \x03(\v21.gateway.worker.StartSessionRequest.MetadataEntryR\bmetadata\x126\n" +
 	"\vfirst_input\x18\x06 \x01(\v2\x15.gateway.worker.InputR\n" +
 	"firstInput\x12G\n" +
-	"\fagent_config\x18\a \x01(\v2$.gateway.worker.AgentExecutionConfigR\vagentConfig\x1a;\n" +
+	"\fagent_config\x18\a \x01(\v2$.gateway.worker.AgentExecutionConfigR\vagentConfig\x12%\n" +
+	"\x0eprovider_model\x18\b \x01(\tR\rproviderModel\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xc5\x02\n" +

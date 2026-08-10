@@ -399,6 +399,9 @@ func validateStartRequest(req runtime.StartRequest) error {
 	if strings.TrimSpace(req.ModelID) == "" {
 		return fmt.Errorf("worker: start session %q: empty model id", req.SessionID)
 	}
+	if strings.Contains(req.ProviderModel, "/") {
+		return fmt.Errorf("worker: start session %q: invalid provider model", req.SessionID)
+	}
 	if strings.TrimSpace(req.CallerID) == "" {
 		return fmt.Errorf("worker: start session %q: empty owner id", req.SessionID)
 	}
@@ -766,11 +769,12 @@ dial:
 
 func toStartSessionReq(req runtime.StartRequest) StartSessionReq {
 	r := StartSessionReq{
-		ModelID:     req.ModelID,
-		SessionID:   req.SessionID,
-		CallerID:    req.CallerID,
-		WorkspaceID: req.WorkspaceID,
-		Metadata:    req.Metadata,
+		ModelID:       req.ModelID,
+		SessionID:     req.SessionID,
+		CallerID:      req.CallerID,
+		WorkspaceID:   req.WorkspaceID,
+		ProviderModel: req.ProviderModel,
+		Metadata:      req.Metadata,
 	}
 	if req.FirstInput != nil {
 		in := *req.FirstInput

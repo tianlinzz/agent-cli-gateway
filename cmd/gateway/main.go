@@ -46,6 +46,14 @@ func agentExecutionConfigs(in map[string]config.AgentConfig) map[string]runtime.
 	return out
 }
 
+func agentModels(in map[string]config.AgentConfig) map[string][]string {
+	out := make(map[string][]string, len(in))
+	for name, c := range in {
+		out[name] = append([]string(nil), c.Models...)
+	}
+	return out
+}
+
 func main() {
 	// -config defaults to $GATEWAY_CONFIG (set by the container entrypoint to
 	// the runtime config path) so a mounted/entrypoint-written config is loaded
@@ -131,6 +139,7 @@ func main() {
 			agent, ok := cfg.Agents[name]
 			return !ok || agent.Enabled
 		},
+		Models: agentModels(cfg.Agents),
 	})
 
 	srv := &http.Server{

@@ -67,7 +67,8 @@ type Capabilities struct {
 // public contract.
 type StartRequest struct {
 	// ModelID is the public model (agent) identifier requested by the client.
-	ModelID string
+	ModelID       string
+	ProviderModel string
 	// SessionID is the gateway-assigned session identifier.
 	SessionID string
 	// CallerID identifies the tenant/user that owns the session.
