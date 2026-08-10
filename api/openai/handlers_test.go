@@ -901,25 +901,32 @@ func TestOwnerIsolation_SessionNotLeaked(t *testing.T) {
 		t.Errorf("owner B abort code = %q, want session_not_found", ae.Code)
 	}
 
-	// Existence-leak prevention: an explicit UNKNOWN session id must produce
-	// the exact same generic 404 as a wrong-owner id — never an implicit
-	// create-and-run.
+	// A caller may supply its stable business conversation id on the first
+	// request. The gateway creates that session and echoes the same id, so an
+	// OpenAI-compatible caller can reuse one persistent agent worker without a
+	// separate create-session round trip.
 	before := len(backend.StartRequests())
 	resp = doAuthJSONH(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body,
-		map[string]string{"X-Gateway-Session-Id": "does-not-exist"})
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("unknown session chat: status = %d, want 404 (body %s)", resp.StatusCode, readBody(t, resp))
+		map[string]string{"X-Gateway-Session-Id": "business-session-1"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("caller-provided session create: status = %d, want 200 (body %s)", resp.StatusCode, readBody(t, resp))
 	}
-	ae = decodeError(t, resp)
-	if ae.Code != "session_not_found" {
-		t.Errorf("unknown session chat code = %q, want session_not_found", ae.Code)
+	if got := resp.Header.Get("X-Gateway-Session-Id"); got != "business-session-1" {
+		t.Errorf("created session header = %q, want business-session-1", got)
 	}
-	if got := len(backend.StartRequests()); got != before {
-		t.Errorf("unknown explicit session id started an execution (start requests %d -> %d)", before, got)
+	if got := len(backend.StartRequests()); got != before+1 {
+		t.Errorf("caller-provided session start requests = %d, want %d", got, before+1)
 	}
-	resp = doAuthJSON(t, "POST", ts.URL+"/v1/sessions/does-not-exist/abort", testToken, testOwner, nil)
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("unknown session abort: status = %d, want 404 (body %s)", resp.StatusCode, readBody(t, resp))
+
+	// A second turn with the same caller-provided id reuses the existing
+	// execution instead of starting a second worker.
+	resp = doAuthJSONH(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body,
+		map[string]string{"X-Gateway-Session-Id": "business-session-1"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("caller-provided session resume: status = %d, want 200 (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	if got := len(backend.StartRequests()); got != before+1 {
+		t.Errorf("resumed caller-provided session started another execution: got %d starts, want %d", got, before+1)
 	}
 }
 

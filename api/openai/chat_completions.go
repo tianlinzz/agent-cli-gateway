@@ -205,18 +205,16 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	workspaceID := strings.TrimSpace(firstNonEmpty(r.Header.Get(h.workspaceHeader), metaString(req.Metadata, "workspace_id")))
 
 	// Resolve the session. Absent gateway session id -> the gateway generates
-	// one and returns it in the X-Gateway-Session-Id response header so the
-	// client can resume later. An explicit id must resolve to a session owned
-	// by this tenant; BOTH an unknown id and a wrong-owner id yield the same
-	// generic 404, so a cross-tenant probe never learns whether a session id
-	// exists. This is the deliberate Task-2 collapse.
+	// one. A caller may also provide a stable business-conversation id on its
+	// first request; an unknown id is created for that caller, while an existing
+	// id owned by another caller remains the same generic 404 as before.
 	created := false
 	var rec runtime.SessionRecord
 	if sessionID == "" {
 		sessionID = newSessionID()
-		created = true
 	}
-	if created {
+	rec, err = h.store.Get(r.Context(), sessionID, callerID)
+	if errors.Is(err, runtime.ErrSessionNotFound) {
 		if workspaceID == "" {
 			writeError(w, http.StatusBadRequest, invalidRequest("workspace_id is required for a new session"))
 			return
@@ -227,21 +225,28 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			CallerID:    callerID,
 			WorkspaceID: workspaceID,
 		}
-		if err := h.store.Create(r.Context(), rec); err != nil {
-			writeError(w, http.StatusInternalServerError, serverError("failed to create session: "+err.Error()))
+		if createErr := h.store.Create(r.Context(), rec); createErr == nil {
+			created = true
+			err = nil
+		} else if errors.Is(createErr, runtime.ErrSessionExists) {
+			// Concurrent first requests may race to create the caller-provided
+			// id. Re-read it and apply the normal ownership/model/workspace
+			// checks; never overwrite the winner.
+			rec, err = h.store.Get(r.Context(), sessionID, callerID)
+		} else {
+			writeError(w, http.StatusInternalServerError, serverError("failed to create session: "+createErr.Error()))
 			return
 		}
-	} else {
-		var err error
-		rec, err = h.store.Get(r.Context(), sessionID, callerID)
-		if err != nil {
-			if errors.Is(err, runtime.ErrSessionNotFound) || errors.Is(err, runtime.ErrSessionForbidden) {
-				writeError(w, http.StatusNotFound, sessionNotFound())
-				return
-			}
-			writeError(w, http.StatusInternalServerError, serverError(err.Error()))
+	}
+	if err != nil {
+		if errors.Is(err, runtime.ErrSessionNotFound) || errors.Is(err, runtime.ErrSessionForbidden) {
+			writeError(w, http.StatusNotFound, sessionNotFound())
 			return
 		}
+		writeError(w, http.StatusInternalServerError, serverError(err.Error()))
+		return
+	}
+	if !created {
 		if rec.ModelID != req.Model {
 			writeError(w, http.StatusBadRequest, invalidRequest("model does not match session "+sessionID))
 			return
