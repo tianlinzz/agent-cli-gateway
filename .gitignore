@@ -16,6 +16,7 @@ cc-connect.bak-*
 /gateway
 /gateway-worker
 /gateway-run/
+/.gateway-dev/
 
 # ============================================================================
 # Go workspace & tooling
