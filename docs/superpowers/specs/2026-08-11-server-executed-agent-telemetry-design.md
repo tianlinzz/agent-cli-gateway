@@ -61,10 +61,15 @@ Assistant text remains standard OpenAI content:
 }
 ```
 
-### Reasoning
+### Unified Process Channel
 
-Safe, user-visible reasoning uses the established OpenAI-compatible
-`reasoning_content` delta field:
+All Gateway-owned process telemetry uses the established OpenAI-compatible
+`reasoning_content` delta field. This includes safe reasoning summaries and
+terminal summaries for native tool executions. The client already has one
+consumer path for this field, so adding a new `tool_execution` wire field is
+not required.
+
+Reasoning example:
 
 ```json
 {
@@ -78,14 +83,19 @@ Safe, user-visible reasoning uses the established OpenAI-compatible
 }
 ```
 
+```text
+Checking the workspace state.
+```
+
 This field carries only native protocol content explicitly suitable for user
-display, such as a reasoning summary. The Gateway must not synthesize reasoning
-or expose hidden chain-of-thought, signatures, encrypted blocks, or private
-provider metadata. An Agent that has no safe reasoning event emits none.
+display, such as a reasoning summary. The Gateway must not synthesize hidden
+chain-of-thought, signatures, encrypted blocks, or private provider metadata.
+An Agent that has no safe reasoning event emits none.
 
-### Completed Tool Execution
+### Terminal Native Tool Summary
 
-Each native tool produces at most one display-only terminal event:
+Each native tool produces at most one terminal display summary, encoded as a
+string in the same `reasoning_content` field:
 
 ```json
 {
@@ -93,13 +103,7 @@ Each native tool produces at most one display-only terminal event:
     {
       "index": 0,
       "delta": {
-        "tool_execution": {
-          "id": "tool-123",
-          "name": "Bash",
-          "status": "completed",
-          "is_error": false,
-          "result": "/workspace"
-        }
+        "reasoning_content": "gateway.tool_execution.v1:{\"id\":\"tool-123\",\"name\":\"Bash\",\"status\":\"completed\",\"is_error\":false,\"result\":\"/workspace\"}"
       },
       "finish_reason": null
     }
@@ -107,10 +111,10 @@ Each native tool produces at most one display-only terminal event:
 }
 ```
 
-The v1 wire fields are:
+The payload after the stable prefix is JSON with these fields:
 
 ```go
-type toolExecution struct {
+type ToolExecutionSummary struct {
     ID      string `json:"id"`
     Name    string `json:"name,omitempty"`
     Status  string `json:"status"` // always "completed" in v1
@@ -119,9 +123,11 @@ type toolExecution struct {
 }
 ```
 
-`tool_execution` is an OpenAI-compatible extension, not a standard OpenAI tool
-request. Unknown response fields are optional extension data; clients that do
-not understand it can continue consuming standard assistant content.
+The `gateway.tool_execution.v1:` prefix is stable and makes the message
+recognizable to consumers that want a dedicated tool card later. Consumers that
+do not recognize it still receive an ordinary reasoning string and do not enter
+any tool loop. This is an application-level convention carried through an
+already-consumed compatibility field, not a new OpenAI control field.
 
 The Gateway does not stream `started` or incremental tool updates in v1. It
 keeps native start data internally and emits one event only when the matching
@@ -218,7 +224,9 @@ Projection rules are:
 2. `EventReasoning` writes `delta.reasoning_content` when text is non-empty.
 3. `EventToolUse` records the tool by stable ID and writes no client frame.
 4. `EventToolResult` merges missing name data from the recorded start, applies
-   redaction and output bounds, and writes one `delta.tool_execution` frame.
+   redaction and output bounds, serializes `ToolExecutionSummary` with the
+   `gateway.tool_execution.v1:` prefix, and writes it as one
+   `delta.reasoning_content` frame.
 5. A repeated result ID is ignored and logged as a structured warning.
 6. A result without a prior start is still emitted using the available result
    data; this preserves protocols that report only terminal updates.
@@ -267,21 +275,20 @@ or secrets. A later arguments-preview feature requires its own threat review.
 
 ## Compatibility
 
-- Existing standard content and finish chunks remain unchanged.
+- Existing standard content, reasoning, and finish chunks remain unchanged.
 - `delta.tool_calls`, assistant `message.tool_calls`, tool-role response
   messages, and `finish_reason: "tool_calls"` are never emitted for native
   Agent tools.
-- Clients that ignore unknown `delta.tool_execution` fields still receive the
-  final assistant answer.
-- Reasoning and tool telemetry are optional capabilities. Missing telemetry is
-  not an execution failure.
+- Clients already consuming `reasoning_content` receive both reasoning and
+  terminal tool summaries without a new response-field adapter.
+- Clients that do not understand the stable prefix still receive harmless
+  reasoning text and never enter a tool loop.
+- Missing telemetry is not an execution failure.
 - The API and runtime layers contain no Agent-specific branches.
 
-The initial implementation emits the extensions on streaming responses without
-request negotiation. They are additive optional fields and do not alter the
-standard control flow. If a strict downstream client is later shown to reject
-unknown response fields, an opt-in capability flag can be added without
-changing the event shapes.
+The initial implementation emits these process summaries only on streaming
+responses. No client capability negotiation is required because the wire field
+already exists and the new value remains a string.
 
 ## Testing
 
@@ -307,7 +314,8 @@ Handler tests must verify:
 
 - reasoning becomes `delta.reasoning_content`;
 - a tool start produces no SSE frame;
-- a tool result produces one terminal `delta.tool_execution` frame;
+- a tool result produces one terminal `delta.reasoning_content` frame with the
+  `gateway.tool_execution.v1:` prefix;
 - missing result fields are correlated from the start event;
 - duplicate results are suppressed;
 - no response contains `delta.tool_calls` or `finish_reason: "tool_calls"`;
@@ -323,7 +331,7 @@ The HTTP integration fixture must exercise this ordering:
 ```text
 reasoning_content
 internal tool start (no frame)
-tool_execution completed
+reasoning_content(tool_execution completed)
 assistant content
 finish_reason stop
 [DONE]
@@ -340,8 +348,8 @@ the repository pre-commit checklist.
 
 The following work is deliberately outside this Gateway implementation:
 
-- f1-web parsing of `delta.tool_execution`;
-- conversion to f1-web `ChatStreamProtocol` display events;
+- f1-web parsing of the `gateway.tool_execution.v1:` reasoning payload;
+- conversion to f1-web `ChatStreamProtocol` display events and dedicated UI;
 - UI rendering and historical persistence;
 - client-owned OpenAI function tools;
 - incremental tool progress or argument previews;
