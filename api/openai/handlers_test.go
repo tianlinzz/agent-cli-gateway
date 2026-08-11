@@ -538,8 +538,10 @@ func TestChatCompletions_AgentError(t *testing.T) {
 	}
 }
 
-func TestChatCompletions_InternalAgentToolsDoNotBecomeModelToolCalls(t *testing.T) {
-	ts, _, backend := newTestServer(t)
+func TestChatCompletions_AllAgentsKeepInternalToolsOutOfModelToolCalls(t *testing.T) {
+	ts, h, backend := newTestServer(t)
+	mustRegister(t, h.catalog.reg, "claude-code", runtime.Descriptor{ModelID: "claude-code"}, nil)
+	mustRegister(t, h.catalog.reg, "kimi", runtime.Descriptor{ModelID: "kimi"}, nil)
 	backend.withScript(func(h *fakeHandle) {
 		h.emit(
 			runtime.Event{Type: runtime.EventText, Text: "Let me run that."},
@@ -552,27 +554,36 @@ func TestChatCompletions_InternalAgentToolsDoNotBecomeModelToolCalls(t *testing.
 			runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"},
 		)
 	})
-	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
-		chatReq("codex", false, defaultMessages()))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, readBody(t, resp))
-	}
-	var cb completionBody
-	if err := json.Unmarshal(readBody(t, resp), &cb); err != nil {
-		t.Fatalf("decode completion: %v", err)
-	}
-	if len(cb.Choices) != 1 {
-		t.Fatalf("choices len = %d", len(cb.Choices))
-	}
-	ch := cb.Choices[0]
-	if len(ch.Message.ToolCalls) != 0 {
-		t.Fatalf("tool_calls = %#v, want none; the native agent already executed them", ch.Message.ToolCalls)
-	}
-	if ch.Message.Content == nil || *ch.Message.Content != "Let me run that." {
-		t.Errorf("content = %v, want native assistant text", ch.Message.Content)
-	}
-	if ch.FinishReason == nil || *ch.FinishReason != "stop" {
-		t.Errorf("finish_reason = %v, want stop so the OpenAI caller does not start another tool loop", ch.FinishReason)
+
+	for _, model := range []string{"claude-code", "codex", "kimi"} {
+		t.Run(model, func(t *testing.T) {
+			resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+				chatReq(model, false, defaultMessages()))
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, readBody(t, resp))
+			}
+			var cb completionBody
+			if err := json.Unmarshal(readBody(t, resp), &cb); err != nil {
+				t.Fatalf("decode completion: %v", err)
+			}
+			if len(cb.Choices) != 1 {
+				t.Fatalf("choices len = %d", len(cb.Choices))
+			}
+			ch := cb.Choices[0]
+			if len(ch.Message.ToolCalls) != 0 {
+				t.Fatalf("tool_calls = %#v, want none; the native agent already executed them", ch.Message.ToolCalls)
+			}
+			if ch.Message.Content == nil || *ch.Message.Content != "Let me run that." {
+				t.Errorf("content = %v, want native assistant text", ch.Message.Content)
+			}
+			if ch.FinishReason == nil || *ch.FinishReason != "stop" {
+				t.Errorf("finish_reason = %v, want stop so the OpenAI caller does not start another tool loop", ch.FinishReason)
+			}
+			started := backend.StartRequests()
+			if got := started[len(started)-1].ModelID; got != model {
+				t.Errorf("backend model = %q, want %q", got, model)
+			}
+		})
 	}
 }
 
@@ -745,8 +756,10 @@ func TestChatCompletions_Stream(t *testing.T) {
 	}
 }
 
-func TestChatCompletions_StreamInternalAgentToolsAreNotModelToolCalls(t *testing.T) {
-	ts, _, backend := newTestServer(t)
+func TestChatCompletions_StreamAllAgentsKeepInternalToolsOutOfModelToolCalls(t *testing.T) {
+	ts, h, backend := newTestServer(t)
+	mustRegister(t, h.catalog.reg, "claude-code", runtime.Descriptor{ModelID: "claude-code"}, nil)
+	mustRegister(t, h.catalog.reg, "kimi", runtime.Descriptor{ModelID: "kimi"}, nil)
 	backend.withScript(func(h *fakeHandle) {
 		h.emit(
 			runtime.Event{Type: runtime.EventText, Text: "before "},
@@ -760,45 +773,54 @@ func TestChatCompletions_StreamInternalAgentToolsAreNotModelToolCalls(t *testing
 			runtime.Event{Type: runtime.EventFinish, FinishReason: "tool_use"},
 		)
 	})
-	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
-		chatReq("codex", true, defaultMessages()))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d (body %s)", resp.StatusCode, readBody(t, resp))
-	}
-	events := splitSSE(t, readBody(t, resp))
-	var content strings.Builder
-	var finish string
-	for _, event := range events {
-		if event == "[DONE]" {
-			continue
-		}
-		if strings.Contains(event, `"tool_calls"`) {
-			t.Fatalf("native tool leaked as OpenAI tool_calls: %s", event)
-		}
-		var chunk struct {
-			Choices []struct {
-				Delta struct {
-					Content string `json:"content"`
-				} `json:"delta"`
-				FinishReason *string `json:"finish_reason"`
-			} `json:"choices"`
-		}
-		if err := json.Unmarshal([]byte(event), &chunk); err != nil {
-			t.Fatalf("decode chunk: %v (%q)", err, event)
-		}
-		if len(chunk.Choices) == 0 {
-			continue
-		}
-		content.WriteString(chunk.Choices[0].Delta.Content)
-		if chunk.Choices[0].FinishReason != nil {
-			finish = *chunk.Choices[0].FinishReason
-		}
-	}
-	if got := content.String(); got != "before after" {
-		t.Errorf("content = %q, want native text around the internal tool", got)
-	}
-	if finish != "stop" {
-		t.Errorf("finish_reason = %q, want stop", finish)
+
+	for _, model := range []string{"claude-code", "codex", "kimi"} {
+		t.Run(model, func(t *testing.T) {
+			resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+				chatReq(model, true, defaultMessages()))
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d (body %s)", resp.StatusCode, readBody(t, resp))
+			}
+			events := splitSSE(t, readBody(t, resp))
+			var content strings.Builder
+			var finish string
+			for _, event := range events {
+				if event == "[DONE]" {
+					continue
+				}
+				if strings.Contains(event, `"tool_calls"`) {
+					t.Fatalf("native tool leaked as OpenAI tool_calls: %s", event)
+				}
+				var chunk struct {
+					Choices []struct {
+						Delta struct {
+							Content string `json:"content"`
+						} `json:"delta"`
+						FinishReason *string `json:"finish_reason"`
+					} `json:"choices"`
+				}
+				if err := json.Unmarshal([]byte(event), &chunk); err != nil {
+					t.Fatalf("decode chunk: %v (%q)", err, event)
+				}
+				if len(chunk.Choices) == 0 {
+					continue
+				}
+				content.WriteString(chunk.Choices[0].Delta.Content)
+				if chunk.Choices[0].FinishReason != nil {
+					finish = *chunk.Choices[0].FinishReason
+				}
+			}
+			if got := content.String(); got != "before after" {
+				t.Errorf("content = %q, want native text around the internal tool", got)
+			}
+			if finish != "stop" {
+				t.Errorf("finish_reason = %q, want stop", finish)
+			}
+			started := backend.StartRequests()
+			if got := started[len(started)-1].ModelID; got != model {
+				t.Errorf("backend model = %q, want %q", got, model)
+			}
+		})
 	}
 }
 

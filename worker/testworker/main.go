@@ -81,12 +81,13 @@ func main() {
 
 // stubHandler implements worker.Handler over a scripted event stream.
 type stubHandler struct {
-	mu       sync.Mutex
-	behavior string
-	logPath  string
-	events   chan runtime.Event
-	closed   bool
-	onClose  func()
+	mu        sync.Mutex
+	behavior  string
+	logPath   string
+	events    chan runtime.Event
+	closed    bool
+	turnTimer *time.Timer
+	onClose   func()
 }
 
 func newStubHandler(behavior, logPath string) *stubHandler {
@@ -155,16 +156,24 @@ func (h *stubHandler) SendInput(_ context.Context, input runtime.Input) error {
 		// A turn that stays in flight long enough for an abort to land. The
 		// reply is delayed ~1.5s; the emit is guarded so it never fires after
 		// Close (the worker process may be killed before the timer runs).
-		time.AfterFunc(1500*time.Millisecond, func() {
+		h.mu.Lock()
+		if h.turnTimer != nil {
+			h.turnTimer.Stop()
+		}
+		var timer *time.Timer
+		timer = time.AfterFunc(1500*time.Millisecond, func() {
 			h.mu.Lock()
-			if h.closed {
+			if h.closed || h.turnTimer != timer {
 				h.mu.Unlock()
 				return
 			}
+			h.turnTimer = nil
 			h.mu.Unlock()
 			h.emit(runtime.Event{Type: runtime.EventText, Text: "echo:" + text})
 			h.emit(runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"})
 		})
+		h.turnTimer = timer
+		h.mu.Unlock()
 		return nil
 	case "slow-crash":
 		// Accept the turn but die mid-turn (~1.5s) before producing any output:
@@ -183,6 +192,12 @@ func (h *stubHandler) Events() <-chan runtime.Event {
 
 func (h *stubHandler) Abort(_ context.Context) error {
 	h.logf("abort")
+	h.mu.Lock()
+	if h.turnTimer != nil {
+		h.turnTimer.Stop()
+		h.turnTimer = nil
+	}
+	h.mu.Unlock()
 	h.emit(runtime.Event{Type: runtime.EventStatus, Status: "aborted"})
 	return nil
 }

@@ -9,24 +9,24 @@ import (
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
 )
 
-func TestDescribeDeclaresResumePerTurn(t *testing.T) {
+func TestDescribeDeclaresPersistentProcess(t *testing.T) {
 	descriptor, err := newAdapter(Options{}, nil).Describe(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if descriptor.ModelID != "codex" || descriptor.LifecycleMode != runtime.LifecycleResumePerTurn || !descriptor.Capabilities.Resume {
+	if descriptor.ModelID != "codex" || descriptor.LifecycleMode != runtime.LifecyclePersistentProcess || !descriptor.Capabilities.Resume {
 		t.Fatalf("descriptor = %#v", descriptor)
 	}
 }
 
 func TestStartMapsCodexHomeAndResumeMetadata(t *testing.T) {
 	capture := &captureStarter{session: newFakeSession("")}
-	adapter := newAdapter(Options{Command: "codex --quiet", WorkDir: "/workspace", CodexHome: "/agent-home", Model: "gpt-5"}, capture.Start)
+	adapter := newAdapter(Options{Command: "codex --quiet", WorkDir: "/workspace", CodexHome: "/agent-home", Model: "gpt-5", Permission: "deny"}, capture.Start)
 	_, err := adapter.Start(context.Background(), runtime.StartRequest{Metadata: map[string]string{"native_session_id": "thread-1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if capture.options.ResumeID != "thread-1" || capture.options.WorkDir != "/workspace" || capture.options.Model != "gpt-5" {
+	if capture.options.ResumeID != "thread-1" || capture.options.WorkDir != "/workspace" || capture.options.Model != "gpt-5" || capture.options.Permission != "deny" {
 		t.Fatalf("options = %#v", capture.options)
 	}
 	if !containsValue(capture.options.Env, "CODEX_HOME=/agent-home") {
@@ -46,7 +46,7 @@ func TestSessionBuildsFreshAndResumePrompts(t *testing.T) {
 	}
 
 	resumeNative := newFakeSession("thread-1")
-	resume := wrapSession(resumeNative)
+	resume := wrapSessionWithResume(resumeNative, true)
 	if err := resume.Send(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
@@ -59,10 +59,12 @@ func TestSessionMapsEventsAndDelegatesLifecycle(t *testing.T) {
 	nativeSession := newFakeSession("thread-1")
 	session := wrapSession(nativeSession)
 	nativeSession.events <- native.Event{Kind: native.EventText, Text: "text"}
+	nativeSession.events <- native.Event{Kind: native.EventToolUse, Tool: &native.ToolCall{ID: "tool-1", Name: "Bash", Arguments: map[string]any{"command": "pwd"}}}
+	nativeSession.events <- native.Event{Kind: native.EventToolResult, Tool: &native.ToolCall{ID: "tool-1", Name: "Bash", Result: "/workspace"}}
 	nativeSession.events <- native.Event{Kind: native.EventUsage, Usage: &native.Usage{InputTokens: 1, OutputTokens: 2, TotalTokens: 3}}
 	nativeSession.events <- native.Event{Kind: native.EventFinish, FinishReason: "end_turn", NativeSessionID: "thread-1"}
 	close(nativeSession.events)
-	for _, want := range []runtime.EventType{runtime.EventText, runtime.EventUsage, runtime.EventFinish} {
+	for _, want := range []runtime.EventType{runtime.EventText, runtime.EventToolUse, runtime.EventToolResult, runtime.EventUsage, runtime.EventFinish} {
 		if event := <-session.Events(); event.Type != want {
 			t.Fatalf("event type = %q, want %q", event.Type, want)
 		}

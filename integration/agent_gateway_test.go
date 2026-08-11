@@ -538,6 +538,25 @@ func TestIntegration_AbortCancelsInFlightTurn(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+
+	// A successful turn-scoped abort keeps the same Worker/session available.
+	nextBody := chatBody("codex", false, "ws-1")
+	nextBody["messages"] = []map[string]any{{"role": "user", "content": "after"}}
+	next := h.do("POST", "/v1/chat/completions", nextBody,
+		map[string]string{"X-Gateway-Session-Id": sid})
+	if next.StatusCode != http.StatusOK {
+		t.Fatalf("post-abort turn status = %d (body %s)", next.StatusCode, readBody(t, next))
+	}
+	var completion completionBody
+	if err := json.Unmarshal(readBody(t, next), &completion); err != nil {
+		t.Fatalf("decode post-abort completion: %v", err)
+	}
+	if len(completion.Choices) != 1 || completion.Choices[0].Message.Content == nil || *completion.Choices[0].Message.Content != "echo:after" {
+		t.Fatalf("post-abort content = %+v, want echo:after", completion.Choices)
+	}
+	if count := h.sup.SessionCount(); count != 1 {
+		t.Fatalf("post-abort supervisor sessions = %d, want same live execution", count)
+	}
 }
 
 // TestIntegration_WorkerCrash_ApiRemainsUsable verifies worker failures are
