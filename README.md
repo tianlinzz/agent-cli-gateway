@@ -102,9 +102,27 @@ Each completion is one complete autonomous Agent turn. Claude Code, Codex, and
 Kimi execute their own native tools inside the worker; those internal tool
 events are not returned as OpenAI `tool_calls`. Emitting them as model tool
 requests would make Agent frameworks execute an already-completed tool again
-and resubmit the same user message. A separate observability surface may expose
-native tool progress in the future without changing the chat-completions
-control flow.
+and resubmit the same user message. Display-only process summaries therefore
+remain separate from the chat-completions tool-control flow.
+
+Streaming responses expose safe Agent process information through the existing
+OpenAI-compatible `delta.reasoning_content` string. Native reasoning is emitted
+only when the Agent protocol provides content suitable for display. Each native
+tool emits at most one terminal summary after it completes, encoded as:
+
+```text
+gateway.tool_execution.v1:{"id":"tool-123","name":"Bash","status":"completed","is_error":false,"result":"/workspace"}
+```
+
+The summary is also carried in `delta.reasoning_content`; it is display and
+persistence data, not a request to execute the tool. Clients that already
+consume reasoning need no new response-field adapter. A client may recognize
+the versioned prefix for a dedicated tool view, or display it as ordinary
+reasoning text. Clients must not submit a tool-result message for this summary.
+The Gateway never emits native tools as `delta.tool_calls`, tool-role messages,
+or `finish_reason: "tool_calls"`, so an outer Agent runtime never starts a
+second tool loop. Process telemetry is streaming-only in v1; non-streaming
+responses remain final assistant text, usage, and finish reason.
 
 The concurrency boundary is explicit: there is **one active turn per session**.
 Different sessions in the **same workspace** may run concurrently and may

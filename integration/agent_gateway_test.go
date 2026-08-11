@@ -362,6 +362,57 @@ func TestIntegration_StreamCompletionEndToEnd(t *testing.T) {
 	}
 }
 
+func TestIntegration_ServerExecutedTelemetryUsesReasoningChannel(t *testing.T) {
+	h := newHarness(t, nil)
+	h.setWorkerBehavior("telemetry")
+
+	resp := h.do("POST", "/v1/chat/completions", chatBody("codex", true, "ws-telemetry"), nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	events := splitSSE(t, readBody(t, resp))
+	var reasoning []string
+	var content strings.Builder
+	var finish string
+	for _, event := range events {
+		if event == "[DONE]" {
+			continue
+		}
+		if strings.Contains(event, `"tool_calls"`) {
+			t.Fatalf("native tool leaked as client tool call: %s", event)
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(event), &chunk); err != nil || len(chunk.Choices) == 0 {
+			continue
+		}
+		reasoningContent := chunk.Choices[0].Delta.ReasoningContent
+		if reasoningContent != "" {
+			reasoning = append(reasoning, reasoningContent)
+		}
+		content.WriteString(chunk.Choices[0].Delta.Content)
+		if chunk.Choices[0].FinishReason != nil {
+			finish = *chunk.Choices[0].FinishReason
+		}
+	}
+	if len(reasoning) != 2 || reasoning[0] != "checking workspace" || !strings.HasPrefix(reasoning[1], "gateway.tool_execution.v1:") {
+		t.Fatalf("reasoning sequence = %#v", reasoning)
+	}
+	if content.String() != "echo:hello" {
+		t.Fatalf("content = %q, want echo:hello", content.String())
+	}
+	if finish != "stop" || events[len(events)-1] != "[DONE]" {
+		t.Fatalf("finish = %q, last event = %q", finish, events[len(events)-1])
+	}
+}
+
 // TestIntegration_MultiTurnResumeReusesExecution verifies a second turn on the
 // same gateway session reuses the live worker execution instead of forking a
 // new one (the stub worker is a persistent process). The gateway returns the

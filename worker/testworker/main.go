@@ -5,6 +5,7 @@
 // session whose behavior is selected by GW_TESTWORKER_BEHAVIOR:
 //
 //	(empty)|"echo"        persistent session; SendInput echoes a text event
+//	"telemetry"           emits reasoning and native tool events before text
 //	"slow-echo"           SendInput accepts the turn but delays the echo ~1.5s
 //	                      (a turn that stays in flight for abort tests)
 //	"slow-crash"          SendInput accepts the turn but the worker exits(1)
@@ -157,6 +158,13 @@ func (h *stubHandler) SendInput(_ context.Context, input runtime.Input) error {
 		text += m.Content
 	}
 	switch h.behavior {
+	case "telemetry":
+		h.emit(runtime.Event{Type: runtime.EventReasoning, Reasoning: &runtime.Reasoning{ID: "reason-1", Text: "checking workspace"}})
+		h.emit(runtime.Event{Type: runtime.EventToolUse, Tool: &runtime.ToolCall{ID: "tool-1", Name: "Bash", Arguments: map[string]any{"command": "pwd"}}})
+		h.emit(runtime.Event{Type: runtime.EventToolResult, Tool: &runtime.ToolCall{ID: "tool-1", Result: "/workspace"}})
+		h.emit(runtime.Event{Type: runtime.EventText, Text: "echo:" + text})
+		h.emit(runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"})
+		return nil
 	case "slow-echo":
 		// A turn that stays in flight long enough for an abort to land. The
 		// reply is delayed ~1.5s; the emit is guarded so it never fires after
