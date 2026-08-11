@@ -1,501 +1,267 @@
-//go:build agent_ref
-
+// Package kimi drives native Kimi Code CLI sessions.
 package kimi
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
-	"log/slog"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
-	"github.com/tianlinzz/agent-cli-gateway/core"
+	agentprocess "github.com/tianlinzz/agent-cli-gateway/agent/process"
+	agentprotocol "github.com/tianlinzz/agent-cli-gateway/agent/protocol"
 )
 
-// kimSession manages multi-turn conversations with the Kimi CLI.
-// Each Send() launches a new `kimi --prompt` process (with `--print
-// --output-format stream-json` when the installed binary still supports
-// --print) and uses --resume for conversation continuity. The exact flag
-// surface is decided by the Agent's one-shot probe; see kimiFlagSupport.
-type kimiSession struct {
-	cmd         string
-	extraArgs   []string // extra args from cmd, prepended before kimi args
-	workDir     string
-	model       string
-	mode        string
-	timeout     time.Duration
-	extraEnv    []string
-	flagSupport kimiFlagSupport
-	events      chan core.Event
-	sessionID   atomic.Value // stores string — Kimi session ID
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
-	alive       atomic.Bool
-
-	pendingMsgs []string // buffered assistant text messages
+type Session struct {
+	opts       Options
+	ctx        context.Context
+	cancel     context.CancelFunc
+	events     chan Event
+	sessionID  atomic.Value
+	alive      atomic.Bool
+	mu         sync.Mutex
+	inFlight   *agentprocess.Process
+	turnDone   map[*agentprocess.Process]chan struct{}
+	turnCancel map[*agentprocess.Process]context.CancelFunc
+	aborted    map[*agentprocess.Process]bool
+	wg         sync.WaitGroup
+	close      sync.Once
 }
 
-func newKimiSession(ctx context.Context, cmd string, extraArgs []string, workDir, model, mode, resumeID string, extraEnv []string, timeout time.Duration, flagSupport kimiFlagSupport) (*kimiSession, error) {
-	sessionCtx, cancel := context.WithCancel(ctx)
-
-	ks := &kimiSession{
-		cmd:         cmd,
-		extraArgs:   extraArgs,
-		workDir:     workDir,
-		model:       model,
-		mode:        mode,
-		timeout:     timeout,
-		extraEnv:    extraEnv,
-		flagSupport: flagSupport,
-		events:      make(chan core.Event, 64),
-		ctx:         sessionCtx,
-		cancel:      cancel,
-	}
-	ks.alive.Store(true)
-
-	if resumeID != "" && resumeID != core.ContinueSession {
-		ks.sessionID.Store(resumeID)
-	}
-
-	return ks, nil
+func New(options Options) *Session {
+	opts := NormalizeOptions(options)
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Session{opts: opts, ctx: ctx, cancel: cancel, events: make(chan Event, 64), turnDone: map[*agentprocess.Process]chan struct{}{}, turnCancel: map[*agentprocess.Process]context.CancelFunc{}, aborted: map[*agentprocess.Process]bool{}}
+	s.sessionID.Store(opts.ResumeID)
+	s.alive.Store(true)
+	return s
 }
 
-// buildArgs constructs the Kimi CLI argument slice for a single non-interactive
-// turn. Extracted from Send() so the version-aware flag selection can be unit
-// tested without launching the CLI. The `--print` flag is only emitted when
-// the locally installed binary advertises it in `kimi --help`; the newer Kimi
-// Code CLI dropped that flag and rejects it outright (see issue #1456).
-func (ks *kimiSession) buildArgs(prompt string) []string {
-	args := append([]string{}, ks.extraArgs...)
-	if ks.flagSupport.Print {
-		args = append(args, "--print")
+func (s *Session) Send(ctx context.Context, input Input) error {
+	if !s.alive.Load() {
+		return protocolError("session is closed")
 	}
-	args = append(args, "--output-format", "stream-json")
-
-	switch ks.mode {
-	case "plan":
-		args = append(args, "--plan")
-	case "quiet":
-		args = append(args, "--quiet")
+	prompt := strings.TrimSpace(input.Prompt)
+	if prompt == "" {
+		return protocolError("empty prompt")
 	}
-
-	if sid := ks.CurrentSessionID(); sid != "" {
-		args = append(args, "--resume", sid)
-	}
-	if ks.model != "" {
-		args = append(args, "--model", ks.model)
-	}
-	if ks.workDir != "" {
-		args = append(args, "--work-dir", ks.workDir)
-	}
-
-	args = append(args, "--prompt", prompt)
-	return args
-}
-
-func (ks *kimiSession) Send(prompt string, images []core.ImageAttachment, files []core.FileAttachment) error {
-	if !ks.alive.Load() {
-		return fmt.Errorf("session is closed")
-	}
-
-	// Save images and files into the workspace so Kimi CLI can access them.
-	attachDir := filepath.Join(ks.workDir, ".cc-connect", "attachments")
-	if (len(images) > 0 || len(files) > 0) && os.MkdirAll(attachDir, 0o755) != nil {
-		attachDir = os.TempDir()
-	}
-
-	var imageRefs []string
-	for i, img := range images {
-		ext := ".png"
-		switch img.MimeType {
-		case "image/jpeg":
-			ext = ".jpg"
-		case "image/gif":
-			ext = ".gif"
-		case "image/webp":
-			ext = ".webp"
+	s.mu.Lock()
+	previous := s.inFlight
+	previousDone := s.turnDone[previous]
+	s.mu.Unlock()
+	if previousDone != nil {
+		select {
+		case <-previousDone:
+		case <-ctx.Done():
+			return protocolError("wait previous turn: %w", ctx.Err())
 		}
-		fname := fmt.Sprintf("img_%d_%d%s", time.Now().UnixMilli(), i, ext)
-		fpath := filepath.Join(attachDir, fname)
-		if err := os.WriteFile(fpath, img.Data, 0o644); err != nil {
-			slog.Warn("kimiSession: failed to save image", "error", err)
-			continue
-		}
-		imageRefs = append(imageRefs, fpath)
 	}
 
-	var fileRefs []string
-	for i, f := range files {
-		fname := filepath.Base(f.FileName)
-		if fname == "" || fname == "." || fname == ".." {
-			fname = fmt.Sprintf("file_%d_%d", time.Now().UnixMilli(), i)
-		}
-		fpath := filepath.Join(attachDir, fname)
-		if err := os.WriteFile(fpath, f.Data, 0o644); err != nil {
-			slog.Warn("kimiSession: failed to save file", "error", err)
-			continue
-		}
-		fileRefs = append(fileRefs, fpath)
+	turnCtx, cancel := context.WithCancel(s.ctx)
+	if s.opts.Timeout > 0 {
+		turnCtx, cancel = context.WithTimeout(s.ctx, s.opts.Timeout)
 	}
-
-	fullPrompt := prompt
-	if len(imageRefs) > 0 {
-		if fullPrompt == "" {
-			fullPrompt = "Please analyze the attached image(s)."
-		}
-		fullPrompt += "\n\n[Attached images saved at: " + strings.Join(imageRefs, ", ") + "]"
-	}
-	if len(fileRefs) > 0 {
-		if fullPrompt == "" {
-			fullPrompt = "Please analyze the attached file(s)."
-		}
-		fullPrompt += "\n\n[Attached files saved at: " + strings.Join(fileRefs, ", ") + "]"
-	}
-
-	args := ks.buildArgs(fullPrompt)
-
-	var cancel context.CancelFunc
-	var ctx context.Context
-	if ks.timeout > 0 {
-		ctx, cancel = context.WithTimeout(ks.ctx, ks.timeout)
-	} else {
-		ctx, cancel = context.WithCancel(ks.ctx)
-	}
-
-	started := false
-	defer func() {
-		if !started {
-			cancel()
-		}
-	}()
-
-	slog.Debug("kimiSession: launching",
-		"resume", ks.CurrentSessionID() != "",
-		"supports_print", ks.flagSupport.Print,
-		"args", core.RedactArgs(args))
-	cmd := exec.CommandContext(ctx, ks.cmd, args...)
-	cmd.WaitDelay = 1 * time.Second
-	cmd.Dir = ks.workDir
-	env := os.Environ()
-	if len(ks.extraEnv) > 0 {
-		env = core.MergeEnv(env, ks.extraEnv)
-	}
-	cmd.Env = env
-
-	stdout, err := cmd.StdoutPipe()
+	command := append([]string(nil), s.opts.Command...)
+	command = append(command, BuildArgs(s.opts, prompt, s.NativeSessionID())...)
+	proc, err := agentprocess.Start(turnCtx, agentprocess.Spec{Command: command, Dir: s.opts.WorkDir, Env: s.opts.Env})
 	if err != nil {
-		return fmt.Errorf("kimiSession: stdout pipe: %w", err)
+		cancel()
+		return protocolError("start turn: %w", err)
 	}
-
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("kimiSession: start: %w", err)
+	done := make(chan struct{})
+	s.mu.Lock()
+	if s.inFlight != nil {
+		s.mu.Unlock()
+		cancel()
+		_ = proc.ForceKill()
+		_ = proc.Wait()
+		return protocolError("turn already active")
 	}
-
-	started = true
-	ks.wg.Add(1)
-	go func() {
-		defer cancel()
-		ks.readLoop(ctx, cmd, stdout, &stderrBuf, append(imageRefs, fileRefs...))
-	}()
-
+	s.inFlight = proc
+	s.turnDone[proc] = done
+	s.turnCancel[proc] = cancel
+	s.mu.Unlock()
+	s.wg.Add(1)
+	go s.readTurn(proc)
 	return nil
 }
 
-func (ks *kimiSession) readLoop(ctx context.Context, cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer, tempFiles []string) {
-	defer ks.wg.Done()
-	defer func() {
-		for _, f := range tempFiles {
-			os.Remove(f)
-		}
-	}()
+type turnState struct {
+	pending []string
+	usage   *Usage
+}
 
-	go func() {
-		<-ctx.Done()
-		stdout.Close()
-	}()
-
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
-
-	var scanErr error
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
-		}
-
-		slog.Debug("kimiSession: raw", "line", truncate(line, 500))
-
-		// Kimi prints a non-JSON line at the end: "To resume this session: kimi -r <id>"
-		if strings.HasPrefix(line, "To resume this session:") {
-			if id := extractResumeSessionID(line); id != "" {
-				ks.sessionID.Store(id)
-				slog.Debug("kimiSession: session id updated", "session_id", id)
-			}
-			continue
-		}
-
+func (s *Session) readTurn(proc *agentprocess.Process) {
+	defer s.wg.Done()
+	defer s.clearTurn(proc)
+	state := &turnState{}
+	decoder := agentprotocol.NewJSONLDecoder(proc.Stdout(), 10*1024*1024)
+	for {
 		var raw map[string]any
-		if err := json.Unmarshal([]byte(line), &raw); err != nil {
-			slog.Debug("kimiSession: non-JSON line", "line", line)
-			continue
-		}
-
-		ks.handleEvent(raw)
-	}
-	scanErr = scanner.Err()
-
-	// Wait for process exit before sending any terminal event so the engine
-	// never sees EventError after EventResult from the same turn.
-	waitErr := cmd.Wait()
-
-	// Kimi writes "To resume this session: kimi -r <uuid>" to stderr (not stdout),
-	// so the scanner above never sees it. Extract it from the captured stderr
-	// buffer before emitting EventResult so the next turn can pass --resume.
-	for _, line := range strings.Split(stderrBuf.String(), "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "To resume this session:") {
-			if id := extractResumeSessionID(line); id != "" {
-				ks.sessionID.Store(id)
-				slog.Debug("kimiSession: session id from stderr", "session_id", id)
-			}
+		err := decoder.Decode(&raw)
+		if errors.Is(err, io.EOF) {
 			break
 		}
-	}
-
-	if scanErr != nil {
-		slog.Error("kimiSession: scanner error", "error", scanErr)
-		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", scanErr)}
-		select {
-		case ks.events <- evt:
-		case <-ks.ctx.Done():
-			return
-		}
-	}
-
-	if waitErr != nil {
-		stderrMsg := strings.TrimSpace(stderrBuf.String())
-		if stderrMsg != "" {
-			slog.Error("kimiSession: process failed", "error", waitErr, "stderr", stderrMsg)
-			evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
-			select {
-			case ks.events <- evt:
-			case <-ks.ctx.Done():
-				return
+		if err != nil {
+			if !s.wasAborted(proc) {
+				s.emit(Event{Kind: EventError, Err: protocolError("decode stream: %w", err)})
 			}
-			return
+			_ = proc.ForceKill()
+			break
 		}
+		s.handleEvent(state, raw)
 	}
-
-	// Flush any remaining pending messages as text and send result event.
-	ks.flushPendingAsText()
-	evt := core.Event{Type: core.EventResult, SessionID: ks.CurrentSessionID(), Done: true}
-	select {
-	case ks.events <- evt:
-	case <-ks.ctx.Done():
+	waitErr := proc.Wait()
+	stderr := proc.StderrString()
+	if id := extractResumeID(stderr); id != "" && id != s.NativeSessionID() {
+		s.sessionID.Store(id)
+		s.emit(Event{Kind: EventNativeSession, NativeSessionID: id})
+	}
+	if waitErr != nil && !s.wasAborted(proc) && s.alive.Load() {
+		s.emit(Event{Kind: EventError, Err: protocolError("process exited: %s", strings.TrimSpace(stderr))})
+		return
+	}
+	s.flush(state)
+	s.emit(Event{Kind: EventFinish, FinishReason: "end_turn", NativeSessionID: s.NativeSessionID()})
+	if state.usage != nil {
+		s.emit(Event{Kind: EventUsage, Usage: state.usage, NativeSessionID: s.NativeSessionID()})
 	}
 }
 
-func extractResumeSessionID(line string) string {
-	// Format: "To resume this session: kimi -r <uuid>"
-	parts := strings.Fields(line)
-	for i, p := range parts {
-		if p == "-r" && i+1 < len(parts) {
-			return parts[i+1]
-		}
-	}
-	return ""
-}
-
-// Kimi CLI stream-json message roles:
-//   - "assistant": content (think + text), tool_calls
-//   - "tool":      content (tool execution result), tool_call_id
-func (ks *kimiSession) handleEvent(raw map[string]any) {
+func (s *Session) handleEvent(state *turnState, raw map[string]any) {
 	role, _ := raw["role"].(string)
-
 	switch role {
 	case "assistant":
-		ks.handleAssistant(raw)
-	case "tool":
-		ks.handleTool(raw)
-	default:
-		slog.Debug("kimiSession: unhandled role", "role", role)
-	}
-}
-
-func (ks *kimiSession) handleAssistant(raw map[string]any) {
-	content, _ := raw["content"].([]any)
-	for _, item := range content {
-		block, ok := item.(map[string]any)
-		if !ok {
-			continue
+		if usage := usageFromValue(raw["usage"]); usage != nil {
+			state.usage = usage
 		}
-		blockType, _ := block["type"].(string)
-		switch blockType {
-		case "think", "thinking":
-			if think, ok := block["think"].(string); ok && think != "" {
-				evt := core.Event{Type: core.EventThinking, Content: think}
-				select {
-				case ks.events <- evt:
-				case <-ks.ctx.Done():
-					return
-				}
-			}
-		case "text":
-			if text, ok := block["text"].(string); ok && text != "" {
-				ks.pendingMsgs = append(ks.pendingMsgs, text)
-			}
-		}
-	}
-
-	// Handle tool_calls
-	toolCalls, _ := raw["tool_calls"].([]any)
-	if len(toolCalls) > 0 {
-		ks.flushPendingAsThinking()
-		for _, tc := range toolCalls {
-			tcMap, ok := tc.(map[string]any)
+		content, _ := raw["content"].([]any)
+		for _, value := range content {
+			block, ok := value.(map[string]any)
 			if !ok {
 				continue
 			}
-			funcBlock, _ := tcMap["function"].(map[string]any)
-			toolName, _ := funcBlock["name"].(string)
-			args, _ := funcBlock["arguments"].(string)
-			toolID, _ := tcMap["id"].(string)
-
-			slog.Debug("kimiSession: tool_call", "tool", toolName, "id", toolID)
-			evt := core.Event{
-				Type:      core.EventToolUse,
-				ToolName:  toolName,
-				ToolInput: truncate(strings.TrimSpace(args), 500),
-				RequestID: toolID,
-			}
-			select {
-			case ks.events <- evt:
-			case <-ks.ctx.Done():
-				return
+			switch kind, _ := block["type"].(string); kind {
+			case "think", "thinking":
+				if text, _ := block["think"].(string); text != "" {
+					s.emit(Event{Kind: EventText, Text: text})
+				}
+			case "text":
+				if text, _ := block["text"].(string); text != "" {
+					state.pending = append(state.pending, text)
+				}
 			}
 		}
-	}
-}
-
-func (ks *kimiSession) handleTool(raw map[string]any) {
-	toolCallID, _ := raw["tool_call_id"].(string)
-	content, _ := raw["content"].([]any)
-	var outputParts []string
-	for _, item := range content {
-		block, ok := item.(map[string]any)
-		if !ok {
-			continue
+		calls, _ := raw["tool_calls"].([]any)
+		if len(calls) > 0 {
+			s.flush(state)
 		}
-		blockType, _ := block["type"].(string)
-		if blockType == "text" {
-			if text, ok := block["text"].(string); ok {
-				outputParts = append(outputParts, text)
+		for _, value := range calls {
+			call, _ := value.(map[string]any)
+			function, _ := call["function"].(map[string]any)
+			id, _ := call["id"].(string)
+			name, _ := function["name"].(string)
+			args, _ := function["arguments"].(string)
+			s.emit(Event{Kind: EventToolUse, Tool: &ToolCall{ID: id, Name: name, Arguments: toolArgs(args)}})
+		}
+	case "tool":
+		id, _ := raw["tool_call_id"].(string)
+		content, _ := raw["content"].([]any)
+		var parts []string
+		for _, value := range content {
+			if block, ok := value.(map[string]any); ok {
+				if text, _ := block["text"].(string); text != "" {
+					parts = append(parts, text)
+				}
 			}
 		}
-	}
-	output := strings.Join(outputParts, "")
-
-	if output != "" {
-		slog.Debug("kimiSession: tool result", "tool_call_id", toolCallID)
-		evt := core.Event{
-			Type:       core.EventToolResult,
-			ToolName:   toolCallID,
-			ToolResult: truncate(strings.TrimSpace(output), 500),
-		}
-		select {
-		case ks.events <- evt:
-		case <-ks.ctx.Done():
-			return
-		}
+		s.emit(Event{Kind: EventToolResult, Tool: &ToolCall{ID: id, Result: strings.Join(parts, "\n")}})
 	}
 }
 
-func (ks *kimiSession) flushPendingAsThinking() {
-	if len(ks.pendingMsgs) == 0 {
-		return
+func (s *Session) flush(state *turnState) {
+	for _, text := range state.pending {
+		s.emit(Event{Kind: EventText, Text: text})
 	}
-	text := strings.Join(ks.pendingMsgs, "")
-	ks.pendingMsgs = ks.pendingMsgs[:0]
-	if text != "" {
-		evt := core.Event{Type: core.EventThinking, Content: text}
-		select {
-		case ks.events <- evt:
-		case <-ks.ctx.Done():
-		}
+	state.pending = nil
+}
+func (s *Session) emit(event Event) {
+	select {
+	case s.events <- event:
+	case <-s.ctx.Done():
 	}
 }
+func (s *Session) Events() <-chan Event    { return s.events }
+func (s *Session) NativeSessionID() string { value, _ := s.sessionID.Load().(string); return value }
+func (s *Session) Alive() bool             { return s.alive.Load() }
 
-func (ks *kimiSession) flushPendingAsText() {
-	if len(ks.pendingMsgs) == 0 {
-		return
+func (s *Session) clearTurn(proc *agentprocess.Process) {
+	s.mu.Lock()
+	done := s.turnDone[proc]
+	cancel := s.turnCancel[proc]
+	delete(s.turnDone, proc)
+	delete(s.turnCancel, proc)
+	delete(s.aborted, proc)
+	if s.inFlight == proc {
+		s.inFlight = nil
 	}
-	text := strings.Join(ks.pendingMsgs, "")
-	ks.pendingMsgs = ks.pendingMsgs[:0]
-	if text != "" {
-		evt := core.Event{Type: core.EventText, Content: text}
-		select {
-		case ks.events <- evt:
-		case <-ks.ctx.Done():
-		}
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
-}
-
-// RespondPermission is a no-op — Kimi CLI auto-approves tool calls in
-// non-interactive mode. The legacy kimi-cli triggers this via --print's
-// implicit --yolo; the newer Kimi Code CLI does it implicitly when invoked
-// with --prompt (its "auto" permission default). Either way, cc-connect
-// never sees an interactive permission request from Kimi.
-func (ks *kimiSession) RespondPermission(_ string, _ core.PermissionResult) error {
-	return nil
-}
-
-func (ks *kimiSession) Events() <-chan core.Event {
-	return ks.events
-}
-
-func (ks *kimiSession) CurrentSessionID() string {
-	v, _ := ks.sessionID.Load().(string)
-	return v
-}
-
-func (ks *kimiSession) Alive() bool {
-	return ks.alive.Load()
-}
-
-func (ks *kimiSession) Close() error {
-	ks.alive.Store(false)
-	ks.cancel()
-	done := make(chan struct{})
-	go func() {
-		ks.wg.Wait()
+	if done != nil {
 		close(done)
-	}()
+	}
+}
+func (s *Session) wasAborted(proc *agentprocess.Process) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.aborted[proc]
+}
+
+func (s *Session) Abort(ctx context.Context) error {
+	s.mu.Lock()
+	proc := s.inFlight
+	if proc == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	s.aborted[proc] = true
+	done := s.turnDone[proc]
+	s.mu.Unlock()
+	if err := proc.ForceKill(); err != nil {
+		return protocolError("abort: %w", err)
+	}
 	select {
 	case <-done:
-		close(ks.events)
-	case <-time.After(8 * time.Second):
-		slog.Warn("kimiSession: close timed out, abandoning wg.Wait")
+		return nil
+	case <-ctx.Done():
+		return protocolError("abort wait: %w", ctx.Err())
 	}
-	return nil
 }
 
-func truncate(s string, maxRunes int) string {
-	if utf8.RuneCountInString(s) <= maxRunes {
-		return s
+func (s *Session) Close(ctx context.Context) error {
+	if !s.alive.Swap(false) {
+		return nil
 	}
-	return string([]rune(s)[:maxRunes]) + "..."
+	s.cancel()
+	s.mu.Lock()
+	proc := s.inFlight
+	s.mu.Unlock()
+	if proc != nil {
+		_ = proc.ForceKill()
+	}
+	done := make(chan struct{})
+	go func() { s.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return protocolError("close wait: %w", ctx.Err())
+	case <-time.After(8 * time.Second):
+		return protocolError("close timed out")
+	}
+	s.close.Do(func() { close(s.events) })
+	return nil
 }
