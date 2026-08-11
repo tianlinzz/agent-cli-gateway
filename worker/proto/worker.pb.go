@@ -1056,6 +1056,59 @@ func (x *Usage) GetTotalTokens() int32 {
 	return 0
 }
 
+// Reasoning carries safe, displayable native Agent reasoning text.
+type Reasoning struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Text          string                 `protobuf:"bytes,2,opt,name=text,proto3" json:"text,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Reasoning) Reset() {
+	*x = Reasoning{}
+	mi := &file_worker_proto_worker_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Reasoning) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Reasoning) ProtoMessage() {}
+
+func (x *Reasoning) ProtoReflect() protoreflect.Message {
+	mi := &file_worker_proto_worker_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Reasoning.ProtoReflect.Descriptor instead.
+func (*Reasoning) Descriptor() ([]byte, []int) {
+	return file_worker_proto_worker_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *Reasoning) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *Reasoning) GetText() string {
+	if x != nil {
+		return x.Text
+	}
+	return ""
+}
+
 // EventFrame is one canonical runtime event (runtime.Event) serialized over
 // the wire. type is the runtime.EventType string.
 type EventFrame struct {
@@ -1069,13 +1122,14 @@ type EventFrame struct {
 	FinishReason    string                 `protobuf:"bytes,7,opt,name=finish_reason,json=finishReason,proto3" json:"finish_reason,omitempty"`
 	Status          string                 `protobuf:"bytes,8,opt,name=status,proto3" json:"status,omitempty"`
 	NativeSessionId string                 `protobuf:"bytes,9,opt,name=native_session_id,json=nativeSessionId,proto3" json:"native_session_id,omitempty"`
+	Reasoning       *Reasoning             `protobuf:"bytes,10,opt,name=reasoning,proto3" json:"reasoning,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
 
 func (x *EventFrame) Reset() {
 	*x = EventFrame{}
-	mi := &file_worker_proto_worker_proto_msgTypes[18]
+	mi := &file_worker_proto_worker_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1087,7 +1141,7 @@ func (x *EventFrame) String() string {
 func (*EventFrame) ProtoMessage() {}
 
 func (x *EventFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_worker_proto_worker_proto_msgTypes[18]
+	mi := &file_worker_proto_worker_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1100,7 +1154,7 @@ func (x *EventFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EventFrame.ProtoReflect.Descriptor instead.
 func (*EventFrame) Descriptor() ([]byte, []int) {
-	return file_worker_proto_worker_proto_rawDescGZIP(), []int{18}
+	return file_worker_proto_worker_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *EventFrame) GetType() string {
@@ -1164,6 +1218,13 @@ func (x *EventFrame) GetNativeSessionId() string {
 		return x.NativeSessionId
 	}
 	return ""
+}
+
+func (x *EventFrame) GetReasoning() *Reasoning {
+	if x != nil {
+		return x.Reasoning
+	}
+	return nil
 }
 
 var File_worker_proto_worker_proto protoreflect.FileDescriptor
@@ -1254,7 +1315,10 @@ const file_worker_proto_worker_proto_rawDesc = "" +
 	"\x05Usage\x12!\n" +
 	"\finput_tokens\x18\x01 \x01(\x05R\vinputTokens\x12#\n" +
 	"\routput_tokens\x18\x02 \x01(\x05R\foutputTokens\x12!\n" +
-	"\ftotal_tokens\x18\x03 \x01(\x05R\vtotalTokens\"\xd1\x02\n" +
+	"\ftotal_tokens\x18\x03 \x01(\x05R\vtotalTokens\"/\n" +
+	"\tReasoning\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
+	"\x04text\x18\x02 \x01(\tR\x04text\"\x8a\x03\n" +
 	"\n" +
 	"EventFrame\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x12\n" +
@@ -1267,7 +1331,9 @@ const file_worker_proto_worker_proto_rawDesc = "" +
 	"\x05error\x18\x06 \x01(\tR\x05error\x12#\n" +
 	"\rfinish_reason\x18\a \x01(\tR\ffinishReason\x12\x16\n" +
 	"\x06status\x18\b \x01(\tR\x06status\x12*\n" +
-	"\x11native_session_id\x18\t \x01(\tR\x0fnativeSessionId2\x87\x04\n" +
+	"\x11native_session_id\x18\t \x01(\tR\x0fnativeSessionId\x127\n" +
+	"\treasoning\x18\n" +
+	" \x01(\v2\x19.gateway.worker.ReasoningR\treasoning2\x87\x04\n" +
 	"\x06Worker\x12G\n" +
 	"\x06Health\x12\x1d.gateway.worker.HealthRequest\x1a\x1e.gateway.worker.HealthResponse\x12Y\n" +
 	"\fStartSession\x12#.gateway.worker.StartSessionRequest\x1a$.gateway.worker.StartSessionResponse\x12P\n" +
@@ -1288,7 +1354,7 @@ func file_worker_proto_worker_proto_rawDescGZIP() []byte {
 	return file_worker_proto_worker_proto_rawDescData
 }
 
-var file_worker_proto_worker_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+var file_worker_proto_worker_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
 var file_worker_proto_worker_proto_goTypes = []any{
 	(*HealthRequest)(nil),        // 0: gateway.worker.HealthRequest
 	(*HealthResponse)(nil),       // 1: gateway.worker.HealthResponse
@@ -1308,44 +1374,46 @@ var file_worker_proto_worker_proto_goTypes = []any{
 	(*ToolCall)(nil),             // 15: gateway.worker.ToolCall
 	(*PermissionRequest)(nil),    // 16: gateway.worker.PermissionRequest
 	(*Usage)(nil),                // 17: gateway.worker.Usage
-	(*EventFrame)(nil),           // 18: gateway.worker.EventFrame
-	nil,                          // 19: gateway.worker.StartSessionRequest.MetadataEntry
-	nil,                          // 20: gateway.worker.AgentExecutionConfig.EnvEntry
-	nil,                          // 21: gateway.worker.Input.MetadataEntry
-	(*structpb.Struct)(nil),      // 22: google.protobuf.Struct
+	(*Reasoning)(nil),            // 18: gateway.worker.Reasoning
+	(*EventFrame)(nil),           // 19: gateway.worker.EventFrame
+	nil,                          // 20: gateway.worker.StartSessionRequest.MetadataEntry
+	nil,                          // 21: gateway.worker.AgentExecutionConfig.EnvEntry
+	nil,                          // 22: gateway.worker.Input.MetadataEntry
+	(*structpb.Struct)(nil),      // 23: google.protobuf.Struct
 }
 var file_worker_proto_worker_proto_depIdxs = []int32{
-	19, // 0: gateway.worker.StartSessionRequest.metadata:type_name -> gateway.worker.StartSessionRequest.MetadataEntry
+	20, // 0: gateway.worker.StartSessionRequest.metadata:type_name -> gateway.worker.StartSessionRequest.MetadataEntry
 	12, // 1: gateway.worker.StartSessionRequest.first_input:type_name -> gateway.worker.Input
 	3,  // 2: gateway.worker.StartSessionRequest.agent_config:type_name -> gateway.worker.AgentExecutionConfig
-	20, // 3: gateway.worker.AgentExecutionConfig.env:type_name -> gateway.worker.AgentExecutionConfig.EnvEntry
+	21, // 3: gateway.worker.AgentExecutionConfig.env:type_name -> gateway.worker.AgentExecutionConfig.EnvEntry
 	12, // 4: gateway.worker.SendInputRequest.input:type_name -> gateway.worker.Input
 	13, // 5: gateway.worker.Input.messages:type_name -> gateway.worker.Message
 	14, // 6: gateway.worker.Input.tools:type_name -> gateway.worker.Tool
-	21, // 7: gateway.worker.Input.metadata:type_name -> gateway.worker.Input.MetadataEntry
+	22, // 7: gateway.worker.Input.metadata:type_name -> gateway.worker.Input.MetadataEntry
 	15, // 8: gateway.worker.Message.tool_calls:type_name -> gateway.worker.ToolCall
-	22, // 9: gateway.worker.Tool.parameters:type_name -> google.protobuf.Struct
-	22, // 10: gateway.worker.ToolCall.arguments:type_name -> google.protobuf.Struct
+	23, // 9: gateway.worker.Tool.parameters:type_name -> google.protobuf.Struct
+	23, // 10: gateway.worker.ToolCall.arguments:type_name -> google.protobuf.Struct
 	15, // 11: gateway.worker.EventFrame.tool:type_name -> gateway.worker.ToolCall
 	16, // 12: gateway.worker.EventFrame.permission:type_name -> gateway.worker.PermissionRequest
 	17, // 13: gateway.worker.EventFrame.usage:type_name -> gateway.worker.Usage
-	0,  // 14: gateway.worker.Worker.Health:input_type -> gateway.worker.HealthRequest
-	2,  // 15: gateway.worker.Worker.StartSession:input_type -> gateway.worker.StartSessionRequest
-	5,  // 16: gateway.worker.Worker.SendInput:input_type -> gateway.worker.SendInputRequest
-	7,  // 17: gateway.worker.Worker.StreamEvents:input_type -> gateway.worker.StreamEventsRequest
-	8,  // 18: gateway.worker.Worker.AbortSession:input_type -> gateway.worker.AbortSessionRequest
-	10, // 19: gateway.worker.Worker.CloseSession:input_type -> gateway.worker.CloseSessionRequest
-	1,  // 20: gateway.worker.Worker.Health:output_type -> gateway.worker.HealthResponse
-	4,  // 21: gateway.worker.Worker.StartSession:output_type -> gateway.worker.StartSessionResponse
-	6,  // 22: gateway.worker.Worker.SendInput:output_type -> gateway.worker.SendInputResponse
-	18, // 23: gateway.worker.Worker.StreamEvents:output_type -> gateway.worker.EventFrame
-	9,  // 24: gateway.worker.Worker.AbortSession:output_type -> gateway.worker.AbortSessionResponse
-	11, // 25: gateway.worker.Worker.CloseSession:output_type -> gateway.worker.CloseSessionResponse
-	20, // [20:26] is the sub-list for method output_type
-	14, // [14:20] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	18, // 14: gateway.worker.EventFrame.reasoning:type_name -> gateway.worker.Reasoning
+	0,  // 15: gateway.worker.Worker.Health:input_type -> gateway.worker.HealthRequest
+	2,  // 16: gateway.worker.Worker.StartSession:input_type -> gateway.worker.StartSessionRequest
+	5,  // 17: gateway.worker.Worker.SendInput:input_type -> gateway.worker.SendInputRequest
+	7,  // 18: gateway.worker.Worker.StreamEvents:input_type -> gateway.worker.StreamEventsRequest
+	8,  // 19: gateway.worker.Worker.AbortSession:input_type -> gateway.worker.AbortSessionRequest
+	10, // 20: gateway.worker.Worker.CloseSession:input_type -> gateway.worker.CloseSessionRequest
+	1,  // 21: gateway.worker.Worker.Health:output_type -> gateway.worker.HealthResponse
+	4,  // 22: gateway.worker.Worker.StartSession:output_type -> gateway.worker.StartSessionResponse
+	6,  // 23: gateway.worker.Worker.SendInput:output_type -> gateway.worker.SendInputResponse
+	19, // 24: gateway.worker.Worker.StreamEvents:output_type -> gateway.worker.EventFrame
+	9,  // 25: gateway.worker.Worker.AbortSession:output_type -> gateway.worker.AbortSessionResponse
+	11, // 26: gateway.worker.Worker.CloseSession:output_type -> gateway.worker.CloseSessionResponse
+	21, // [21:27] is the sub-list for method output_type
+	15, // [15:21] is the sub-list for method input_type
+	15, // [15:15] is the sub-list for extension type_name
+	15, // [15:15] is the sub-list for extension extendee
+	0,  // [0:15] is the sub-list for field type_name
 }
 
 func init() { file_worker_proto_worker_proto_init() }
@@ -1359,7 +1427,7 @@ func file_worker_proto_worker_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_worker_proto_worker_proto_rawDesc), len(file_worker_proto_worker_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   22,
+			NumMessages:   23,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

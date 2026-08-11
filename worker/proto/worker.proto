@@ -152,6 +152,12 @@ message Usage {
   int32 total_tokens = 3;
 }
 
+// Reasoning carries safe, displayable native Agent reasoning text.
+message Reasoning {
+  string id = 1;
+  string text = 2;
+}
+
 // EventFrame is one canonical runtime event (runtime.Event) serialized over
 // the wire. type is the runtime.EventType string.
 message EventFrame {
@@ -164,4 +170,5 @@ message EventFrame {
   string finish_reason = 7;
   string status = 8;
   string native_session_id = 9;
+  Reasoning reasoning = 10;
 }

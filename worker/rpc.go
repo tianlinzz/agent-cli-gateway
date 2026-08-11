@@ -500,6 +500,9 @@ func toFrame(ev runtime.Event) (*workerpb.EventFrame, error) {
 			TotalTokens:  int32(ev.Usage.TotalTokens),
 		}
 	}
+	if ev.Reasoning != nil {
+		f.Reasoning = &workerpb.Reasoning{Id: ev.Reasoning.ID, Text: ev.Reasoning.Text}
+	}
 	return f, nil
 }
 
@@ -537,6 +540,9 @@ func fromFrame(f *workerpb.EventFrame) runtime.Event {
 			OutputTokens: int(f.Usage.OutputTokens),
 			TotalTokens:  int(f.Usage.TotalTokens),
 		}
+	}
+	if f.Reasoning != nil {
+		ev.Reasoning = &runtime.Reasoning{ID: f.Reasoning.Id, Text: f.Reasoning.Text}
 	}
 	return ev
 }
