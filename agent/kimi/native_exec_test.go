@@ -21,9 +21,9 @@ func TestBuildArgsUsesPersistentACP(t *testing.T) {
 }
 
 func TestBuildArgsPassesConfiguredModelToACP(t *testing.T) {
-	got := strings.Join(BuildArgs(Options{Model: "eepseek-v4-flash"}, "", ""), " ")
-	if got != "--model eepseek-v4-flash acp" {
-		t.Fatalf("args = %q, want --model eepseek-v4-flash acp", got)
+	got := strings.Join(BuildArgs(Options{Model: "deepseek-v4-flash"}, "", ""), " ")
+	if got != "--model deepseek-v4-flash acp" {
+		t.Fatalf("args = %q, want --model deepseek-v4-flash acp", got)
 	}
 }
 

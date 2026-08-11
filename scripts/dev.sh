@@ -95,7 +95,7 @@ enabled = $KIMI_ENABLED
 command = "$(toml_quote "$KIMI_COMMAND")"
 permission = "auto"
 timeout = "30m"
-models = ["kimi-k3", "eepseek-v4-flash"]
+models = ["kimi-k3", "deepseek-v4-flash"]
 EOF
 
 echo "==> 启动 Gateway"
