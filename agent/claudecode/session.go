@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -17,6 +18,13 @@ import (
 	agentprotocol "github.com/tianlinzz/agent-cli-gateway/agent/protocol"
 )
 
+type activeTurn struct {
+	done        chan struct{}
+	abortOnce   sync.Once
+	abortErr    error
+	interrupted atomic.Bool
+}
+
 // Session owns one persistent Claude Code CLI process.
 type Session struct {
 	opts       Options
@@ -26,9 +34,13 @@ type Session struct {
 	cancel     context.CancelFunc
 	done       chan struct{}
 	stdinMu    sync.Mutex
+	turnMu     sync.Mutex
+	turn       *activeTurn
+	pendingMu  sync.Mutex
+	pending    map[string]chan controlResponse
+	requestSeq atomic.Uint64
 	sessionID  atomic.Value
 	alive      atomic.Bool
-	aborted    atomic.Bool
 	closing    atomic.Bool
 	closeOnce  sync.Once
 	promptFile string
@@ -82,10 +94,17 @@ func Start(ctx context.Context, options Options) (*Session, error) {
 		done:       make(chan struct{}),
 		promptFile: promptFile,
 		secrets:    secretValues(opts.Env),
+		pending:    make(map[string]chan controlResponse),
 	}
 	session.sessionID.Store(opts.ResumeID)
 	session.alive.Store(true)
 	go session.readLoop()
+	if err := session.requestControl(ctx, "initialize"); err != nil {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = session.Close(closeCtx)
+		closeCancel()
+		return nil, protocolError("initialize control protocol: %w", err)
+	}
 	return session, nil
 }
 
@@ -110,7 +129,7 @@ func (s *Session) readLoop() {
 			break
 		}
 		if err != nil {
-			if !s.aborted.Load() && !s.closing.Load() {
+			if !s.closing.Load() {
 				s.emit(Event{Kind: EventError, Err: protocolError("decode stream: %w", err)})
 			}
 			break
@@ -123,7 +142,7 @@ func (s *Session) readLoop() {
 func (s *Session) finish() {
 	s.alive.Store(false)
 	waitErr := s.process.Wait()
-	if waitErr != nil && !s.aborted.Load() && !s.closing.Load() {
+	if waitErr != nil && !s.closing.Load() {
 		message := strings.TrimSpace(redactText(s.process.StderrString(), s.secrets))
 		if message == "" {
 			message = waitErr.Error()
@@ -152,6 +171,8 @@ func (s *Session) handleFrame(raw map[string]any) {
 		s.handleResult(raw)
 	case "control_request":
 		s.handleControlRequest(raw)
+	case "control_response":
+		s.handleControlResponse(raw)
 	case "control_cancel_request":
 		return
 	default:
@@ -212,9 +233,40 @@ func (s *Session) handleResult(raw map[string]any) {
 		return
 	}
 	input, output, _, _ := parseUsageMap(raw["usage"])
-	s.emit(Event{Kind: EventFinish, FinishReason: "end_turn", NativeSessionID: s.NativeSessionID()})
+	turn := s.currentTurn()
+	finishReason := "end_turn"
+	if turn != nil && turn.interrupted.Load() {
+		finishReason = "cancelled"
+	}
+	s.emit(Event{Kind: EventFinish, FinishReason: finishReason, NativeSessionID: s.NativeSessionID()})
 	if total := input + output; total > 0 {
 		s.emit(Event{Kind: EventUsage, Usage: &Usage{InputTokens: input, OutputTokens: output, TotalTokens: total}, NativeSessionID: s.NativeSessionID()})
+	}
+	s.finishTurn(turn)
+}
+
+type controlResponse struct {
+	subtype string
+	err     string
+}
+
+func (s *Session) handleControlResponse(raw map[string]any) {
+	response, _ := raw["response"].(map[string]any)
+	requestID, _ := response["request_id"].(string)
+	if requestID == "" {
+		return
+	}
+	result := controlResponse{}
+	result.subtype, _ = response["subtype"].(string)
+	result.err, _ = response["error"].(string)
+	s.pendingMu.Lock()
+	pending := s.pending[requestID]
+	s.pendingMu.Unlock()
+	if pending != nil {
+		select {
+		case pending <- result:
+		default:
+		}
 	}
 }
 
@@ -272,10 +324,49 @@ func (s *Session) Send(_ context.Context, input Input) error {
 	if strings.TrimSpace(input.Prompt) == "" {
 		return protocolError("empty prompt")
 	}
-	return s.writeJSON(map[string]any{
+	s.turnMu.Lock()
+	if s.turn != nil {
+		s.turnMu.Unlock()
+		return protocolError("turn already active")
+	}
+	turn := &activeTurn{done: make(chan struct{})}
+	s.turn = turn
+	s.turnMu.Unlock()
+	if err := s.writeJSON(map[string]any{
 		"type":    "user",
 		"message": map[string]any{"role": "user", "content": input.Prompt},
-	})
+	}); err != nil {
+		s.clearTurn(turn)
+		return err
+	}
+	return nil
+}
+
+func (s *Session) currentTurn() *activeTurn {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	return s.turn
+}
+
+func (s *Session) finishTurn(turn *activeTurn) {
+	if turn == nil {
+		return
+	}
+	s.turnMu.Lock()
+	if s.turn == turn {
+		s.turn = nil
+		close(turn.done)
+	}
+	s.turnMu.Unlock()
+}
+
+func (s *Session) clearTurn(turn *activeTurn) {
+	s.turnMu.Lock()
+	if s.turn == turn {
+		s.turn = nil
+		close(turn.done)
+	}
+	s.turnMu.Unlock()
 }
 
 func (s *Session) writeJSON(value any) error {
@@ -310,22 +401,88 @@ func (s *Session) emit(event Event) {
 	}
 }
 
-// Abort terminates an in-flight execution because Claude stream-json has no
-// protocol-level turn cancellation. It does not report success until the
-// native process has been reaped.
+// Abort interrupts only the active turn through Claude's bidirectional
+// control protocol. It waits for the turn's result so a later Send cannot race
+// with stale events, while the persistent native process remains alive.
 func (s *Session) Abort(ctx context.Context) error {
 	if !s.alive.Load() {
 		return nil
 	}
-	s.aborted.Store(true)
+	turn := s.currentTurn()
+	if turn == nil {
+		return nil
+	}
+	turn.abortOnce.Do(func() { turn.abortErr = s.interruptTurn(ctx, turn) })
+	return turn.abortErr
+}
+
+func (s *Session) interruptTurn(ctx context.Context, turn *activeTurn) error {
+	select {
+	case <-turn.done:
+		return nil
+	default:
+	}
+	turn.interrupted.Store(true)
+	if err := s.requestControl(ctx, "interrupt"); err != nil {
+		turn.interrupted.Store(false)
+		select {
+		case <-turn.done:
+			return nil
+		default:
+		}
+		return s.interruptEscalation(ctx, err)
+	}
+	select {
+	case <-turn.done:
+		return nil
+	case <-ctx.Done():
+		return s.interruptEscalation(ctx, protocolError("interrupt settle: %w", ctx.Err()))
+	}
+}
+
+func (s *Session) interruptEscalation(ctx context.Context, cause error) error {
 	if err := s.process.ForceKill(); err != nil {
-		return protocolError("abort process: %w", err)
+		return protocolError("interrupt failed (%v), force kill: %w", cause, err)
 	}
 	select {
 	case <-s.done:
+		return cause
+	case <-ctx.Done():
+		return protocolError("interrupt failed (%v), reap: %w", cause, ctx.Err())
+	}
+}
+
+func (s *Session) requestControl(ctx context.Context, subtype string) error {
+	requestID := fmt.Sprintf("gateway-%d", s.requestSeq.Add(1))
+	response := make(chan controlResponse, 1)
+	s.pendingMu.Lock()
+	s.pending[requestID] = response
+	s.pendingMu.Unlock()
+	defer func() {
+		s.pendingMu.Lock()
+		delete(s.pending, requestID)
+		s.pendingMu.Unlock()
+	}()
+	if err := s.writeJSON(map[string]any{
+		"type":       "control_request",
+		"request_id": requestID,
+		"request":    map[string]any{"subtype": subtype},
+	}); err != nil {
+		return protocolError("%s request: %w", subtype, err)
+	}
+	select {
+	case result := <-response:
+		if result.subtype != "success" {
+			if result.err == "" {
+				result.err = result.subtype
+			}
+			return protocolError("%s rejected: %s", subtype, result.err)
+		}
 		return nil
 	case <-ctx.Done():
-		return protocolError("abort wait: %w", ctx.Err())
+		return protocolError("%s response: %w", subtype, ctx.Err())
+	case <-s.done:
+		return protocolError("%s response: process exited", subtype)
 	}
 }
 

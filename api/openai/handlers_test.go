@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,11 +38,12 @@ func (a *fakeAdapter) Start(ctx context.Context, req runtime.StartRequest) (runt
 }
 
 type fakeHandle struct {
-	mu     sync.Mutex
-	sends  int
-	dead   bool                // true = the worker/CLI exited; Send fails terminally
-	script func(h *fakeHandle) // runs once per Send, in a goroutine
-	events chan runtime.Event
+	mu      sync.Mutex
+	sends   int
+	dead    bool                // true = the worker/CLI exited; Send fails terminally
+	script  func(h *fakeHandle) // runs once per Send, in a goroutine
+	onAbort func(h *fakeHandle)
+	events  chan runtime.Event
 
 	abortOnce sync.Once
 	aborted   chan struct{}
@@ -110,11 +112,27 @@ func (h *fakeHandle) emitThenClose(evs ...runtime.Event) {
 func (h *fakeHandle) Events() <-chan runtime.Event { return h.events }
 
 func (h *fakeHandle) Abort(ctx context.Context) error {
-	h.abortOnce.Do(func() { close(h.aborted) })
+	h.abortOnce.Do(func() {
+		h.mu.Lock()
+		onAbort := h.onAbort
+		h.mu.Unlock()
+		if onAbort != nil {
+			onAbort(h)
+		} else {
+			h.emit(runtime.Event{Type: runtime.EventFinish, FinishReason: "cancelled"})
+		}
+		close(h.aborted)
+	})
 	return nil
 }
 
 func (h *fakeHandle) Aborted() <-chan struct{} { return h.aborted }
+
+func (h *fakeHandle) setOnAbort(onAbort func(h *fakeHandle)) {
+	h.mu.Lock()
+	h.onAbort = onAbort
+	h.mu.Unlock()
+}
 
 func (h *fakeHandle) Close(ctx context.Context) error {
 	h.closeOnce.Do(func() { close(h.closed) })
@@ -1071,6 +1089,184 @@ func TestClientDisconnect_AbortsTurn(t *testing.T) {
 	_ = resp
 }
 
+func TestClientDisconnect_DrainsCancelledTurnBeforeNextTurn(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(h *fakeHandle) {
+		if h.SendCount() == 2 {
+			h.emit(
+				runtime.Event{Type: runtime.EventText, Text: "second-answer"},
+				runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"},
+			)
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	body, err := json.Marshal(chatReq("codex", true, defaultMessages()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", ts.URL+"/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	req.Header.Set("Content-Type", "application/json")
+	response := make(chan *http.Response, 1)
+	requestErr := make(chan error, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			requestErr <- err
+			return
+		}
+		response <- resp
+	}()
+	var firstResp *http.Response
+	select {
+	case firstResp = <-response:
+	case err := <-requestErr:
+		t.Fatalf("first stream request: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("first stream did not return response headers")
+	}
+
+	var sid string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		started := backend.StartRequests()
+		if len(started) > 0 {
+			sid = started[0].SessionID
+			if h := backend.Handle(sid); h != nil && h.SendCount() == 1 {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sid == "" {
+		t.Fatal("first turn did not start")
+	}
+	handle := backend.Handle(sid)
+	handle.setOnAbort(func(h *fakeHandle) {
+		h.emit(runtime.Event{Type: runtime.EventFinish, FinishReason: "cancelled"})
+	})
+	cancel()
+	firstResp.Body.Close()
+	select {
+	case <-handle.Aborted():
+	case <-time.After(3 * time.Second):
+		t.Fatal("first turn was not aborted")
+	}
+
+	resp2 := doAuthJSONH(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", false, defaultMessages()), map[string]string{"X-Gateway-Session-Id": sid})
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("second turn status = %d (body %s)", resp2.StatusCode, readBody(t, resp2))
+	}
+	var completion completionBody
+	if err := json.NewDecoder(resp2.Body).Decode(&completion); err != nil {
+		t.Fatal(err)
+	}
+	if len(completion.Choices) != 1 || completion.Choices[0].Message.Content == nil || *completion.Choices[0].Message.Content != "second-answer" {
+		t.Fatalf("second turn response = %#v, want second-answer", completion)
+	}
+}
+
+type backpressuredAbortHandle struct {
+	events chan runtime.Event
+}
+
+type slowSuccessfulAbortHandle struct {
+	events chan runtime.Event
+	closed atomic.Bool
+}
+
+type delayedTerminalAbortHandle struct {
+	events chan runtime.Event
+	closed atomic.Bool
+}
+
+func (h *delayedTerminalAbortHandle) Send(context.Context, runtime.Input) error { return nil }
+func (h *delayedTerminalAbortHandle) Events() <-chan runtime.Event              { return h.events }
+func (h *delayedTerminalAbortHandle) Abort(context.Context) error {
+	go func() {
+		time.Sleep(700 * time.Millisecond)
+		h.events <- runtime.Event{Type: runtime.EventFinish, FinishReason: "cancelled"}
+	}()
+	return nil
+}
+func (h *delayedTerminalAbortHandle) Close(context.Context) error {
+	h.closed.Store(true)
+	return nil
+}
+
+func (h *slowSuccessfulAbortHandle) Send(context.Context, runtime.Input) error { return nil }
+func (h *slowSuccessfulAbortHandle) Events() <-chan runtime.Event              { return h.events }
+func (h *slowSuccessfulAbortHandle) Abort(ctx context.Context) error {
+	timer := time.NewTimer(5200 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		h.events <- runtime.Event{Type: runtime.EventFinish, FinishReason: "cancelled"}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func (h *slowSuccessfulAbortHandle) Close(context.Context) error {
+	h.closed.Store(true)
+	return nil
+}
+
+func (h *backpressuredAbortHandle) Send(context.Context, runtime.Input) error { return nil }
+func (h *backpressuredAbortHandle) Events() <-chan runtime.Event              { return h.events }
+func (h *backpressuredAbortHandle) Close(context.Context) error               { return nil }
+func (h *backpressuredAbortHandle) Abort(context.Context) error {
+	h.events <- runtime.Event{Type: runtime.EventFinish, FinishReason: "cancelled"}
+	return nil
+}
+
+func TestAbortAndDrainConsumesEventsWhileAbortIsRunning(t *testing.T) {
+	h, _ := newTestHandler(t, nil)
+	handle := &backpressuredAbortHandle{events: make(chan runtime.Event)}
+	done := make(chan struct{})
+	go func() {
+		h.abortAndDrain(context.Background(), "backpressure", handle)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("abortAndDrain deadlocked while Abort waited for event consumption")
+	}
+}
+
+func TestAbortAndDrainAllowsClaudeInterruptLongerThanFiveSeconds(t *testing.T) {
+	h, _ := newTestHandler(t, nil)
+	handle := &slowSuccessfulAbortHandle{events: make(chan runtime.Event)}
+	h.abortAndDrain(context.Background(), "slow-interrupt", handle)
+	if handle.closed.Load() {
+		t.Fatal("execution was closed before the native interrupt could settle")
+	}
+}
+
+func TestAbortAndDrainWaitsForDelayedTerminalEvent(t *testing.T) {
+	h, _ := newTestHandler(t, nil)
+	handle := &delayedTerminalAbortHandle{events: make(chan runtime.Event, 1)}
+	started := time.Now()
+	h.abortAndDrain(context.Background(), "delayed-terminal", handle)
+	if elapsed := time.Since(started); elapsed < 700*time.Millisecond {
+		t.Fatalf("abortAndDrain returned before terminal event arrived: %s", elapsed)
+	}
+	if handle.closed.Load() {
+		t.Fatal("execution was closed despite receiving the delayed terminal event")
+	}
+	select {
+	case event := <-handle.events:
+		t.Fatalf("terminal event leaked into the next turn: %#v", event)
+	default:
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Abort endpoint
 // ---------------------------------------------------------------------------
@@ -1288,6 +1484,66 @@ func TestDeadHandleBetweenTurns_RecoversWithFreshExecution(t *testing.T) {
 	}
 	if fresh.SendCount() != 1 {
 		t.Errorf("fresh handle sends = %d, want 1 (the turn was delivered to the fresh execution)", fresh.SendCount())
+	}
+}
+
+type racingDeadHandle struct {
+	*fakeHandle
+	done        chan struct{}
+	terminating atomic.Bool
+}
+
+func newRacingDeadHandle() *racingDeadHandle {
+	return &racingDeadHandle{fakeHandle: newFakeHandle(nil), done: make(chan struct{})}
+}
+
+func (h *racingDeadHandle) Send(context.Context, runtime.Input) error {
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		h.terminating.Store(true)
+		time.Sleep(500 * time.Millisecond)
+		h.markDead()
+		close(h.done)
+	}()
+	return errors.New("worker transport closed before supervisor published termination")
+}
+
+func (h *racingDeadHandle) Done() <-chan struct{} { return h.done }
+func (h *racingDeadHandle) Terminating() bool     { return h.terminating.Load() }
+
+// TestDeadHandleSendRace_WaitsForTerminationAndRecovers covers the real
+// worker-exit race: Send observes the broken transport just before the
+// supervisor publishes Closed. The turn must wait for that terminal signal,
+// replace the stale handle, and deliver the input to a fresh execution.
+func TestDeadHandleSendRace_WaitsForTerminationAndRecovers(t *testing.T) {
+	h, backend := newTestHandler(t, nil)
+	backend.withScript(func(fresh *fakeHandle) {
+		fresh.emit(runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"})
+	})
+	stale := newRacingDeadHandle()
+	h.registerHandle("session-race", stale)
+	startReq := runtime.StartRequest{
+		ModelID: "codex", SessionID: "session-race", CallerID: testOwner, WorkspaceID: testWorkspace,
+		Metadata: map[string]string{"native_session_id": "native-existing"},
+	}
+
+	fresh, err := h.deliverTurn(context.Background(), "session-race", stale, startReq, runtime.Input{
+		Messages: []runtime.Message{{Role: "user", Content: "second turn"}},
+	})
+	if err != nil {
+		t.Fatalf("deliver second turn during worker termination race: %v", err)
+	}
+	if fresh == stale {
+		t.Fatal("stale execution handle was not replaced")
+	}
+	if got := len(backend.StartRequests()); got != 1 {
+		t.Fatalf("fresh execution starts = %d, want 1", got)
+	}
+	if got := backend.StartRequests()[0].Metadata["native_session_id"]; got != "native-existing" {
+		t.Fatalf("native resume id = %q, want native-existing", got)
+	}
+	if got := backend.Handle("session-race").SendCount(); got != 1 {
+		t.Fatalf("fresh execution sends = %d, want 1", got)
 	}
 }
 

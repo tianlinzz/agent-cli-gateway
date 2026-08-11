@@ -23,9 +23,16 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
+)
+
+const (
+	nativeAbortTimeout = 30 * time.Second
+	abortDrainTimeout  = nativeAbortTimeout + time.Second
+	turnHandoffTimeout = nativeAbortTimeout + 5*time.Second
 )
 
 // Options configures the OpenAI API Handler. Every field has a usable default
@@ -98,9 +105,47 @@ type Handler struct {
 // after the request context is derived; the abort endpoint may call it before
 // or after wiring, so it is mutex-guarded.
 type turnState struct {
-	mu     sync.Mutex
-	cancel context.CancelFunc
-	done   chan struct{}
+	mu       sync.Mutex
+	cancel   context.CancelFunc
+	done     chan struct{}
+	settling atomic.Bool
+}
+
+func (ts *turnState) markSettling() { ts.settling.Store(true) }
+
+func (h *Handler) markTurnSettling(sessionID string) {
+	h.mu.Lock()
+	ts := h.turns[sessionID]
+	h.mu.Unlock()
+	if ts != nil {
+		ts.markSettling()
+	}
+}
+
+// awaitSettlingTurn waits only for a turn that is already being cancelled or
+// timed out. A genuinely active concurrent turn remains an immediate 409.
+func (h *Handler) awaitSettlingTurn(ctx context.Context, sessionID string) bool {
+	h.mu.Lock()
+	ts := h.turns[sessionID]
+	h.mu.Unlock()
+	if ts == nil {
+		// EndTurn may have completed between BeginTurn's busy result and this
+		// lookup. Allow one immediate retry to close that publication window.
+		return true
+	}
+	if !ts.settling.Load() {
+		return false
+	}
+	timer := time.NewTimer(turnHandoffTimeout)
+	defer timer.Stop()
+	select {
+	case <-ts.done:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
 }
 
 func (ts *turnState) setCancel(f context.CancelFunc) {
@@ -310,31 +355,96 @@ func (h *Handler) registerTurn(sessionID string) *turnState {
 // clearTurn ends a turn, running EndTurn on the store and closing ts.done so
 // an abort endpoint waiting on the turn unblocks.
 func (h *Handler) clearTurn(sessionID, callerID string, ts *turnState) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := h.store.EndTurn(ctx, sessionID, callerID); err != nil {
+		slog.Debug("openai: end turn", "session", sessionID, "error", err)
+	}
+	cancel()
+
 	h.mu.Lock()
 	if cur, ok := h.turns[sessionID]; ok && cur == ts {
 		delete(h.turns, sessionID)
 	}
 	h.mu.Unlock()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := h.store.EndTurn(ctx, sessionID, callerID); err != nil {
-		slog.Debug("openai: end turn", "session", sessionID, "error", err)
-	}
 	close(ts.done)
 }
 
 // abortHandle best-effort aborts an execution with its own bounded context so
 // a canceled request context can never wedge the abort RPC.
-func (h *Handler) abortHandle(ctx context.Context, handle runtime.ExecutionHandle) {
+func (h *Handler) abortHandle(ctx context.Context, handle runtime.ExecutionHandle) error {
 	if handle == nil {
-		return
+		return nil
 	}
-	actx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	actx, cancel := context.WithTimeout(ctx, nativeAbortTimeout)
 	defer cancel()
 	if err := handle.Abort(actx); err != nil {
 		slog.Warn("openai: abort execution", "error", err)
+		return err
 	}
+	return nil
+}
+
+// abortAndDrain cancels one turn and consumes its terminal events before the
+// session is made available to another request. Persistent executions share a
+// single event stream across turns; leaving a cancelled finish event buffered
+// would make the next turn terminate immediately with an empty response.
+func (h *Handler) abortAndDrain(ctx context.Context, sessionID string, handle runtime.ExecutionHandle) {
+	if handle == nil {
+		return
+	}
+	abortResult := make(chan error, 1)
+	go func() { abortResult <- h.abortHandle(ctx, handle) }()
+	abortDone := (<-chan error)(abortResult)
+	events := handle.Events()
+	settle := time.NewTimer(abortDrainTimeout)
+	defer settle.Stop()
+	var grace <-chan time.Time
+	terminalDrained := false
+	var abortErr error
+	for {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				events = nil
+				terminalDrained = true
+				if abortDone == nil {
+					goto complete
+				}
+				continue
+			}
+			if ev.Type == runtime.EventFinish || ev.Type == runtime.EventError {
+				grace = time.After(h.usageGrace)
+			}
+		case err := <-abortDone:
+			abortErr = err
+			abortDone = nil
+			if terminalDrained {
+				goto complete
+			}
+		case <-grace:
+			grace = nil
+			terminalDrained = true
+			if abortDone == nil {
+				goto complete
+			}
+		case <-settle.C:
+			if abortErr == nil {
+				abortErr = fmt.Errorf("abort succeeded but terminal events did not drain")
+			}
+			goto complete
+		}
+	}
+
+complete:
+	if abortErr == nil {
+		return
+	}
+	cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := handle.Close(cctx); err != nil {
+		slog.Warn("openai: close failed execution after abort", "session", sessionID, "error", err)
+	}
+	h.dropHandle(sessionID, handle)
 }
 
 // newRandomID returns a random 24-hex-char id (used for chat completion ids).

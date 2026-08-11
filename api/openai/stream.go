@@ -55,7 +55,8 @@ func (h *Handler) streamTurn(w http.ResponseWriter, r *http.Request, ctx context
 	deferredAbort := true
 	defer func() {
 		if deferredAbort {
-			h.abortHandle(context.Background(), handle)
+			h.markTurnSettling(sessionID)
+			h.abortAndDrain(context.Background(), sessionID, handle)
 		}
 	}()
 	hdr := w.Header()
@@ -105,8 +106,11 @@ loop:
 	for {
 		select {
 		case <-ctx.Done():
-			// Client disconnect or explicit abort: kill the turn at the worker.
-			h.abortHandle(context.Background(), handle)
+			// Client disconnect or explicit abort: settle this turn and discard
+			// its terminal events before another request can reuse the session.
+			h.markTurnSettling(sessionID)
+			h.abortAndDrain(context.Background(), sessionID, handle)
+			deferredAbort = false
 			if r.Context().Err() != nil {
 				return // the client is gone; nothing more to write
 			}
@@ -168,6 +172,9 @@ loop:
 		case <-timeout:
 			finish = "length"
 			status = "timeout"
+			h.markTurnSettling(sessionID)
+			h.abortAndDrain(context.Background(), sessionID, handle)
+			deferredAbort = false
 			break loop
 		}
 	}

@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -685,6 +686,46 @@ func TestSupervisor_SessionIDReusableAfterClose(t *testing.T) {
 	waitEvent(t, ws2, grt.EventFinish, 5*time.Second)
 	if err := ws2.Close(context.Background()); err != nil {
 		t.Fatalf("Close resumed session: %v", err)
+	}
+}
+
+func TestWorkerDonePublishesAfterDeregisterAndRuntimeCleanup(t *testing.T) {
+	sessionDir := t.TempDir()
+	socketDir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	sup := &Supervisor{sessions: make(map[string]*workerSession)}
+	releaseStarted := make(chan struct{})
+	allowRelease := make(chan struct{})
+	ws := &workerSession{
+		sup: sup, req: testRequest("publish-after-cleanup"), ctx: ctx, cancel: cancel,
+		state: stateRunning, done: make(chan struct{}), sessionDir: sessionDir, socketDir: socketDir,
+		releaseSlot: func() {
+			close(releaseStarted)
+			<-allowRelease
+		},
+	}
+	sup.sessions[ws.req.SessionID] = ws
+	go ws.terminate(errors.New("worker exited"))
+	<-releaseStarted
+	select {
+	case <-ws.Done():
+		t.Fatal("Done published before terminal cleanup completed")
+	default:
+	}
+	close(allowRelease)
+	select {
+	case <-ws.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Done was not published after cleanup")
+	}
+	if sup.SessionCount() != 0 {
+		t.Fatal("session remains registered after Done")
+	}
+	if _, err := os.Stat(sessionDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("session dir still exists after Done: %v", err)
+	}
+	if _, err := os.Stat(socketDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("socket dir still exists after Done: %v", err)
 	}
 }
 

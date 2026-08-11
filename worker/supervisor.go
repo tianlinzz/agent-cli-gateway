@@ -299,6 +299,7 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 		sup:         s,
 		req:         req,
 		events:      make(chan runtime.Event, 128),
+		stopping:    make(chan struct{}),
 		done:        make(chan struct{}),
 		reaped:      make(chan struct{}),
 		cmd:         cmd,
@@ -471,10 +472,11 @@ type workerSession struct {
 	lifecycle string
 	err       error
 
-	client *client
-	events chan runtime.Event
-	done   chan struct{} // closed on termination
-	reaped chan struct{} // closed when the direct child (cmd) is reaped
+	client   *client
+	events   chan runtime.Event
+	stopping chan struct{} // internal signal: teardown started, stop event bridge
+	done     chan struct{} // external signal: deregistration and cleanup completed
+	reaped   chan struct{} // closed when the direct child (cmd) is reaped
 
 	cmd       *exec.Cmd
 	outerPID  int // spawned process: nsjail PID when isolated, worker PID when direct
@@ -537,8 +539,14 @@ func (ws *workerSession) Close(ctx context.Context) error {
 		return err
 	}
 	if ws.state == stateClosing {
+		done := ws.done
 		ws.mu.Unlock()
-		return nil
+		select {
+		case <-done:
+			return ws.Err()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	ws.state = stateClosing
 	ws.closing = true
@@ -595,6 +603,19 @@ func (ws *workerSession) Closed() bool {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	return ws.state == stateClosed
+}
+
+// Done closes after the worker execution reaches its terminal state. It lets
+// the API distinguish a transport failure racing with process reaping from a
+// transient Send error without importing worker implementation details.
+func (ws *workerSession) Done() <-chan struct{} { return ws.done }
+
+// Terminating reports that teardown has started. Once true, callers may wait
+// on Done for the stronger guarantee that deregistration and cleanup finished.
+func (ws *workerSession) Terminating() bool {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	return ws.state == stateClosing || ws.state == stateClosed
 }
 
 // monitor waits for the direct child (nsjail wrapper, or the worker itself in
@@ -665,15 +686,16 @@ func (ws *workerSession) bridge() {
 		ev := fromFrame(frame)
 		select {
 		case ws.events <- ev:
-		case <-ws.done:
+		case <-ws.stopping:
 			return
 		}
 	}
 }
 
-// terminate is the idempotent teardown path: cancel the session context,
-// kill the process group, close the done channel, close the gRPC connection,
-// deregister, and remove the session's runtime dirs.
+// terminate is the idempotent teardown path. The internal stopping signal is
+// published first so the event bridge exits; the external Done/Closed state is
+// published only after deregistration and runtime-path cleanup, making an
+// immediate same-session restart safe.
 func (ws *workerSession) terminate(err error) {
 	ws.once.Do(func() {
 		ws.cancel()
@@ -681,11 +703,13 @@ func (ws *workerSession) terminate(err error) {
 		if err != nil && ws.err == nil {
 			ws.err = err
 		}
-		ws.state = stateClosed
+		ws.state = stateClosing
 		ws.mu.Unlock()
 
 		ws.killGroup(syscall.SIGKILL)
-		close(ws.done)
+		if ws.stopping != nil {
+			close(ws.stopping)
+		}
 		if ws.client != nil {
 			ws.client.Close()
 		}
@@ -707,6 +731,10 @@ func (ws *workerSession) terminate(err error) {
 				slog.Warn("worker: cleanup socket dir", "session", ws.req.SessionID, "error", err)
 			}
 		}
+		ws.mu.Lock()
+		ws.state = stateClosed
+		ws.mu.Unlock()
+		close(ws.done)
 	})
 }
 

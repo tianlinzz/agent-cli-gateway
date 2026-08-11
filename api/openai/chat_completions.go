@@ -262,7 +262,11 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set(h.sessionHeader, sessionID)
 
 	// Single active turn per session (the store's BeginTurn is the arbiter).
-	if err := h.store.BeginTurn(r.Context(), sessionID, callerID); err != nil {
+	err = h.store.BeginTurn(r.Context(), sessionID, callerID)
+	if errors.Is(err, runtime.ErrSessionBusy) && h.awaitSettlingTurn(r.Context(), sessionID) {
+		err = h.store.BeginTurn(r.Context(), sessionID, callerID)
+	}
+	if err != nil {
 		if created {
 			h.deleteSession(r.Context(), sessionID, callerID)
 		}
@@ -353,6 +357,18 @@ type closedHandle interface {
 	Closed() bool
 }
 
+// terminatingHandle exposes the execution's terminal signal. A worker can
+// lose its transport a few milliseconds before its supervisor publishes the
+// closed state; waiting on this signal closes that recovery race without
+// treating ordinary Send errors as terminal.
+type terminatingHandle interface {
+	Done() <-chan struct{}
+}
+
+type terminatingState interface {
+	Terminating() bool
+}
+
 // deliverTurn sends a turn to the session's execution handle, recovering from
 // a DEAD handle — a worker/CLI that exited while the session was idle between
 // turns — by dropping the stale handle and starting a FRESH execution for the
@@ -363,7 +379,7 @@ type closedHandle interface {
 func (h *Handler) deliverTurn(ctx context.Context, sessionID string, handle runtime.ExecutionHandle, startReq runtime.StartRequest, input runtime.Input) (runtime.ExecutionHandle, error) {
 	if err := handle.Send(ctx, input); err == nil {
 		return handle, nil
-	} else if !h.deadHandle(handle) {
+	} else if !h.awaitDeadHandle(ctx, handle) {
 		// Transient turn error on a live handle: surface it, keep the handle.
 		return handle, err
 	}
@@ -384,6 +400,42 @@ func (h *Handler) deliverTurn(ctx context.Context, sessionID string, handle runt
 		return fresh, err
 	}
 	return fresh, nil
+}
+
+func (h *Handler) awaitDeadHandle(ctx context.Context, handle runtime.ExecutionHandle) bool {
+	if h.deadHandle(handle) {
+		return true
+	}
+	doneHandle, hasDone := handle.(terminatingHandle)
+	stateHandle, hasState := handle.(terminatingState)
+	if !hasDone || !hasState {
+		return false
+	}
+	publication := time.NewTimer(250 * time.Millisecond)
+	defer publication.Stop()
+	poll := time.NewTicker(5 * time.Millisecond)
+	defer poll.Stop()
+	for !stateHandle.Terminating() {
+		select {
+		case <-doneHandle.Done():
+			return h.deadHandle(handle)
+		case <-ctx.Done():
+			return false
+		case <-publication.C:
+			return false
+		case <-poll.C:
+		}
+	}
+	wait := time.NewTimer(turnHandoffTimeout)
+	defer wait.Stop()
+	select {
+	case <-doneHandle.Done():
+		return h.deadHandle(handle)
+	case <-ctx.Done():
+		return false
+	case <-wait.C:
+		return h.deadHandle(handle)
+	}
 }
 
 // deadHandle reports whether a Send failure means the underlying session is
@@ -429,20 +481,17 @@ func (h *Handler) handleAbort(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.Lock()
-	handle := h.handles[sessionID]
 	ts := h.turns[sessionID]
 	h.mu.Unlock()
 
-	if handle != nil {
-		h.abortHandle(r.Context(), handle)
-	}
 	if ts != nil {
+		ts.markSettling()
 		// Cancel the turn context so the streaming/aggregation loop unblocks,
 		// then wait for its cleanup (EndTurn) to complete.
 		ts.cancelTurn()
 		select {
 		case <-ts.done:
-		case <-time.After(5 * time.Second):
+		case <-time.After(turnHandoffTimeout):
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "aborted"})
@@ -481,7 +530,8 @@ func (h *Handler) aggregateTurn(ctx context.Context, sessionID, callerID string,
 			// Client disconnect or explicit abort: the turn must be killed at
 			// the worker so no orphaned CLI keeps running.
 			res.aborted = true
-			h.abortHandle(context.Background(), handle)
+			h.markTurnSettling(sessionID)
+			h.abortAndDrain(context.Background(), sessionID, handle)
 			return res
 		case ev, ok := <-handle.Events():
 			if !ok {
@@ -531,8 +581,9 @@ func (h *Handler) aggregateTurn(ctx context.Context, sessionID, callerID string,
 		case <-timeout:
 			res.timedOut = true
 			res.finishReason = "length"
-			// The agent may still be running; kill it after reporting.
-			h.abortHandle(context.Background(), handle)
+			h.markTurnSettling(sessionID)
+			// Settle and drain the timed-out turn before this session is reused.
+			h.abortAndDrain(context.Background(), sessionID, handle)
 			return res
 		}
 	}
