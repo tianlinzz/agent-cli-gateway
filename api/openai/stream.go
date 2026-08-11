@@ -216,6 +216,7 @@ loop:
 					return
 				}
 				completed[tool.ID] = struct{}{}
+				h.recordServerToolID(sessionID, tool.ID)
 			case runtime.EventUsage:
 				if ev.Usage != nil {
 					usage = usageFromRuntime(ev.Usage)

@@ -901,6 +901,49 @@ func TestChatCompletions_StreamProjectsReasoningAndTerminalToolSummary(t *testin
 	}
 }
 
+func TestRejectServerExecutedToolReplay(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(
+			runtime.Event{Type: runtime.EventToolUse, Tool: &runtime.ToolCall{ID: "tool-1", Name: "Bash"}},
+			runtime.Event{Type: runtime.EventToolResult, Tool: &runtime.ToolCall{ID: "tool-1", Name: "Bash", Result: "ok"}},
+			runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"},
+		)
+	})
+	first := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", false, defaultMessages()))
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first status = %d (body %s)", first.StatusCode, readBody(t, first))
+	}
+	sessionID := first.Header.Get("X-Gateway-Session-Id")
+	if sessionID == "" {
+		t.Fatal("first response did not return session id")
+	}
+	replay := map[string]any{
+		"model": "codex",
+		"messages": []map[string]any{
+			{"role": "assistant", "content": nil, "tool_calls": []map[string]any{{
+				"id": "tool-1", "type": "function", "function": map[string]any{"name": "Bash", "arguments": "{}"},
+			}}},
+			{"role": "tool", "tool_call_id": "tool-1", "content": "ok"},
+			{"role": "user", "content": "continue"},
+		},
+		"metadata": map[string]any{"workspace_id": testWorkspace},
+	}
+	second := doAuthJSONH(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, replay,
+		map[string]string{"X-Gateway-Session-Id": sessionID})
+	if second.StatusCode != http.StatusBadRequest {
+		t.Fatalf("replay status = %d (body %s), want 400", second.StatusCode, readBody(t, second))
+	}
+	ae := decodeError(t, second)
+	if !strings.Contains(ae.Message, "server-executed") {
+		t.Fatalf("replay error = %+v, want server-executed explanation", ae)
+	}
+	if got := backend.Handle(sessionID).SendCount(); got != 1 {
+		t.Fatalf("native sends = %d, want 1", got)
+	}
+}
+
 func TestChatCompletions_StreamUsage(t *testing.T) {
 	ts, _, backend := newTestServer(t)
 	backend.withScript(func(h *fakeHandle) {

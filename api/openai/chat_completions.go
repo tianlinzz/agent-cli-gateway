@@ -257,6 +257,10 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		}
 		workspaceID = rec.WorkspaceID
 	}
+	if h.hasServerToolReplay(sessionID, req.Messages) {
+		writeError(w, http.StatusBadRequest, invalidRequest("server-executed tool results must not be submitted by the client"))
+		return
+	}
 	// Echo the gateway session id so the client can resume the session on a
 	// later request.
 	w.Header().Set(h.sessionHeader, sessionID)
@@ -557,8 +561,9 @@ func (h *Handler) aggregateTurn(ctx context.Context, sessionID, callerID string,
 				// them as OpenAI tool_calls would make an upstream Agent framework
 				// execute them again and resubmit the same user turn.
 			case runtime.EventToolResult:
-				// Internal tool telemetry is intentionally not part of the OpenAI
-				// model response. It belongs on a separate observability surface.
+				if ev.Tool != nil {
+					h.recordServerToolID(sessionID, ev.Tool.ID)
+				}
 			case runtime.EventUsage:
 				if ev.Usage != nil {
 					res.usage = usageFromRuntime(ev.Usage)

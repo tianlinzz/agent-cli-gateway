@@ -95,9 +95,10 @@ type Handler struct {
 	newID func() string
 	now   func() time.Time
 
-	mu      sync.Mutex
-	handles map[string]runtime.ExecutionHandle // sessionID -> live execution
-	turns   map[string]*turnState              // sessionID -> in-flight turn
+	mu            sync.Mutex
+	handles       map[string]runtime.ExecutionHandle // sessionID -> live execution
+	turns         map[string]*turnState              // sessionID -> in-flight turn
+	serverToolIDs map[string]map[string]struct{}     // sessionID -> completed native tool IDs
 }
 
 // turnState is one in-flight turn on a session, registered so the abort
@@ -120,6 +121,49 @@ func (h *Handler) markTurnSettling(sessionID string) {
 	if ts != nil {
 		ts.markSettling()
 	}
+}
+
+const maxServerToolIDsPerSession = 128
+
+func (h *Handler) recordServerToolID(sessionID, toolID string) {
+	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(toolID) == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	ids := h.serverToolIDs[sessionID]
+	if ids == nil {
+		ids = make(map[string]struct{})
+		h.serverToolIDs[sessionID] = ids
+	}
+	if len(ids) >= maxServerToolIDsPerSession {
+		for oldest := range ids {
+			delete(ids, oldest)
+			break
+		}
+	}
+	ids[toolID] = struct{}{}
+}
+
+func (h *Handler) isServerToolID(sessionID, toolID string) bool {
+	h.mu.Lock()
+	_, ok := h.serverToolIDs[sessionID][toolID]
+	h.mu.Unlock()
+	return ok
+}
+
+func (h *Handler) hasServerToolReplay(sessionID string, messages []ChatMessage) bool {
+	for _, message := range messages {
+		if message.ToolCallID != "" && h.isServerToolID(sessionID, message.ToolCallID) {
+			return true
+		}
+		for _, toolCall := range message.ToolCalls {
+			if toolCall.ID != "" && h.isServerToolID(sessionID, toolCall.ID) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // awaitSettlingTurn waits only for a turn that is already being cancelled or
@@ -200,6 +244,7 @@ func NewHandler(opts Options) *Handler {
 		now:             now,
 		handles:         make(map[string]runtime.ExecutionHandle),
 		turns:           make(map[string]*turnState),
+		serverToolIDs:   make(map[string]map[string]struct{}),
 	}
 	h.catalog = &modelCatalog{reg: opts.Registry, enabled: opts.Enabled, models: opts.Models}
 	return h
