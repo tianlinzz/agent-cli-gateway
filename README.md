@@ -91,6 +91,13 @@ supplied) and the generated id is returned in the `X-Gateway-Session-Id`
 response header. Resume by sending that header back on the next request; the
 gateway reuses the running worker execution.
 
+Every Gateway session owns one persistent Worker and one persistent native
+Agent CLI process. Normal turn completion returns that process to idle; it does
+not close or restart it. A worker/CLI crash drops only that execution. The next
+request starts a new Worker and passes the saved native thread/session ID so
+the Agent can resume, but the Gateway never retries a turn whose completion is
+unknown.
+
 Each completion is one complete autonomous Agent turn. Claude Code, Codex, and
 Kimi execute their own native tools inside the worker; those internal tool
 events are not returned as OpenAI `tool_calls`. Emitting them as model tool
@@ -108,14 +115,22 @@ caller that owns the workspace.
 
 | Model id | Adapter | Lifecycle |
 |---|---|---|
-| `codex` | `adapters/codex` | resume per turn |
-| `claude-code` | `adapters/claudecode` | persistent process |
-| `kimi` | `adapters/kimi` | resume per turn |
+| `codex` | `adapters/codex` | persistent `codex app-server` JSON-RPC |
+| `claude-code` | `adapters/claudecode` | persistent bidirectional `stream-json` |
+| `kimi` | `adapters/kimi` | persistent `kimi acp` JSON-RPC |
 
 Adapters are registered by name into the runtime registry. `agent/<name>` owns
 native CLI launch, protocol parsing, resume IDs, usage, abort, and process
 teardown. `adapters/<name>` only converts trusted configuration, prompts,
 events, and lifecycle calls to the canonical `runtime.AgentAdapter` contract.
+There is no per-turn CLI fallback.
+
+Abort is turn-scoped. Codex sends `turn/interrupt`; Kimi sends
+`session/cancel`; a successful cancellation leaves the Worker and Agent
+process available for the next turn. Claude Code's current stream-json surface
+does not provide an equivalent reliable interrupt, so its adapter escalates by
+terminating the native process; the dead handle is discarded and the next
+request resumes through the saved native session ID.
 
 ## Isolation
 
@@ -138,7 +153,8 @@ Production and dev profiles require nsjail:
 
 Worker failures are isolated to the session: a crashed worker is reaped by the
 supervisor (SIGTERM → SIGKILL escalation, process-group kill) and the gateway
-keeps serving. `docker/nsjail-smoke.sh` validates the nsjail build on Linux CI
+keeps serving. Unknown turn outcomes are never automatically replayed.
+`docker/nsjail-smoke.sh` validates the nsjail build on Linux CI
 (`--version`, `ldd`, minimal jail).
 
 ## Configuration
@@ -262,3 +278,9 @@ Agent CLI lifecycle and protocol behavior was selectively migrated from
 `adapters/<name>/SOURCE.md` and `LICENSES/cc-connect-MIT.txt`. The upstream
 README declares MIT License, but its linked standalone license file is absent
 at that baseline; the notice records this caveat explicitly.
+
+The persistent Codex app-server sequence was independently checked against
+Hermes Agent commit `9d6c5a920c773f86fad9ea16528212faeaa21815`
+(MIT). Kimi ACP v1 behavior was checked against MoonshotAI Kimi Code commit
+`2acf22f66e15361d9804d9014d58ad68a9383caf` (MIT). Exact file-level evidence
+is recorded in the corresponding `adapters/<name>/SOURCE.md`.

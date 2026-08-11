@@ -48,7 +48,10 @@ gid = 65532
 policy = "kafel"
 
 # --- Agents ----------------------------------------------------------------
-# The three first-generation agents default to enabled with auto permission.
+# The three agents default to enabled with auto permission. Each enabled
+# Gateway session starts one persistent native protocol process: Codex
+# app-server, Claude bidirectional stream-json, or Kimi ACP. There is no
+# per-turn CLI fallback.
 
 [agents.codex]
 enabled = true

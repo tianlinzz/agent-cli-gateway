@@ -13,6 +13,8 @@ import (
 
 const modulePath = "github.com/tianlinzz/agent-cli-gateway"
 const ccConnectBaseline = "3fc360ee6acc9bab13ab1b48ddde3af44062903b"
+const hermesBaseline = "9d6c5a920c773f86fad9ea16528212faeaa21815"
+const kimiCodeBaseline = "2acf22f66e15361d9804d9014d58ad68a9383caf"
 
 func TestDependencyRules(t *testing.T) {
 	root := moduleRoot(t)
@@ -139,6 +141,22 @@ func TestProvenance(t *testing.T) {
 		} {
 			if !strings.Contains(content, required) {
 				t.Errorf("%s missing %q", relative, required)
+			}
+		}
+	}
+
+	for relative, required := range map[string][]string{
+		"adapters/codex/SOURCE.md": {hermesBaseline, "app-server", "MIT"},
+		"adapters/kimi/SOURCE.md":  {kimiCodeBaseline, "ACP", "MIT"},
+	} {
+		data, err := os.ReadFile(filepath.Join(root, relative))
+		if err != nil {
+			t.Errorf("read %s: %v", relative, err)
+			continue
+		}
+		for _, needle := range required {
+			if !strings.Contains(string(data), needle) {
+				t.Errorf("%s missing native protocol provenance %q", relative, needle)
 			}
 		}
 	}

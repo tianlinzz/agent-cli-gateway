@@ -95,6 +95,21 @@ the OpenAI surface; doing so creates a second upstream Agent loop and repeats
 the same user turn. Expose native tool progress through a separate optional
 telemetry protocol if needed.
 
+### Persistent Native Lifecycle
+
+Every Gateway session owns one Worker process and one persistent Agent CLI:
+
+- Claude Code: bidirectional `stream-json`.
+- Codex: `codex app-server --listen stdio://` JSON-RPC v2.
+- Kimi Code: `kimi acp` JSON-RPC / ACP v1.
+
+Normal turn completion only returns the native session to idle. There is no
+per-turn process fallback. `Abort` cancels only the active turn when the native
+protocol supports it; cancellation failure or a protocol without a reliable
+interrupt may escalate to process teardown. A crashed execution is replaced
+on the next request using the saved native session ID. Never automatically
+retry a turn with an unknown completion outcome.
+
 ## Development Rules
 
 ### 1. No Hardcoded Agent Names in Runtime
@@ -164,6 +179,8 @@ if handle, ok := someBackend.(OptionalCapability); ok {
   auto-approved inside the controlled workspace), the event surface must keep
   the ability to request permission.
 - Agent config selects the mode: `auto` / `ask` / `deny`.
+- Reverse permission/user-input requests must always receive a deterministic
+  response; an unattended OpenAI request must never wait for terminal input.
 
 ### 7. Error Handling
 

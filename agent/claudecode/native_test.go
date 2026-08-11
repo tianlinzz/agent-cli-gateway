@@ -80,6 +80,47 @@ func TestSessionUsesOnePersistentProcessForMultipleTurns(t *testing.T) {
 	}
 }
 
+func TestRealClaudePersistentProcessTwoTurns(t *testing.T) {
+	if os.Getenv("CLAUDE_REAL_SMOKE") != "1" {
+		t.Skip("set CLAUDE_REAL_SMOKE=1 to use the installed authenticated Claude CLI")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	session, err := Start(ctx, Options{WorkDir: t.TempDir(), Permission: "auto", CloseTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close(context.Background())
+	pid := session.process.PID()
+	for _, prompt := range []string{"Reply with exactly: turn-one", "Reply with exactly: turn-two"} {
+		if err := session.Send(ctx, Input{Prompt: prompt}); err != nil {
+			t.Fatal(err)
+		}
+		var events []Event
+		for {
+			select {
+			case event, ok := <-session.Events():
+				if !ok {
+					t.Fatalf("Claude exited during turn: %#v", events)
+				}
+				events = append(events, event)
+				if event.Kind == EventError {
+					t.Fatalf("Claude turn failed: %#v", events)
+				}
+				if event.Kind == EventUsage {
+					goto settled
+				}
+			case <-ctx.Done():
+				t.Fatalf("Claude turn timed out: %#v", events)
+			}
+		}
+	settled:
+		if session.process.PID() != pid || !session.Alive() {
+			t.Fatalf("Claude process changed after turn: pid=%d current=%d alive=%v", pid, session.process.PID(), session.Alive())
+		}
+	}
+}
+
 func TestAskUserQuestionIsDeniedWithoutHanging(t *testing.T) {
 	responseFile := filepath.Join(t.TempDir(), "response.json")
 	session := startTestSession(t, "ask", map[string]string{"CLAUDE_TEST_RESPONSE_FILE": responseFile})
