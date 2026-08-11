@@ -4,7 +4,7 @@
 
 **Goal:** Make Codex, Claude Code, and Kimi project safe reasoning and terminal native-tool summaries through the existing `reasoning_content` channel without emitting client-executable `tool_calls`.
 
-**Architecture:** Native Agent parsers emit safe reasoning plus existing tool lifecycle events. Adapters map them to a name-agnostic runtime contract. The OpenAI streaming layer correlates tool starts/results, serializes one terminal `gateway.tool_execution.v1:` summary as a reasoning string, and keeps standard tool control fields suppressed. f1-web remains a separate follow-up consumer task.
+**Architecture:** Native Agent parsers emit safe reasoning plus existing tool lifecycle events. Adapters map them to a name-agnostic runtime contract. The OpenAI streaming layer correlates tool starts/results, formats one immediately displayable CLI-style icon/name/result summary as a reasoning string, and keeps standard tool control fields suppressed. Consumers do not parse Gateway-specific JSON.
 
 **Tech Stack:** Go, runtime contracts, native protocol fixtures, adapter tests, `api/openai` SSE handlers, integration tests, `go test`, race detector, and cross-platform builds.
 
@@ -44,9 +44,9 @@
 
 **Files:** `api/openai/types.go`, `api/openai/stream.go`, `api/openai/handlers_test.go`
 
-- [ ] **Step 1: Write failing SSE tests.** Feed a fake execution handle with `EventReasoning`, `EventToolUse(id=tool-1,name=Bash)`, `EventToolResult(id=tool-1,result=/workspace)`, `EventText`, and `EventFinish`. Assert frames contain reasoning text, exactly one reasoning string beginning `gateway.tool_execution.v1:`, final `stop`, and `[DONE]`; assert no `delta.tool_calls`. Add result-only and duplicate-result cases.
+- [ ] **Step 1: Write failing SSE tests.** Feed a fake execution handle with `EventReasoning`, `EventToolUse(id=tool-1,name=Bash)`, `EventToolResult(id=tool-1,result=/workspace)`, `EventText`, and `EventFinish`. Assert frames contain reasoning text, exactly one CLI-style tool summary, final `stop`, and `[DONE]`; assert no `delta.tool_calls`. Add result-only and duplicate-result cases.
 - [ ] **Step 2: Run focused tests.** Run `go test ./api/openai -run 'Test.*Telemetry|Test.*Reasoning|Test.*ToolExecution' -v`; expect failures because the projection does not exist.
-- [ ] **Step 3: Add the serialization helper.** Define an API-local `ToolExecutionSummary{ID, Name, Status, IsError, Result}` and a helper that emits `gateway.tool_execution.v1:` followed by compact JSON. Bound and redact the result before serialization; omit arguments from v1.
+- [ ] **Step 3: Add the presentation helper.** Define an API-local formatter that emits an icon, tool name, and optional sanitized result as ordinary display text. Bound and redact the result; omit arguments and internal IDs.
 - [ ] **Step 4: Add per-turn correlation.** In `streamTurn`, maintain `started map[string]runtime.ToolCall` and `completed map[string]struct{}`. `EventToolUse` records only; `EventToolResult` merges missing name data, suppresses repeated IDs, serializes one terminal summary as `delta.reasoning_content`, and logs structured warnings for malformed data. `EventReasoning` continues to project plain `reasoning_content`.
 - [ ] **Step 5: Preserve existing control behavior.** Do not emit `delta.tool_calls`, tool-role messages, or `finish_reason: tool_calls`; retain existing text, usage, timeout, abort, error, and `[DONE]` paths. Non-streaming responses remain unchanged.
 - [ ] **Step 6: Verify and commit.** Run `go test ./api/openai`; commit `api/openai/types.go api/openai/stream.go api/openai/handlers_test.go` with `feat: project native tool summaries through reasoning`.
@@ -65,7 +65,7 @@
 
 **Files:** `integration/agent_gateway_test.go`, existing hermetic worker fixture files only when needed
 
-- [ ] **Step 1: Write the failing integration case.** Make the stub worker emit reasoning, tool start, tool result, text, and finish; assert the HTTP stream order is `reasoning_content`, `reasoning_content(gateway.tool_execution.v1:...)`, content, `finish_reason=stop`, `[DONE]`, with exactly one backend turn and no `tool_calls`.
+- [ ] **Step 1: Write the failing integration case.** Make the stub worker emit reasoning, tool start, tool result, text, and finish; assert the HTTP stream order is `reasoning_content`, `reasoning_content(⏺ Bash...)`, content, `finish_reason=stop`, `[DONE]`, with exactly one backend turn and no `tool_calls`.
 - [ ] **Step 2: Run it and confirm failure.** Run `go test ./integration -run Test.*Telemetry -v`; expect failure until all layers are connected.
 - [ ] **Step 3: Extend only the existing stub fixture.** Do not add real Agent CLI dependencies; preserve current worker crash, abort, workspace, and session recovery fixtures.
 - [ ] **Step 4: Verify and commit.** Run `go test ./integration -v`, then commit `git add integration worker/testworker && git commit -m "test: cover reasoning-channel agent telemetry"`.
@@ -74,9 +74,20 @@
 
 **Files:** `README.md`, no other planned files
 
-- [ ] **Step 1: Document compatibility.** Explain that native tools remain cloud-side, terminal summaries are encoded in existing `reasoning_content` with the `gateway.tool_execution.v1:` prefix, clients must not submit tool results for them, and non-streaming responses omit process telemetry.
+- [ ] **Step 1: Document compatibility.** Explain that native tools remain cloud-side, terminal summaries are normalized into immediately displayable `reasoning_content`, clients must not submit tool results for them, and non-streaming responses omit process telemetry.
 - [ ] **Step 2: Run documentation consistency checks.** Run `rg -n 'gateway\.tool_execution\.v1|reasoning_content|tool_calls|stream=true' README.md docs/superpowers/specs/2026-08-11-server-executed-agent-telemetry-design.md`; ensure field names and ownership language match.
 - [ ] **Step 3: Commit documentation.** Run `git add README.md && git commit -m "docs: explain reasoning-channel agent telemetry"`.
 - [ ] **Step 4: Run required verification.** Run `go test ./...`, `go test -race ./...`, `go test ./integration/ -v`, `go build ./...`, `GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./...`, and `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...`; expect all commands to exit 0.
 - [ ] **Step 5: Run the negative contract audit.** Run `! rg -n 'delta\.tool_calls|finish_reason.*tool_calls' api/openai` and `git diff --check`; expect no native-tool projection to client-executable tool calls and no whitespace errors.
 
+## Task 7: Normalize terminal tool presentation
+
+**Files:** `api/openai/stream.go`, `api/openai/handlers_test.go`, `integration/agent_gateway_test.go`, `README.md`
+
+- [ ] **Step 1: Replace the API expectations before production code.** Update focused handler tests so a successful tool result must equal `⏺ Bash\n  ⎿ /workspace\n`, a failed result must equal `⨯ Bash\n  ⎿ command failed\n`, and an empty result must equal `⏺ Bash\n`. Assert none contains `gateway.tool_execution.v1:`, JSON field labels, or Chinese labels.
+- [ ] **Step 2: Verify the focused tests fail for the old wire format.** Run `go test ./api/openai -run 'TestChatCompletions_StreamProjectsReasoningAndTerminalToolSummary|TestFormatToolExecutionSummary' -v`; expect mismatches against the current prefix plus JSON serialization.
+- [ ] **Step 3: Implement the minimal formatter.** Replace `encodeToolExecutionSummary` and its JSON payload with `formatToolExecutionSummary`. Select `⏺` when `IsError` is false and `⨯` when true, retain the correlated tool name, append the sanitized result as `  ⎿ <result>`, and end every summary with `\n`. Preserve the existing recursive secret redaction, UTF-8 repair, output bound, duplicate suppression, replay ledger, and finish guards.
+- [ ] **Step 4: Update the full HTTP expectation.** Require the integration telemetry fixture to emit `checking workspace`, then `⏺ Bash\n  ⎿ /workspace\n`, assistant content, `finish_reason=stop`, and `[DONE]`, with no `tool_calls` and no Gateway-specific prefix.
+- [ ] **Step 5: Update consumer documentation.** Replace the README JSON example with the CLI-style text format and state explicitly that callers consume ordinary `reasoning_content` without a Gateway-specific parser.
+- [ ] **Step 6: Run focused and full verification.** Run `go test ./api/openai`, `go test ./integration/ -v`, `go test ./...`, `go test -race ./...`, `go vet ./...`, `go build ./...`, both required cross-platform builds, `git diff --check`, and `! rg -n 'gateway\.tool_execution\.v1' api integration README.md`.
+- [ ] **Step 7: Commit the implementation.** Stage only the four Task 7 files and commit with `feat: normalize tool telemetry presentation`.
