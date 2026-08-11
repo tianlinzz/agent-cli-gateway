@@ -4,7 +4,7 @@ This adapter is a thin runtime bridge over the native implementation in
 `agent/codex/`. The current implementation uses Codex app-server v2 as its
 only production protocol.
 
-## Protocol references
+## Upstream source files and protocol references
 
 - The installed Codex CLI `0.145.0` generated the JSON schemas used to verify
   `initialize`, `thread/start`, `thread/resume`, `turn/start`,
@@ -14,10 +14,11 @@ only production protocol.
   `agent/transports/codex_app_server.py`, was reviewed as an independent
   example of the stable initialize/thread/turn sequence.
 - The earlier native adapter selectively migrated `codex exec` behavior from
-  cc-connect commit `3fc360ee6acc9bab13ab1b48ddde3af44062903b`.
+  [cc-connect](https://github.com/chenhg5/cc-connect) commit
+  `3fc360ee6acc9bab13ab1b48ddde3af44062903b`.
   That resume-per-turn implementation has now been removed.
 
-## Implemented behavior
+## Migrated behaviors
 
 - One `codex app-server --listen stdio://` process per Gateway session.
 - One initialization handshake and one native thread start or resume.
@@ -27,7 +28,7 @@ only production protocol.
 - Process termination only for explicit session close, app-server failure, or
   failed/timed-out interrupt escalation.
 
-## Local boundaries
+## Material local modifications
 
 - `agent/codex/` depends only on shared `agent/process`, `agent/protocol`, and
   the Go standard library.
@@ -38,7 +39,7 @@ only production protocol.
 - Provider switching, quota HTTP calls, session listing/history, attachments,
   and messaging-platform behavior are outside this adapter.
 
-## Tests
+## Local regression tests
 
 - `agent/codex/native_exec_test.go`
 - `adapters/codex/adapter_test.go`
