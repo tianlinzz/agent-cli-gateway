@@ -34,10 +34,6 @@ test/
 # exercised by `go test`, not by the image build)
 integration/
 
-# Migration reference (compiled out behind the `agent_ref` build tag; still
-# imports the deleted core package and deliberately does not compile)
-agent/
-
 # Docs, dev files, and markdown (not needed in the image)
 docs/
 scripts/

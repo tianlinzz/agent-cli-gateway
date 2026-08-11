@@ -30,7 +30,7 @@ at `agent/claudecode/` — which itself originated in **cc-connect** (MIT Licens
 
 ## Old `core`/IM dependencies cut
 
-Every `github.com/tianlinzz/agent-cli-gateway/core` import is gone; the package
+Every removed legacy nucleus import is gone; the package
 imports stdlib + `github.com/tianlinzz/agent-cli-gateway/runtime` only. No
 `net/http`, no `server/`, no Platform/IM types. Specific `core.*` symbols that
 no longer appear: `core.Agent`, `core.AgentSession`, `core.Event*`,
