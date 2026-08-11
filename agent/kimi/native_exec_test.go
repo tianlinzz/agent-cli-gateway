@@ -95,6 +95,46 @@ func TestAbortCancelsPromptAndPreservesACPProcess(t *testing.T) {
 	}
 }
 
+func TestRealKimiACPPersistentProcessTwoTurns(t *testing.T) {
+	if os.Getenv("KIMI_REAL_SMOKE") != "1" {
+		t.Skip("set KIMI_REAL_SMOKE=1 to use the installed authenticated Kimi Code CLI")
+	}
+	command := strings.TrimSpace(os.Getenv("KIMI_REAL_COMMAND"))
+	if command == "" {
+		command = "kimi"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	session, err := Start(ctx, Options{
+		Command:    []string{command},
+		WorkDir:    t.TempDir(),
+		Permission: "auto",
+		Timeout:    2 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close(context.Background())
+
+	pid := session.process.PID()
+	nativeID := session.NativeSessionID()
+	if nativeID == "" {
+		t.Fatal("Kimi ACP returned an empty native session ID")
+	}
+	for _, prompt := range []string{"Reply with exactly: turn-one", "Reply with exactly: turn-two"} {
+		if err := session.Send(ctx, Input{Prompt: prompt}); err != nil {
+			t.Fatal(err)
+		}
+		events := readKimiTurnWithContext(t, ctx, session.Events())
+		if findKimiEvent(events, EventFinish) == nil || findKimiEvent(events, EventError) != nil {
+			t.Fatalf("events = %#v", events)
+		}
+		if session.process.PID() != pid || session.NativeSessionID() != nativeID || !session.Alive() {
+			t.Fatalf("ACP lifecycle changed after turn: pid=%d current=%d native_id=%q current_native_id=%q alive=%v", pid, session.process.PID(), nativeID, session.NativeSessionID(), session.Alive())
+		}
+	}
+}
+
 func startKimiTestSession(t *testing.T, options Options, extra map[string]string) *Session {
 	t.Helper()
 	env := []string{"GO_WANT_KIMI_ACP_HELPER=1"}
@@ -115,8 +155,14 @@ func startKimiTestSession(t *testing.T, options Options, extra map[string]string
 
 func readKimiTurn(t *testing.T, events <-chan Event) []Event {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return readKimiTurnWithContext(t, ctx, events)
+}
+
+func readKimiTurnWithContext(t *testing.T, ctx context.Context, events <-chan Event) []Event {
+	t.Helper()
 	var got []Event
-	deadline := time.After(3 * time.Second)
 	for {
 		select {
 		case event, ok := <-events:
@@ -127,7 +173,7 @@ func readKimiTurn(t *testing.T, events <-chan Event) []Event {
 			if event.Kind == EventFinish || event.Kind == EventError {
 				return got
 			}
-		case <-deadline:
+		case <-ctx.Done():
 			t.Fatalf("turn timed out: %#v", got)
 		}
 	}
