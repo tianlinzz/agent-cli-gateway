@@ -22,6 +22,9 @@ const (
 	// "closed").
 	EventStatus        EventType = "status"
 	EventNativeSession EventType = "native_session"
+	// EventReasoning carries safe, displayable reasoning text from the native
+	// Agent protocol. It is never model tool-control data.
+	EventReasoning EventType = "reasoning"
 )
 
 // Event is the canonical runtime event emitted by sessions and executions.
@@ -43,6 +46,9 @@ type Event struct {
 	// Usage is set for EventUsage.
 	Usage *Usage
 
+	// Reasoning is set for EventReasoning.
+	Reasoning *Reasoning
+
 	// Error is the failure description for EventError.
 	Error string
 
@@ -54,6 +60,14 @@ type Event struct {
 	// NativeSessionID is emitted when an adapter learns the resumable native
 	// conversation/thread identifier.
 	NativeSessionID string
+}
+
+// Reasoning carries safe, displayable reasoning text from a native Agent.
+// Native adapters must not populate it with hidden chain-of-thought or private
+// provider metadata.
+type Reasoning struct {
+	ID   string
+	Text string
 }
 
 // PermissionRequest is a canonical permission request raised by an agent.
