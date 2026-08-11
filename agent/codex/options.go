@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// Options configures a native Codex exec session.
+// Options configures a persistent native Codex app-server session.
 type Options struct {
 	Command            []string
 	Env                []string
@@ -13,6 +13,7 @@ type Options struct {
 	Model              string
 	ReasoningEffort    string
 	Mode               string
+	Permission         string
 	ResumeID           string
 	BaseURL            string
 	ModelProvider      string
@@ -29,11 +30,23 @@ func NormalizeOptions(opts Options) Options {
 		opts.Command = append([]string(nil), opts.Command...)
 	}
 	opts.Mode = normalizeMode(opts.Mode)
+	opts.Permission = normalizePermission(opts.Permission)
 	opts.ReasoningEffort = normalizeEffort(opts.ReasoningEffort)
 	if opts.CloseTimeout <= 0 {
 		opts.CloseTimeout = 8 * time.Second
 	}
 	return opts
+}
+
+func normalizePermission(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "ask":
+		return "ask"
+	case "deny":
+		return "deny"
+	default:
+		return "auto"
+	}
 }
 
 func normalizeMode(raw string) string {

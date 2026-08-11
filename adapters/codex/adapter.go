@@ -3,7 +3,6 @@ package codex
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"strings"
 
@@ -21,7 +20,6 @@ type Options struct {
 	Model           string
 	ReasoningEffort string
 	Mode            string
-	Backend         string
 	Permission      string
 	SystemPrompt    string
 	AppendPrompt    string
@@ -50,7 +48,6 @@ func New(_ context.Context, _ string) (runtime.AgentAdapter, error) {
 		Model:           envOrDefault("CC_GATEWAY_CODEX_MODEL", ""),
 		ReasoningEffort: envOrDefault("CC_GATEWAY_CODEX_EFFORT", ""),
 		Mode:            envOrDefault("CC_GATEWAY_CODEX_MODE", "full-auto"),
-		Backend:         envOrDefault("CC_GATEWAY_CODEX_BACKEND", "exec"),
 		Permission:      envOrDefault("CC_GATEWAY_CODEX_PERMISSION", "auto"),
 	}
 	if raw := envOrDefault("CC_GATEWAY_CODEX_ENV", ""); raw != "" {
@@ -60,12 +57,11 @@ func New(_ context.Context, _ string) (runtime.AgentAdapter, error) {
 }
 
 func NewAdapter(opts Options) (*Adapter, error) {
-	if normalizeBackend(opts.Backend) != "exec" {
-		return nil, fmt.Errorf("codex: app_server backend is not supported; use exec")
-	}
-	return newAdapter(opts, func(_ context.Context, options native.Options) (nativeSession, error) {
-		return native.New(options), nil
-	}), nil
+	return newAdapter(opts, startNative), nil
+}
+
+func startNative(ctx context.Context, options native.Options) (nativeSession, error) {
+	return native.Start(ctx, options)
 }
 
 func newAdapter(opts Options, start starter) *Adapter {
@@ -78,8 +74,8 @@ func newAdapter(opts Options, start starter) *Adapter {
 func (a *Adapter) Describe(context.Context) (runtime.Descriptor, error) {
 	return runtime.Descriptor{
 		ModelID: "codex", DisplayName: "Codex",
-		Description:   "OpenAI Codex CLI via codex exec (resume per turn)",
-		LifecycleMode: runtime.LifecycleResumePerTurn,
+		Description:   "OpenAI Codex CLI via persistent app-server",
+		LifecycleMode: runtime.LifecyclePersistentProcess,
 		Capabilities:  runtime.Capabilities{Streaming: true, ToolCalls: true, Reasoning: true, Permission: true, Resume: true, MultiTurn: true},
 	}, nil
 }
@@ -95,28 +91,17 @@ func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.
 	}
 	start := a.start
 	if start == nil {
-		start = func(_ context.Context, options native.Options) (nativeSession, error) {
-			return native.New(options), nil
-		}
+		start = startNative
 	}
 	nativeSession, err := start(ctx, native.Options{
 		Command: splitCommand(a.opts.Command), Env: env, WorkDir: a.opts.WorkDir,
-		Model: a.opts.Model, ReasoningEffort: a.opts.ReasoningEffort, Mode: a.opts.Mode,
+		Model: a.opts.Model, ReasoningEffort: a.opts.ReasoningEffort, Mode: a.opts.Mode, Permission: a.opts.Permission,
 		ResumeID: resumeID, SystemPrompt: a.opts.SystemPrompt, AppendSystemPrompt: a.opts.AppendPrompt,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return wrapSession(nativeSession), nil
-}
-
-func normalizeBackend(raw string) string {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "app-server", "app_server", "appserver", "ws":
-		return "app_server"
-	default:
-		return "exec"
-	}
+	return wrapSessionWithResume(nativeSession, resumeID != ""), nil
 }
 
 func splitCommand(command string) []string {
