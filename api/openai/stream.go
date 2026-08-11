@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -28,8 +29,34 @@ type streamChoice struct {
 }
 
 type streamDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role             string `json:"role,omitempty"`
+	Content          string `json:"content,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
+}
+
+const toolExecutionPrefix = "gateway.tool_execution.v1:"
+
+type toolExecutionSummary struct {
+	ID      string `json:"id"`
+	Name    string `json:"name,omitempty"`
+	Status  string `json:"status"`
+	IsError bool   `json:"is_error"`
+	Result  string `json:"result,omitempty"`
+}
+
+func encodeToolExecutionSummary(tool runtime.ToolCall) (string, error) {
+	summary := toolExecutionSummary{
+		ID:      tool.ID,
+		Name:    tool.Name,
+		Status:  "completed",
+		IsError: tool.IsError,
+		Result:  tool.Result,
+	}
+	data, err := json.Marshal(summary)
+	if err != nil {
+		return "", fmt.Errorf("encode tool execution summary: %w", err)
+	}
+	return toolExecutionPrefix + string(data), nil
 }
 
 func (c streamChunk) withChoices(choices ...streamChoice) streamChunk {
@@ -95,6 +122,8 @@ func (h *Handler) streamTurn(w http.ResponseWriter, r *http.Request, ctx context
 		finish     = ""
 		finishSeen = false
 		status     = "normal" // "normal" | "error" | "timeout"
+		started    = make(map[string]runtime.ToolCall)
+		completed  = make(map[string]struct{})
 	)
 	var grace <-chan time.Time
 	var timeout <-chan time.Time
@@ -139,15 +168,54 @@ loop:
 				})); err != nil {
 					return
 				}
+			case runtime.EventReasoning:
+				if finishSeen || ev.Reasoning == nil || ev.Reasoning.Text == "" {
+					continue
+				}
+				if err := writeChunk(base.withChoices(streamChoice{
+					Index: 0,
+					Delta: streamDelta{ReasoningContent: ev.Reasoning.Text},
+				})); err != nil {
+					return
+				}
 			case runtime.EventToolUse:
 				// Native Agent tools are already executed. Do not emit OpenAI
 				// delta.tool_calls, which would start a second orchestration loop.
+				if ev.Tool != nil && ev.Tool.ID != "" {
+					started[ev.Tool.ID] = *ev.Tool
+				}
 			case runtime.EventNativeSession:
 				if ev.NativeSessionID != "" {
 					_, _ = h.store.Update(context.Background(), sessionID, callerID, func(rec *runtime.SessionRecord) { rec.NativeSessionID = ev.NativeSessionID })
 				}
 			case runtime.EventToolResult:
-				// Tool results are not surfaced in OpenAI chat responses.
+				if ev.Tool == nil || ev.Tool.ID == "" {
+					continue
+				}
+				if _, seen := completed[ev.Tool.ID]; seen {
+					continue
+				}
+				tool := *ev.Tool
+				if prior, ok := started[tool.ID]; ok {
+					if tool.Name == "" {
+						tool.Name = prior.Name
+					}
+					if tool.Arguments == nil {
+						tool.Arguments = prior.Arguments
+					}
+				}
+				summary, err := encodeToolExecutionSummary(tool)
+				if err != nil {
+					slog.Warn("openai: encode native tool summary", "tool_id", tool.ID, "error", err)
+					continue
+				}
+				if err := writeChunk(base.withChoices(streamChoice{
+					Index: 0,
+					Delta: streamDelta{ReasoningContent: summary},
+				})); err != nil {
+					return
+				}
+				completed[tool.ID] = struct{}{}
 			case runtime.EventUsage:
 				if ev.Usage != nil {
 					usage = usageFromRuntime(ev.Usage)

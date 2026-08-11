@@ -842,6 +842,65 @@ func TestChatCompletions_StreamAllAgentsKeepInternalToolsOutOfModelToolCalls(t *
 	}
 }
 
+func TestChatCompletions_StreamProjectsReasoningAndTerminalToolSummary(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(
+			runtime.Event{Type: runtime.EventReasoning, Reasoning: &runtime.Reasoning{ID: "reason-1", Text: "checking workspace"}},
+			runtime.Event{Type: runtime.EventToolUse, Tool: &runtime.ToolCall{ID: "tool-1", Name: "Bash", Arguments: map[string]any{"command": "pwd"}}},
+			runtime.Event{Type: runtime.EventToolResult, Tool: &runtime.ToolCall{ID: "tool-1", Result: "/workspace", IsError: false}},
+			runtime.Event{Type: runtime.EventText, Text: "done"},
+			runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"},
+		)
+	})
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", true, defaultMessages()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	events := splitSSE(t, readBody(t, resp))
+	var reasoning []string
+	var content strings.Builder
+	for _, event := range events {
+		if event == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content          string          `json:"content"`
+					ReasoningContent string          `json:"reasoning_content"`
+					ToolCalls        json.RawMessage `json:"tool_calls"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(event), &chunk); err != nil {
+			t.Fatalf("decode chunk: %v (%q)", err, event)
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		delta := chunk.Choices[0].Delta
+		if delta.ToolCalls != nil {
+			t.Fatalf("native tool leaked as tool_calls: %s", event)
+		}
+		if delta.ReasoningContent != "" {
+			reasoning = append(reasoning, delta.ReasoningContent)
+		}
+		content.WriteString(delta.Content)
+	}
+	if len(reasoning) != 2 || reasoning[0] != "checking workspace" {
+		t.Fatalf("reasoning = %#v, want native reasoning and one tool summary", reasoning)
+	}
+	if !strings.HasPrefix(reasoning[1], "gateway.tool_execution.v1:") || !strings.Contains(reasoning[1], `"id":"tool-1"`) || !strings.Contains(reasoning[1], `"name":"Bash"`) {
+		t.Fatalf("tool summary = %q", reasoning[1])
+	}
+	if content.String() != "done" {
+		t.Errorf("content = %q, want done", content.String())
+	}
+}
+
 func TestChatCompletions_StreamUsage(t *testing.T) {
 	ts, _, backend := newTestServer(t)
 	backend.withScript(func(h *fakeHandle) {
