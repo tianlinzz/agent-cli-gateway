@@ -91,6 +91,14 @@ supplied) and the generated id is returned in the `X-Gateway-Session-Id`
 response header. Resume by sending that header back on the next request; the
 gateway reuses the running worker execution.
 
+Each completion is one complete autonomous Agent turn. Claude Code, Codex, and
+Kimi execute their own native tools inside the worker; those internal tool
+events are not returned as OpenAI `tool_calls`. Emitting them as model tool
+requests would make Agent frameworks execute an already-completed tool again
+and resubmit the same user message. A separate observability surface may expose
+native tool progress in the future without changing the chat-completions
+control flow.
+
 The concurrency boundary is explicit: there is **one active turn per session**.
 Different sessions in the **same workspace** may run concurrently and may
 therefore modify the same files; filesystem conflict policy belongs to the

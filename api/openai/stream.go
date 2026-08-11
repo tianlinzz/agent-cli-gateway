@@ -28,21 +28,8 @@ type streamChoice struct {
 }
 
 type streamDelta struct {
-	Role      string           `json:"role,omitempty"`
-	Content   string           `json:"content,omitempty"`
-	ToolCalls []streamToolCall `json:"tool_calls,omitempty"`
-}
-
-type streamToolCall struct {
-	Index    int                    `json:"index"`
-	ID       string                 `json:"id"`
-	Type     string                 `json:"type"`
-	Function streamToolCallFunction `json:"function"`
-}
-
-type streamToolCallFunction struct {
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
+	Role    string `json:"role,omitempty"`
+	Content string `json:"content,omitempty"`
 }
 
 func (c streamChunk) withChoices(choices ...streamChoice) streamChunk {
@@ -51,8 +38,8 @@ func (c streamChunk) withChoices(choices ...streamChoice) streamChunk {
 }
 
 // streamTurn serves POST /v1/chat/completions with stream=true. It converts
-// canonical events into OpenAI SSE chunks: role intro, content deltas, tool
-// call deltas, a final finish_reason chunk, optional usage chunk, and a final
+// canonical events into OpenAI SSE chunks: role intro, content deltas, a final
+// finish_reason chunk, optional usage chunk, and a final
 // "data: [DONE]" frame. Client disconnect and explicit abort cancel the turn
 // and terminate the stream. A closed events channel (execution terminated)
 // drops the dead handle so a later resume starts fresh.
@@ -104,7 +91,6 @@ func (h *Handler) streamTurn(w http.ResponseWriter, r *http.Request, ctx context
 
 	var (
 		usage      *usageInfo
-		toolCalls  []openAIToolCall
 		finish     = ""
 		finishSeen = false
 		status     = "normal" // "normal" | "error" | "timeout"
@@ -150,25 +136,8 @@ loop:
 					return
 				}
 			case runtime.EventToolUse:
-				if ev.Tool != nil {
-					tc := toOpenAIToolCall(*ev.Tool, len(toolCalls))
-					toolCalls = append(toolCalls, tc)
-					stc := streamToolCall{
-						Index: len(toolCalls) - 1,
-						ID:    tc.ID,
-						Type:  "function",
-						Function: streamToolCallFunction{
-							Name:      tc.Function.Name,
-							Arguments: tc.Function.Arguments,
-						},
-					}
-					if err := writeChunk(base.withChoices(streamChoice{
-						Index: 0,
-						Delta: streamDelta{ToolCalls: []streamToolCall{stc}},
-					})); err != nil {
-						return
-					}
-				}
+				// Native Agent tools are already executed. Do not emit OpenAI
+				// delta.tool_calls, which would start a second orchestration loop.
 			case runtime.EventNativeSession:
 				if ev.NativeSessionID != "" {
 					_, _ = h.store.Update(context.Background(), sessionID, callerID, func(rec *runtime.SessionRecord) { rec.NativeSessionID = ev.NativeSessionID })
@@ -205,7 +174,7 @@ loop:
 
 	if status != "error" {
 		// Final chunk with the mapped finish reason.
-		fr := mapFinishReason(finish, len(toolCalls))
+		fr := mapFinishReason(finish)
 		if err := writeChunk(base.withChoices(streamChoice{
 			Index:        0,
 			Delta:        streamDelta{},

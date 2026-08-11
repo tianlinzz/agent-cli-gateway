@@ -88,6 +88,13 @@ runtime/    → stdlib only
   `permission`, `usage`, `error`, `finish`, `status`. This is the only event
   shape that crosses the API boundary.
 
+Native `tool_use` and `tool_result` events are execution telemetry, not OpenAI
+model tool requests. The Agent CLI already executes those tools. Never map them
+to `message.tool_calls`, `delta.tool_calls`, or `finish_reason: tool_calls` on
+the OpenAI surface; doing so creates a second upstream Agent loop and repeats
+the same user turn. Expose native tool progress through a separate optional
+telemetry protocol if needed.
+
 ## Development Rules
 
 ### 1. No Hardcoded Agent Names in Runtime

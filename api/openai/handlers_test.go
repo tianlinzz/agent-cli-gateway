@@ -333,9 +333,9 @@ type choiceMessage struct {
 }
 
 type chatCompMessage struct {
-	Role      string           `json:"role"`
-	Content   *string          `json:"content"`
-	ToolCalls []openAIToolCall `json:"tool_calls"`
+	Role      string            `json:"role"`
+	Content   *string           `json:"content"`
+	ToolCalls []json.RawMessage `json:"tool_calls"`
 }
 
 // sseData is one parsed SSE event.
@@ -538,7 +538,7 @@ func TestChatCompletions_AgentError(t *testing.T) {
 	}
 }
 
-func TestChatCompletions_ToolCalls(t *testing.T) {
+func TestChatCompletions_InternalAgentToolsDoNotBecomeModelToolCalls(t *testing.T) {
 	ts, _, backend := newTestServer(t)
 	backend.withScript(func(h *fakeHandle) {
 		h.emit(
@@ -565,32 +565,26 @@ func TestChatCompletions_ToolCalls(t *testing.T) {
 		t.Fatalf("choices len = %d", len(cb.Choices))
 	}
 	ch := cb.Choices[0]
-	if len(ch.Message.ToolCalls) != 1 {
-		t.Fatalf("tool_calls len = %d, want 1", len(ch.Message.ToolCalls))
+	if len(ch.Message.ToolCalls) != 0 {
+		t.Fatalf("tool_calls = %#v, want none; the native agent already executed them", ch.Message.ToolCalls)
 	}
-	tc := ch.Message.ToolCalls[0]
-	if tc.Type != "function" || tc.Function.Name != "Bash" {
-		t.Errorf("tool call = %+v, want function Bash", tc)
+	if ch.Message.Content == nil || *ch.Message.Content != "Let me run that." {
+		t.Errorf("content = %v, want native assistant text", ch.Message.Content)
 	}
-	if !strings.Contains(tc.Function.Arguments, "ls -la") {
-		t.Errorf("tool call arguments = %q, want to contain ls -la", tc.Function.Arguments)
-	}
-	// A concrete canonical reason (end_turn) wins over the presence of tool
-	// calls: the turn is done, so clients must not loop again on tools.
 	if ch.FinishReason == nil || *ch.FinishReason != "stop" {
-		t.Errorf("finish_reason = %v, want stop (end_turn is canonical)", ch.FinishReason)
+		t.Errorf("finish_reason = %v, want stop so the OpenAI caller does not start another tool loop", ch.FinishReason)
 	}
 }
 
-func TestChatCompletions_ToolCalls_EmptyReason(t *testing.T) {
+func TestChatCompletions_InternalAgentToolWithEmptyReasonStillStops(t *testing.T) {
 	ts, _, backend := newTestServer(t)
 	backend.withScript(func(h *fakeHandle) {
 		h.emit(
 			runtime.Event{Type: runtime.EventToolUse, Tool: &runtime.ToolCall{
 				Name: "Bash", Arguments: map[string]any{"command": "ls"},
 			}},
-			// No explicit finish reason: the tool call is the last action, so
-			// the gateway synthesizes finish_reason tool_calls.
+			// A missing native reason must not turn an already-executed internal
+			// tool into an instruction for the OpenAI caller to execute it again.
 			runtime.Event{Type: runtime.EventFinish, FinishReason: ""},
 		)
 	})
@@ -607,11 +601,11 @@ func TestChatCompletions_ToolCalls_EmptyReason(t *testing.T) {
 		t.Fatalf("choices len = %d, want 1", len(cb.Choices))
 	}
 	ch := cb.Choices[0]
-	if len(ch.Message.ToolCalls) != 1 {
-		t.Fatalf("tool_calls len = %d, want 1", len(ch.Message.ToolCalls))
+	if len(ch.Message.ToolCalls) != 0 {
+		t.Fatalf("tool_calls = %#v, want none", ch.Message.ToolCalls)
 	}
-	if ch.FinishReason == nil || *ch.FinishReason != "tool_calls" {
-		t.Errorf("finish_reason = %v, want tool_calls (synthesized from empty reason)", ch.FinishReason)
+	if ch.FinishReason == nil || *ch.FinishReason != "stop" {
+		t.Errorf("finish_reason = %v, want stop", ch.FinishReason)
 	}
 }
 
@@ -642,9 +636,9 @@ func TestChatCompletions_UnknownFinishReason(t *testing.T) {
 	}
 }
 
-// TestMapFinishReason pins the finish_reason mapping contract: concrete
-// canonical reasons win, tool_calls is only synthesized from an empty reason,
-// and unknown reasons fall back to the safe OpenAI default.
+// TestMapFinishReason pins the Agent-as-model boundary. Native tool-related
+// reasons are internal lifecycle details, never requests for the OpenAI caller
+// to execute a function and invoke this autonomous Agent again.
 func TestMapFinishReason(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -658,12 +652,10 @@ func TestMapFinishReason(t *testing.T) {
 		{"explicit stop after tools", "stop", 1, "stop"},
 		{"plain end_turn", "end_turn", 0, "stop"},
 		{"empty reason, no tools", "", 0, "stop"},
-		// tool_calls is synthesized only when no canonical reason was given and
-		// the turn ended on a tool use.
-		{"synthesize after tool use", "", 1, "tool_calls"},
-		{"known tool_use reason", "tool_use", 1, "tool_calls"},
-		{"known function_calls reason", "function_calls", 1, "tool_calls"},
-		{"known requires_action reason", "requires_action", 1, "tool_calls"},
+		{"empty reason after internal tool", "", 1, "stop"},
+		{"native tool_use reason", "tool_use", 1, "stop"},
+		{"native function_calls reason", "function_calls", 1, "stop"},
+		{"native requires_action reason", "requires_action", 1, "stop"},
 		// Unknown reasons fall back to the safe OpenAI default.
 		{"unknown reason", "pause_turn", 0, "stop"},
 		{"unknown reason after tools", "idk", 1, "stop"},
@@ -672,8 +664,8 @@ func TestMapFinishReason(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := mapFinishReason(c.reason, c.toolCalls); got != c.want {
-				t.Errorf("mapFinishReason(%q, %d) = %q, want %q", c.reason, c.toolCalls, got, c.want)
+			if got := mapFinishReason(c.reason); got != c.want {
+				t.Errorf("mapFinishReason(%q) = %q, want %q", c.reason, got, c.want)
 			}
 		})
 	}
@@ -750,6 +742,63 @@ func TestChatCompletions_Stream(t *testing.T) {
 		t.Error("no final chunk with finish_reason seen")
 	} else if lastFinish == nil || *lastFinish != "stop" {
 		t.Errorf("finish_reason = %v, want stop", lastFinish)
+	}
+}
+
+func TestChatCompletions_StreamInternalAgentToolsAreNotModelToolCalls(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(
+			runtime.Event{Type: runtime.EventText, Text: "before "},
+			runtime.Event{Type: runtime.EventToolUse, Tool: &runtime.ToolCall{
+				Name: "Bash", Arguments: map[string]any{"command": "pwd"},
+			}},
+			runtime.Event{Type: runtime.EventToolResult, Tool: &runtime.ToolCall{
+				Name: "Bash", Result: "/workspace", IsError: false,
+			}},
+			runtime.Event{Type: runtime.EventText, Text: "after"},
+			runtime.Event{Type: runtime.EventFinish, FinishReason: "tool_use"},
+		)
+	})
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", true, defaultMessages()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	events := splitSSE(t, readBody(t, resp))
+	var content strings.Builder
+	var finish string
+	for _, event := range events {
+		if event == "[DONE]" {
+			continue
+		}
+		if strings.Contains(event, `"tool_calls"`) {
+			t.Fatalf("native tool leaked as OpenAI tool_calls: %s", event)
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(event), &chunk); err != nil {
+			t.Fatalf("decode chunk: %v (%q)", err, event)
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		content.WriteString(chunk.Choices[0].Delta.Content)
+		if chunk.Choices[0].FinishReason != nil {
+			finish = *chunk.Choices[0].FinishReason
+		}
+	}
+	if got := content.String(); got != "before after" {
+		t.Errorf("content = %q, want native text around the internal tool", got)
+	}
+	if finish != "stop" {
+		t.Errorf("finish_reason = %q, want stop", finish)
 	}
 }
 

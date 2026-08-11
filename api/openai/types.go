@@ -423,18 +423,6 @@ type ChatFunctionCall struct {
 	Arguments string `json:"arguments"`
 }
 
-// openAIToolCall is the response form of a tool call (message.tool_calls[i]).
-type openAIToolCall struct {
-	ID       string             `json:"id"`
-	Type     string             `json:"type"`
-	Function openAIFunctionCall `json:"function"`
-}
-
-type openAIFunctionCall struct {
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
-}
-
 // usageInfo is the OpenAI usage object.
 type usageInfo struct {
 	PromptTokens     int `json:"prompt_tokens"`

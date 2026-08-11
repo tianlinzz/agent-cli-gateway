@@ -454,7 +454,6 @@ func (h *Handler) handleAbort(w http.ResponseWriter, r *http.Request) {
 
 type turnResult struct {
 	content      string
-	toolCalls    []openAIToolCall
 	usage        *usageInfo
 	finishReason string
 	failed       bool
@@ -504,11 +503,12 @@ func (h *Handler) aggregateTurn(ctx context.Context, sessionID, callerID string,
 					_, _ = h.store.Update(context.Background(), sessionID, callerID, func(rec *runtime.SessionRecord) { rec.NativeSessionID = ev.NativeSessionID })
 				}
 			case runtime.EventToolUse:
-				if ev.Tool != nil {
-					res.toolCalls = append(res.toolCalls, toOpenAIToolCall(*ev.Tool, len(res.toolCalls)))
-				}
+				// The autonomous Agent already executes its native tools. Exposing
+				// them as OpenAI tool_calls would make an upstream Agent framework
+				// execute them again and resubmit the same user turn.
 			case runtime.EventToolResult:
-				// Tool results are not surfaced in OpenAI chat responses.
+				// Internal tool telemetry is intentionally not part of the OpenAI
+				// model response. It belongs on a separate observability surface.
 			case runtime.EventUsage:
 				if ev.Usage != nil {
 					res.usage = usageFromRuntime(ev.Usage)
@@ -556,9 +556,8 @@ type completionChoice struct {
 }
 
 type chatCompletionMessage struct {
-	Role      string           `json:"role"`
-	Content   *string          `json:"content"`
-	ToolCalls []openAIToolCall `json:"tool_calls,omitempty"`
+	Role    string  `json:"role"`
+	Content *string `json:"content"`
 }
 
 // writeCompletion writes the aggregated non-streaming result. Agent errors use
@@ -576,14 +575,8 @@ func (h *Handler) writeCompletion(w http.ResponseWriter, r *http.Request, model 
 		return
 	}
 
-	finish := mapFinishReason(res.finishReason, len(res.toolCalls))
-	var content *string
-	if res.content == "" && len(res.toolCalls) > 0 {
-		content = nil // OpenAI sends null content when the message is tool-only
-	} else {
-		c := res.content
-		content = &c
-	}
+	finish := mapFinishReason(res.finishReason)
+	content := res.content
 	resp := completionResponse{
 		ID:      "chatcmpl-" + h.newID(),
 		Object:  "chat.completion",
@@ -592,9 +585,8 @@ func (h *Handler) writeCompletion(w http.ResponseWriter, r *http.Request, model 
 		Choices: []completionChoice{{
 			Index: 0,
 			Message: chatCompletionMessage{
-				Role:      "assistant",
-				Content:   content,
-				ToolCalls: res.toolCalls,
+				Role:    "assistant",
+				Content: &content,
 			},
 			FinishReason: &finish,
 			Logprobs:     nil,
@@ -606,51 +598,18 @@ func (h *Handler) writeCompletion(w http.ResponseWriter, r *http.Request, model 
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// toOpenAIToolCall converts a canonical tool call into the OpenAI response
-// shape, generating a stable id when the agent supplied none.
-func toOpenAIToolCall(tc runtime.ToolCall, index int) openAIToolCall {
-	id := tc.ID
-	if id == "" {
-		id = fmt.Sprintf("call_%d", index)
-	}
-	args := ""
-	if tc.Arguments != nil {
-		if b, err := json.Marshal(tc.Arguments); err == nil {
-			args = string(b)
-		}
-	}
-	return openAIToolCall{
-		ID:   id,
-		Type: "function",
-		Function: openAIFunctionCall{
-			Name:      tc.Name,
-			Arguments: args,
-		},
-	}
-}
-
-// mapFinishReason converts canonical finish reasons into OpenAI values. OpenAI
-// clients use finish_reason to decide whether to continue the tool loop, so a
-// concrete canonical reason wins whenever it is non-empty: end_turn/stop map to
-// "stop" and known tool-related reasons map to "tool_calls". Only when no
-// canonical reason was provided do we synthesize "tool_calls" from the fact that
-// the turn ended on a tool use. Unknown reasons fall back to the safe "stop"
-// default — the valid OpenAI values are exactly stop, length, tool_calls and
-// content_filter, and we never pass arbitrary agent strings through.
-func mapFinishReason(reason string, toolCalls int) string {
+// mapFinishReason converts native Agent completion reasons into OpenAI model
+// values. Native tools have already run inside the autonomous Agent, so even a
+// tool-related native reason means this OpenAI turn is complete. Returning
+// "tool_calls" would cause upstream Agent frameworks to invoke the Gateway
+// again with the same user message.
+func mapFinishReason(reason string) string {
 	switch strings.ToLower(strings.TrimSpace(reason)) {
-	case "end_turn", "stop":
+	case "end_turn", "stop", "tool_calls", "tool_call", "function_calls", "function_call", "tool_use", "requires_action":
 		return "stop"
 	case "max_tokens", "length":
 		return "length"
-	case "tool_calls", "tool_call", "function_calls", "function_call", "tool_use", "requires_action":
-		return "tool_calls"
 	case "":
-		// No explicit reason: synthesize only when a tool call was the last
-		// action of the turn.
-		if toolCalls > 0 {
-			return "tool_calls"
-		}
 		return "stop"
 	default:
 		return "stop"
