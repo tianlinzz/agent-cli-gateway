@@ -1,9 +1,11 @@
-// Package kimi drives native Kimi Code CLI sessions.
+// Package kimi drives one persistent native `kimi acp` process.
 package kimi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -14,32 +16,89 @@ import (
 	agentprotocol "github.com/tianlinzz/agent-cli-gateway/agent/protocol"
 )
 
+const maxACPFrame = 10 * 1024 * 1024
+
+type activePrompt struct {
+	done      chan struct{}
+	cancel    context.CancelFunc
+	usage     *Usage
+	tools     map[string]ToolCall
+	results   map[string]bool
+	aborted   bool
+	completed bool
+}
+
 type Session struct {
-	opts       Options
-	ctx        context.Context
-	cancel     context.CancelFunc
-	events     chan Event
-	sessionID  atomic.Value
-	alive      atomic.Bool
-	mu         sync.Mutex
-	inFlight   *agentprocess.Process
-	turnDone   map[*agentprocess.Process]chan struct{}
-	turnCancel map[*agentprocess.Process]context.CancelFunc
-	aborted    map[*agentprocess.Process]bool
-	wg         sync.WaitGroup
-	close      sync.Once
+	opts    Options
+	process *agentprocess.Process
+	rpc     *agentprotocol.JSONRPCClient
+	events  chan Event
+	ctx     context.Context
+	cancel  context.CancelFunc
+	done    chan struct{}
+
+	sessionID atomic.Value
+	alive     atomic.Bool
+	closing   atomic.Bool
+	close     sync.Once
+	wg        sync.WaitGroup
+	mu        sync.Mutex
+	active    *activePrompt
 }
 
-func New(options Options) *Session {
+func Start(ctx context.Context, options Options) (*Session, error) {
+	if ctx == nil {
+		return nil, protocolError("nil context")
+	}
 	opts := NormalizeOptions(options)
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &Session{opts: opts, ctx: ctx, cancel: cancel, events: make(chan Event, 64), turnDone: map[*agentprocess.Process]chan struct{}{}, turnCancel: map[*agentprocess.Process]context.CancelFunc{}, aborted: map[*agentprocess.Process]bool{}}
-	s.sessionID.Store(opts.ResumeID)
+	sessionCtx, cancel := context.WithCancel(ctx)
+	command := append([]string(nil), opts.Command...)
+	command = append(command, BuildArgs(opts, "", opts.ResumeID)...)
+	proc, err := agentprocess.Start(sessionCtx, agentprocess.Spec{Command: command, Dir: opts.WorkDir, Env: opts.Env, Stdin: true})
+	if err != nil {
+		cancel()
+		return nil, protocolError("start ACP: %w", err)
+	}
+	s := &Session{opts: opts, process: proc, events: make(chan Event, 64), ctx: sessionCtx, cancel: cancel, done: make(chan struct{})}
+	s.sessionID.Store("")
+	s.rpc = agentprotocol.NewJSONRPCClient(proc.Stdin(), proc.Stdout(), maxACPFrame, s.handleReverse, s.handleNotification)
+	if err := s.initialize(ctx); err != nil {
+		s.cleanupFailedStart()
+		return nil, err
+	}
 	s.alive.Store(true)
-	return s
+	go s.monitor()
+	return s, nil
 }
 
-func (s *Session) Send(ctx context.Context, input Input) error {
+func (s *Session) initialize(ctx context.Context) error {
+	var initialized struct {
+		ProtocolVersion int `json:"protocolVersion"`
+	}
+	if err := s.rpc.Call(ctx, "initialize", map[string]any{"protocolVersion": 1, "clientCapabilities": map[string]any{}}, &initialized); err != nil {
+		return protocolError("initialize ACP: %w", err)
+	}
+	params := map[string]any{"cwd": s.opts.WorkDir, "mcpServers": []any{}}
+	method := "session/new"
+	if s.opts.ResumeID != "" {
+		method = "session/resume"
+		params["sessionId"] = s.opts.ResumeID
+	}
+	var response struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := s.rpc.Call(ctx, method, params, &response); err != nil {
+		return protocolError("%s: %w", method, err)
+	}
+	if strings.TrimSpace(response.SessionID) == "" {
+		return protocolError("%s returned an empty session id", method)
+	}
+	s.sessionID.Store(response.SessionID)
+	s.emit(Event{Kind: EventNativeSession, NativeSessionID: response.SessionID})
+	return nil
+}
+
+func (s *Session) Send(_ context.Context, input Input) error {
 	if !s.alive.Load() {
 		return protocolError("session is closed")
 	}
@@ -47,220 +106,275 @@ func (s *Session) Send(ctx context.Context, input Input) error {
 	if prompt == "" {
 		return protocolError("empty prompt")
 	}
+	turnCtx, cancel := context.WithTimeout(s.ctx, s.opts.Timeout)
+	turn := &activePrompt{done: make(chan struct{}), cancel: cancel, tools: make(map[string]ToolCall), results: make(map[string]bool)}
 	s.mu.Lock()
-	previous := s.inFlight
-	previousDone := s.turnDone[previous]
-	s.mu.Unlock()
-	if previousDone != nil {
-		select {
-		case <-previousDone:
-		case <-ctx.Done():
-			return protocolError("wait previous turn: %w", ctx.Err())
-		}
-	}
-
-	turnCtx, cancel := context.WithCancel(s.ctx)
-	if s.opts.Timeout > 0 {
-		turnCtx, cancel = context.WithTimeout(s.ctx, s.opts.Timeout)
-	}
-	command := append([]string(nil), s.opts.Command...)
-	command = append(command, BuildArgs(s.opts, prompt, s.NativeSessionID())...)
-	proc, err := agentprocess.Start(turnCtx, agentprocess.Spec{Command: command, Dir: s.opts.WorkDir, Env: s.opts.Env})
-	if err != nil {
-		cancel()
-		return protocolError("start turn: %w", err)
-	}
-	done := make(chan struct{})
-	s.mu.Lock()
-	if s.inFlight != nil {
+	if s.active != nil {
 		s.mu.Unlock()
 		cancel()
-		_ = proc.ForceKill()
-		_ = proc.Wait()
 		return protocolError("turn already active")
 	}
-	s.inFlight = proc
-	s.turnDone[proc] = done
-	s.turnCancel[proc] = cancel
+	s.active = turn
 	s.mu.Unlock()
 	s.wg.Add(1)
-	go s.readTurn(proc)
+	go func() {
+		defer s.wg.Done()
+		s.runPrompt(turnCtx, turn, prompt)
+	}()
 	return nil
 }
 
-type turnState struct {
-	pending []string
-	usage   *Usage
-}
-
-func (s *Session) readTurn(proc *agentprocess.Process) {
-	defer s.wg.Done()
-	defer s.clearTurn(proc)
-	state := &turnState{}
-	decoder := agentprotocol.NewJSONLDecoder(proc.Stdout(), 10*1024*1024)
-	for {
-		var raw map[string]any
-		err := decoder.Decode(&raw)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			if !s.wasAborted(proc) {
-				s.emit(Event{Kind: EventError, Err: protocolError("decode stream: %w", err)})
-			}
-			_ = proc.ForceKill()
-			break
-		}
-		s.handleEvent(state, raw)
+func (s *Session) runPrompt(ctx context.Context, turn *activePrompt, prompt string) {
+	var response struct {
+		StopReason string `json:"stopReason"`
 	}
-	waitErr := proc.Wait()
-	stderr := proc.StderrString()
-	if id := extractResumeID(stderr); id != "" && id != s.NativeSessionID() {
-		s.sessionID.Store(id)
-		s.emit(Event{Kind: EventNativeSession, NativeSessionID: id})
-	}
-	if waitErr != nil && !s.wasAborted(proc) && s.alive.Load() {
-		s.emit(Event{Kind: EventError, Err: protocolError("process exited: %s", strings.TrimSpace(stderr))})
+	err := s.rpc.Call(ctx, "session/prompt", map[string]any{
+		"sessionId": s.NativeSessionID(),
+		"prompt":    []map[string]any{{"type": "text", "text": prompt}},
+	}, &response)
+	if err != nil {
+		s.completePrompt(turn, "", protocolError("session/prompt: %w", err))
 		return
 	}
-	s.flush(state)
-	s.emit(Event{Kind: EventFinish, FinishReason: "end_turn", NativeSessionID: s.NativeSessionID()})
-	if state.usage != nil {
-		s.emit(Event{Kind: EventUsage, Usage: state.usage, NativeSessionID: s.NativeSessionID()})
+	s.completePrompt(turn, response.StopReason, nil)
+}
+
+func (s *Session) completePrompt(turn *activePrompt, stopReason string, promptErr error) {
+	s.mu.Lock()
+	if turn.completed {
+		s.mu.Unlock()
+		return
+	}
+	turn.completed = true
+	turn.cancel()
+	if s.active == turn {
+		s.active = nil
+	}
+	usage := turn.usage
+	aborted := turn.aborted
+	close(turn.done)
+	s.mu.Unlock()
+	if promptErr != nil && !aborted {
+		s.emit(Event{Kind: EventError, Err: promptErr})
+		return
+	}
+	reason := normalizeStopReason(stopReason)
+	if aborted {
+		reason = "cancelled"
+	}
+	s.emit(Event{Kind: EventFinish, FinishReason: reason, NativeSessionID: s.NativeSessionID()})
+	if usage != nil {
+		s.emit(Event{Kind: EventUsage, Usage: usage, NativeSessionID: s.NativeSessionID()})
 	}
 }
 
-func (s *Session) handleEvent(state *turnState, raw map[string]any) {
-	role, _ := raw["role"].(string)
-	switch role {
-	case "assistant":
-		if usage := usageFromValue(raw["usage"]); usage != nil {
-			state.usage = usage
-		}
-		content, _ := raw["content"].([]any)
-		for _, value := range content {
-			block, ok := value.(map[string]any)
-			if !ok {
-				continue
-			}
-			switch kind, _ := block["type"].(string); kind {
-			case "think", "thinking":
-				// Keep private reasoning out of OpenAI assistant content.
-				continue
-			case "text":
-				if text, _ := block["text"].(string); text != "" {
-					state.pending = append(state.pending, text)
-				}
+func (s *Session) handleNotification(message agentprotocol.RPCMessage) {
+	if message.Method != "session/update" {
+		return
+	}
+	var params map[string]any
+	if json.Unmarshal(message.Params, &params) != nil || stringValue(params["sessionId"]) != s.NativeSessionID() {
+		return
+	}
+	update := objectValue(params["update"])
+	switch stringValue(update["sessionUpdate"]) {
+	case "agent_message_chunk":
+		content := objectValue(update["content"])
+		if stringValue(content["type"]) == "text" {
+			if text := stringValue(content["text"]); text != "" {
+				s.emit(Event{Kind: EventText, Text: text})
 			}
 		}
-		calls, _ := raw["tool_calls"].([]any)
-		if len(calls) > 0 {
-			s.flush(state)
-		}
-		for _, value := range calls {
-			call, _ := value.(map[string]any)
-			function, _ := call["function"].(map[string]any)
-			id, _ := call["id"].(string)
-			name, _ := function["name"].(string)
-			args, _ := function["arguments"].(string)
-			s.emit(Event{Kind: EventToolUse, Tool: &ToolCall{ID: id, Name: name, Arguments: toolArgs(args)}})
-		}
-	case "tool":
-		id, _ := raw["tool_call_id"].(string)
-		content, _ := raw["content"].([]any)
-		var parts []string
-		for _, value := range content {
-			if block, ok := value.(map[string]any); ok {
-				if text, _ := block["text"].(string); text != "" {
-					parts = append(parts, text)
-				}
+	case "tool_call":
+		s.handleToolStart(update)
+	case "tool_call_update":
+		s.handleToolUpdate(update)
+	case "usage_update":
+		used := intValue(update["used"])
+		if used > 0 {
+			s.mu.Lock()
+			if s.active != nil {
+				s.active.usage = &Usage{TotalTokens: used}
 			}
+			s.mu.Unlock()
 		}
-		s.emit(Event{Kind: EventToolResult, Tool: &ToolCall{ID: id, Result: strings.Join(parts, "\n")}})
 	}
 }
 
-func (s *Session) flush(state *turnState) {
-	for _, text := range state.pending {
-		s.emit(Event{Kind: EventText, Text: text})
+func (s *Session) handleToolStart(update map[string]any) {
+	tool := toolFromUpdate(update)
+	if tool.ID == "" {
+		return
 	}
-	state.pending = nil
+	s.mu.Lock()
+	turn := s.active
+	if turn == nil {
+		s.mu.Unlock()
+		return
+	}
+	if _, exists := turn.tools[tool.ID]; exists {
+		s.mu.Unlock()
+		return
+	}
+	turn.tools[tool.ID] = tool
+	s.mu.Unlock()
+	s.emit(Event{Kind: EventToolUse, Tool: &tool})
 }
+
+func (s *Session) handleToolUpdate(update map[string]any) {
+	status := strings.ToLower(stringValue(update["status"]))
+	if status != "completed" && status != "failed" {
+		return
+	}
+	tool := toolFromUpdate(update)
+	if tool.ID == "" {
+		return
+	}
+	s.mu.Lock()
+	turn := s.active
+	if turn == nil || turn.results[tool.ID] {
+		s.mu.Unlock()
+		return
+	}
+	turn.results[tool.ID] = true
+	start, started := turn.tools[tool.ID]
+	if started {
+		tool.Name, tool.Arguments = start.Name, start.Arguments
+	} else {
+		turn.tools[tool.ID] = tool
+	}
+	s.mu.Unlock()
+	if !started {
+		copy := tool
+		copy.Result = ""
+		s.emit(Event{Kind: EventToolUse, Tool: &copy})
+	}
+	tool.Result = toolContent(update["content"])
+	tool.IsError = status == "failed"
+	s.emit(Event{Kind: EventToolResult, Tool: &tool})
+}
+
+func (s *Session) handleReverse(_ context.Context, message agentprotocol.RPCMessage) (any, *agentprotocol.RPCError) {
+	if message.Method != "session/request_permission" {
+		return nil, &agentprotocol.RPCError{Code: -32601, Message: "unsupported server request"}
+	}
+	var params map[string]any
+	_ = json.Unmarshal(message.Params, &params)
+	toolCall := objectValue(params["toolCall"])
+	id := stringValue(toolCall["toolCallId"])
+	s.emit(Event{Kind: EventPermission, Permission: &PermissionRequest{ID: id, Action: stringValue(toolCall["title"]), Detail: toolContent(toolCall["content"])}})
+	if s.opts.Permission == "auto" {
+		if option := allowedOption(params["options"]); option != "" {
+			return map[string]any{"outcome": map[string]any{"outcome": "selected", "optionId": option}}, nil
+		}
+	}
+	return map[string]any{"outcome": map[string]any{"outcome": "cancelled"}}, nil
+}
+
+func (s *Session) Abort(ctx context.Context) error {
+	s.mu.Lock()
+	turn := s.active
+	if turn == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	turn.aborted = true
+	done := turn.done
+	s.mu.Unlock()
+	if err := s.rpc.Notify(ctx, "session/cancel", map[string]any{"sessionId": s.NativeSessionID()}); err != nil {
+		return s.abortEscalation(fmt.Errorf("session/cancel: %w", err))
+	}
+	timer := time.NewTimer(s.opts.Timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return s.abortEscalation(fmt.Errorf("cancel wait: %w", ctx.Err()))
+	case <-timer.C:
+		return s.abortEscalation(fmt.Errorf("cancel timed out after %s", s.opts.Timeout))
+	}
+}
+
+func (s *Session) abortEscalation(cause error) error {
+	s.closing.Store(true)
+	s.alive.Store(false)
+	s.cancel()
+	_ = s.rpc.Close()
+	_ = s.process.ForceKill()
+	_ = s.process.Wait()
+	return protocolError("abort: %w", cause)
+}
+
+func (s *Session) monitor() {
+	<-s.rpc.Done()
+	waitErr := s.process.Wait()
+	s.wg.Wait()
+	s.alive.Store(false)
+	if !s.closing.Load() {
+		message := strings.TrimSpace(s.process.StderrString())
+		if message == "" {
+			if waitErr != nil {
+				message = waitErr.Error()
+			} else if err := s.rpc.Err(); err != nil && !errors.Is(err, io.EOF) {
+				message = err.Error()
+			}
+		}
+		if message != "" {
+			s.emit(Event{Kind: EventError, Err: protocolError("ACP exited: %s", message)})
+		}
+	}
+	s.close.Do(func() { close(s.events); close(s.done) })
+}
+
+func (s *Session) cleanupFailedStart() {
+	s.closing.Store(true)
+	s.cancel()
+	_ = s.rpc.Close()
+	_ = s.process.ForceKill()
+	_ = s.process.Wait()
+}
+
 func (s *Session) emit(event Event) {
 	select {
 	case s.events <- event:
 	case <-s.ctx.Done():
 	}
 }
-func (s *Session) Events() <-chan Event    { return s.events }
-func (s *Session) NativeSessionID() string { value, _ := s.sessionID.Load().(string); return value }
-func (s *Session) Alive() bool             { return s.alive.Load() }
 
-func (s *Session) clearTurn(proc *agentprocess.Process) {
-	s.mu.Lock()
-	done := s.turnDone[proc]
-	cancel := s.turnCancel[proc]
-	delete(s.turnDone, proc)
-	delete(s.turnCancel, proc)
-	delete(s.aborted, proc)
-	if s.inFlight == proc {
-		s.inFlight = nil
-	}
-	s.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-	if done != nil {
-		close(done)
-	}
+func (s *Session) Events() <-chan Event { return s.events }
+func (s *Session) NativeSessionID() string {
+	value, _ := s.sessionID.Load().(string)
+	return value
 }
-func (s *Session) wasAborted(proc *agentprocess.Process) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.aborted[proc]
-}
-
-func (s *Session) Abort(ctx context.Context) error {
-	s.mu.Lock()
-	proc := s.inFlight
-	if proc == nil {
-		s.mu.Unlock()
-		return nil
-	}
-	s.aborted[proc] = true
-	done := s.turnDone[proc]
-	s.mu.Unlock()
-	if err := proc.ForceKill(); err != nil {
-		return protocolError("abort: %w", err)
-	}
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return protocolError("abort wait: %w", ctx.Err())
-	}
-}
+func (s *Session) Alive() bool { return s.alive.Load() }
 
 func (s *Session) Close(ctx context.Context) error {
 	if !s.alive.Swap(false) {
-		return nil
+		select {
+		case <-s.done:
+			return nil
+		default:
+		}
 	}
+	s.closing.Store(true)
 	s.cancel()
-	s.mu.Lock()
-	proc := s.inFlight
-	s.mu.Unlock()
-	if proc != nil {
-		_ = proc.ForceKill()
-	}
-	done := make(chan struct{})
-	go func() { s.wg.Wait(); close(done) }()
+	_ = s.rpc.Close()
+	timer := time.NewTimer(s.opts.Timeout)
+	defer timer.Stop()
 	select {
-	case <-done:
+	case <-s.done:
+		return nil
 	case <-ctx.Done():
+		_ = s.process.ForceKill()
 		return protocolError("close wait: %w", ctx.Err())
-	case <-time.After(8 * time.Second):
-		return protocolError("close timed out")
+	case <-timer.C:
+		_ = s.process.ForceKill()
+		select {
+		case <-s.done:
+			return nil
+		case <-time.After(s.opts.Timeout):
+			return protocolError("close timed out after %s", 2*s.opts.Timeout)
+		}
 	}
-	s.close.Do(func() { close(s.events) })
-	return nil
 }

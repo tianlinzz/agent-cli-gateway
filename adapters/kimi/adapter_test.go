@@ -10,12 +10,12 @@ import (
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
 )
 
-func TestDescribeDeclaresResumePerTurn(t *testing.T) {
-	descriptor, err := newAdapter(context.Background(), Options{}, nil, nil).Describe(context.Background())
+func TestDescribeDeclaresPersistentProcess(t *testing.T) {
+	descriptor, err := newAdapter(Options{}, nil).Describe(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if descriptor.ModelID != "kimi" || descriptor.LifecycleMode != runtime.LifecycleResumePerTurn {
+	if descriptor.ModelID != "kimi" || descriptor.LifecycleMode != runtime.LifecyclePersistentProcess {
 		t.Fatalf("descriptor = %#v", descriptor)
 	}
 	if !descriptor.Capabilities.Streaming || !descriptor.Capabilities.ToolCalls || !descriptor.Capabilities.Resume || !descriptor.Capabilities.MultiTurn {
@@ -23,23 +23,17 @@ func TestDescribeDeclaresResumePerTurn(t *testing.T) {
 	}
 }
 
-func TestAdapterProbesOnceAndMapsTrustedOptions(t *testing.T) {
+func TestAdapterMapsTrustedOptions(t *testing.T) {
 	capture := &captureStarter{session: newFakeSession("native-1")}
-	probeCalls := 0
-	adapter := newAdapter(context.Background(), Options{
-		Command: "kimi --debug",
-		Env:     []string{"KIMI_API_KEY=secret"},
-		WorkDir: "/workspace",
-		Model:   "kimi-k2",
-		Mode:    "plan",
-		Timeout: 30 * time.Second,
-	}, capture.Start, func(_ context.Context, command []string, _ time.Duration) native.FlagSupport {
-		probeCalls++
-		if strings.Join(command, " ") != "kimi --debug" {
-			t.Fatalf("probe command = %#v", command)
-		}
-		return native.FlagSupport{Print: true}
-	})
+	adapter := newAdapter(Options{
+		Command:    "kimi --debug",
+		Env:        []string{"KIMI_API_KEY=secret"},
+		WorkDir:    "/workspace",
+		Model:      "kimi-k2",
+		Mode:       "plan",
+		Timeout:    30 * time.Second,
+		Permission: "deny",
+	}, capture.Start)
 
 	_, err := adapter.Start(context.Background(), runtime.StartRequest{
 		Metadata: map[string]string{"native_session_id": "resume-1"},
@@ -47,26 +41,16 @@ func TestAdapterProbesOnceAndMapsTrustedOptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if probeCalls != 1 {
-		t.Fatalf("probe calls = %d, want 1", probeCalls)
-	}
 	if got := strings.Join(capture.options.Command, " "); got != "kimi --debug" {
 		t.Fatalf("command = %q", got)
 	}
-	if capture.options.ResumeID != "resume-1" || capture.options.WorkDir != "/workspace" || capture.options.Model != "kimi-k2" || capture.options.Mode != "plan" || capture.options.Timeout != 30*time.Second {
+	if capture.options.ResumeID != "resume-1" || capture.options.WorkDir != "/workspace" || capture.options.Model != "kimi-k2" || capture.options.Mode != "plan" || capture.options.Permission != "deny" || capture.options.Timeout != 30*time.Second {
 		t.Fatalf("options = %#v", capture.options)
 	}
-	if !capture.options.Flags.Print || len(capture.options.Env) != 1 || capture.options.Env[0] != "KIMI_API_KEY=secret" {
+	if len(capture.options.Env) != 1 || capture.options.Env[0] != "KIMI_API_KEY=secret" {
 		t.Fatalf("options = %#v", capture.options)
 	}
 
-	_, err = adapter.Start(context.Background(), runtime.StartRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if probeCalls != 1 {
-		t.Fatalf("probe ran per session: calls = %d", probeCalls)
-	}
 }
 
 func TestSessionBuildsFreshAndResumePrompts(t *testing.T) {
@@ -86,7 +70,7 @@ func TestSessionBuildsFreshAndResumePrompts(t *testing.T) {
 	}
 
 	resumeNative := newFakeSession("native-1")
-	if err := wrapSession(resumeNative).Send(context.Background(), input); err != nil {
+	if err := wrapSessionWithResume(resumeNative, true).Send(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
 	if resumeNative.input.Prompt != "second" {

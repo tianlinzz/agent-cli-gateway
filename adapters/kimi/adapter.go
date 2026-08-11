@@ -34,12 +34,10 @@ type nativeSession interface {
 }
 
 type starter func(context.Context, native.Options) (nativeSession, error)
-type flagProbe func(context.Context, []string, time.Duration) native.FlagSupport
 
 // Adapter implements runtime.AgentAdapter as a thin native bridge.
 type Adapter struct {
 	opts  Options
-	flags native.FlagSupport
 	start starter
 }
 
@@ -62,28 +60,23 @@ func New(ctx context.Context, _ string) (runtime.AgentAdapter, error) {
 			opts.Timeout = time.Duration(seconds) * time.Second
 		}
 	}
-	return newAdapter(ctx, opts, func(_ context.Context, options native.Options) (nativeSession, error) {
-		return native.New(options), nil
-	}, native.ProbeFlags), nil
+	return newAdapter(opts, startNative), nil
 }
 
 // NewAdapter constructs an adapter from explicit trusted options.
 func NewAdapter(opts Options) (*Adapter, error) {
-	return newAdapter(context.Background(), opts, func(_ context.Context, options native.Options) (nativeSession, error) {
-		return native.New(options), nil
-	}, native.ProbeFlags), nil
+	return newAdapter(opts, startNative), nil
 }
 
-func newAdapter(ctx context.Context, opts Options, start starter, probe flagProbe) *Adapter {
+func startNative(ctx context.Context, options native.Options) (nativeSession, error) {
+	return native.Start(ctx, options)
+}
+
+func newAdapter(opts Options, start starter) *Adapter {
 	if strings.TrimSpace(opts.Command) == "" {
 		opts.Command = "kimi"
 	}
-	command := splitCommand(opts.Command)
-	var flags native.FlagSupport
-	if probe != nil {
-		flags = probe(ctx, command, 5*time.Second)
-	}
-	return &Adapter{opts: opts, flags: flags, start: start}
+	return &Adapter{opts: opts, start: start}
 }
 
 // Describe returns the public Kimi model descriptor.
@@ -91,8 +84,8 @@ func (a *Adapter) Describe(context.Context) (runtime.Descriptor, error) {
 	return runtime.Descriptor{
 		ModelID:       "kimi",
 		DisplayName:   "Kimi",
-		Description:   "Kimi Code CLI via stream-json (resume per turn)",
-		LifecycleMode: runtime.LifecycleResumePerTurn,
+		Description:   "Kimi Code CLI via persistent ACP",
+		LifecycleMode: runtime.LifecyclePersistentProcess,
 		Capabilities: runtime.Capabilities{
 			Streaming: true, ToolCalls: true, Reasoning: true,
 			Resume: true, MultiTurn: true,
@@ -108,20 +101,18 @@ func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.
 	}
 	start := a.start
 	if start == nil {
-		start = func(_ context.Context, options native.Options) (nativeSession, error) {
-			return native.New(options), nil
-		}
+		start = startNative
 	}
 	session, err := start(ctx, native.Options{
 		Command: splitCommand(a.opts.Command),
 		Env:     append([]string(nil), a.opts.Env...), WorkDir: a.opts.WorkDir,
-		Model: a.opts.Model, Mode: a.opts.Mode, ResumeID: resumeID,
-		Timeout: a.opts.Timeout, Flags: a.flags,
+		Model: a.opts.Model, Mode: a.opts.Mode, Permission: a.opts.Permission, ResumeID: resumeID,
+		Timeout: a.opts.Timeout,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return wrapSession(session), nil
+	return wrapSessionWithResume(session, resumeID != ""), nil
 }
 
 func splitCommand(command string) []string {

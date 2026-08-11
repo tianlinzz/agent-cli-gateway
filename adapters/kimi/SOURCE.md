@@ -1,33 +1,43 @@
 # Kimi source provenance
 
 This adapter is a thin runtime bridge over the native implementation in
-`agent/kimi/`. The native implementation selectively migrates proven Kimi CLI
-behavior from [cc-connect](https://github.com/chenhg5/cc-connect) at upstream
-baseline `3fc360ee6acc9bab13ab1b48ddde3af44062903b`.
+`agent/kimi/`. The current implementation uses Agent Client Protocol v1 over
+`kimi acp` as its only production protocol.
 
-## Upstream source files
+## Upstream source files and protocol reference
 
-- `agent/kimi/kimi.go`: Agent defaults and command configuration.
-- `agent/kimi/session.go`: stream-json parsing, resume trailer extraction,
-  ordered events, and per-turn process lifecycle.
-- `agent/kimi/probe.go`: installed CLI flag-surface probing.
-- `agent/codex/proc_unix.go` and `agent/codex/proc_windows.go`: the shared
-  process-tree termination pattern used by the upstream Kimi path.
+- MoonshotAI Kimi Code commit
+  `2acf22f66e15361d9804d9014d58ad68a9383caf` was used to verify the ACP
+  handshake, session lifecycle, prompt/update shapes, permission response,
+  and cancellation behavior.
+- Relevant upstream files include `docs/en/reference/kimi-acp.md`,
+  `packages/acp-server/src/server.ts`, `events-map.ts`, and the ACP lifecycle
+  and end-to-end turn tests.
+- The earlier adapter selectively migrated print-mode behavior from
+  [cc-connect](https://github.com/chenhg5/cc-connect) commit
+  `3fc360ee6acc9bab13ab1b48ddde3af44062903b`.
+  That per-turn implementation and its compatibility probe have been removed.
 
 ## Migrated behaviors
 
-- One Kimi CLI process per turn with native session resume.
-- Conservative `--print` compatibility probing across Kimi CLI generations.
-- Ordered assistant/tool/result events, usage, timeout, abort, and reaping.
+- One `kimi acp` process and one ACP session per Gateway session.
+- One initialize plus session create or resume handshake.
+- Repeated asynchronous `session/prompt` calls on the same process.
+- Streaming text, stable tool telemetry, usage updates, deterministic
+  permission responses, and turn-scoped `session/cancel`.
+- Process termination only for explicit close, ACP failure, or failed/timed-out
+  cancellation escalation.
 
 ## Material local modifications
 
-- Native code now lives in `agent/kimi/` and depends only on shared
-  `agent/process`, `agent/protocol`, and the Go standard library.
-- `adapters/kimi/` probes once at construction and only maps trusted options,
-  prompts, native events, and lifecycle calls to `runtime`.
-- cc-connect provider switching, session listing/history, skills, management
-  modes, attachments, and IM-facing behavior were intentionally not migrated.
+- `agent/kimi/` depends only on shared `agent/process`, `agent/protocol`, and
+  the Go standard library.
+- `adapters/kimi/` maps trusted Gateway options, prompts, events, and
+  lifecycle calls to `runtime`; it contains no process or JSON-RPC code.
+- Native tools remain internal telemetry and never become OpenAI client-side
+  `tool_calls`.
+- Model/provider management, session listing, attachments, and messaging
+  platform behavior are outside this adapter.
 
 ## Local regression tests
 
@@ -35,6 +45,6 @@ baseline `3fc360ee6acc9bab13ab1b48ddde3af44062903b`.
 - `adapters/kimi/adapter_test.go`
 - `integration/agent_gateway_test.go`
 
-The upstream README declares MIT License at the pinned baseline. See
-`LICENSES/cc-connect-MIT.txt` for the exact evidence and the missing-license
-file caveat.
+MoonshotAI Kimi Code is MIT licensed (Moonshot AI, 2026). The pinned
+cc-connect baseline declares MIT in its README but has no standalone license
+file; see `LICENSES/cc-connect-MIT.txt` for the recorded evidence and caveat.

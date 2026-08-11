@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	native "github.com/tianlinzz/agent-cli-gateway/agent/kimi"
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
@@ -12,10 +13,17 @@ import (
 type session struct {
 	native nativeSession
 	events chan runtime.Event
+	mu     sync.Mutex
+	resume bool
+	sent   bool
 }
 
 func wrapSession(nativeSession nativeSession) *session {
-	s := &session{native: nativeSession, events: make(chan runtime.Event, 64)}
+	return wrapSessionWithResume(nativeSession, false)
+}
+
+func wrapSessionWithResume(nativeSession nativeSession, resume bool) *session {
+	s := &session{native: nativeSession, events: make(chan runtime.Event, 64), resume: resume}
 	go func() {
 		defer close(s.events)
 		for event := range nativeSession.Events() {
@@ -26,7 +34,14 @@ func wrapSession(nativeSession nativeSession) *session {
 }
 
 func (s *session) Send(ctx context.Context, input runtime.Input) error {
-	return s.native.Send(ctx, native.Input{Prompt: promptFromRuntime(input, s.native.NativeSessionID() != "")})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prompt := promptFromRuntime(input, s.resume || s.sent)
+	if err := s.native.Send(ctx, native.Input{Prompt: prompt}); err != nil {
+		return err
+	}
+	s.sent = true
+	return nil
 }
 
 func promptFromRuntime(input runtime.Input, resume bool) string {

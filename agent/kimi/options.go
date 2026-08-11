@@ -5,17 +5,15 @@ import (
 	"time"
 )
 
-type FlagSupport struct{ Print bool }
-
 type Options struct {
-	Command  []string
-	Env      []string
-	WorkDir  string
-	Model    string
-	Mode     string
-	ResumeID string
-	Timeout  time.Duration
-	Flags    FlagSupport
+	Command    []string
+	Env        []string
+	WorkDir    string
+	Model      string
+	Mode       string
+	Permission string
+	ResumeID   string
+	Timeout    time.Duration
 }
 
 func NormalizeOptions(opts Options) Options {
@@ -31,6 +29,17 @@ func NormalizeOptions(opts Options) Options {
 		opts.Mode = "quiet"
 	default:
 		opts.Mode = "default"
+	}
+	switch strings.ToLower(strings.TrimSpace(opts.Permission)) {
+	case "ask":
+		opts.Permission = "ask"
+	case "deny":
+		opts.Permission = "deny"
+	default:
+		opts.Permission = "auto"
+	}
+	if opts.Timeout <= 0 {
+		opts.Timeout = 8 * time.Second
 	}
 	return opts
 }
