@@ -38,6 +38,30 @@ func TestProbeFlagsUsesInstalledHelpSurface(t *testing.T) {
 	}
 }
 
+func TestThinkingBlocksDoNotLeakIntoAssistantText(t *testing.T) {
+	session := &Session{events: make(chan Event, 4), ctx: context.Background()}
+	state := &turnState{}
+	session.handleEvent(state, map[string]any{"role": "assistant", "content": []any{
+		map[string]any{"type": "think", "think": "private reasoning"},
+		map[string]any{"type": "text", "text": "OK"},
+	}})
+	session.flush(state)
+
+	select {
+	case event := <-session.events:
+		if event.Kind != EventText || event.Text != "OK" {
+			t.Fatalf("public event = %#v, want final text only", event)
+		}
+	default:
+		t.Fatal("missing final text event")
+	}
+	select {
+	case event := <-session.events:
+		t.Fatalf("unexpected leaked event: %#v", event)
+	default:
+	}
+}
+
 func TestSessionStartsPerTurnAndResumesFromStderrTrailer(t *testing.T) {
 	logFile := filepath.Join(t.TempDir(), "invocations.jsonl")
 	session := newKimiTestSession(t, map[string]string{"KIMI_TEST_LOG": logFile})

@@ -145,9 +145,8 @@ func (s *Session) handleEvent(state *turnState, raw map[string]any) {
 			}
 			switch kind, _ := block["type"].(string); kind {
 			case "think", "thinking":
-				if text, _ := block["think"].(string); text != "" {
-					s.emit(Event{Kind: EventText, Text: text})
-				}
+				// Keep private reasoning out of OpenAI assistant content.
+				continue
 			case "text":
 				if text, _ := block["text"].(string); text != "" {
 					state.pending = append(state.pending, text)

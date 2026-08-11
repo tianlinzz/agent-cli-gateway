@@ -177,9 +177,9 @@ func (s *Session) handleAssistant(raw map[string]any) {
 			arguments, _ := block["input"].(map[string]any)
 			s.emit(Event{Kind: EventToolUse, Tool: &ToolCall{ID: id, Name: name, Arguments: arguments}})
 		case "thinking":
-			if text, _ := block["thinking"].(string); text != "" {
-				s.emit(Event{Kind: EventText, Text: text})
-			}
+			// OpenAI message.content carries assistant output, not private
+			// reasoning. Keep the native block inside this protocol boundary.
+			continue
 		case "text":
 			if text, _ := block["text"].(string); text != "" {
 				s.emit(Event{Kind: EventText, Text: text})

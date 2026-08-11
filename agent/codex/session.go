@@ -212,9 +212,8 @@ func (s *Session) handleItemCompleted(state *turnState, raw map[string]any) {
 	itemType, _ := item["type"].(string)
 	switch itemType {
 	case "reasoning":
-		if text := extractItemText(item, "summary", "summary_text"); text != "" {
-			s.emit(Event{Kind: EventText, Text: text})
-		}
+		// Reasoning summaries are native diagnostics, not assistant output.
+		return
 	case "agent_message", "message":
 		if text := extractItemText(item, "content", "output_text"); text != "" {
 			state.pending = append(state.pending, text)

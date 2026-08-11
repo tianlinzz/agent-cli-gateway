@@ -77,6 +77,32 @@ func TestToolCommentaryPrecedesToolEvents(t *testing.T) {
 	}
 }
 
+func TestReasoningItemsDoNotLeakIntoAssistantText(t *testing.T) {
+	session := &Session{events: make(chan Event, 4), ctx: context.Background()}
+	state := &turnState{}
+	session.handleItemCompleted(state, map[string]any{"item": map[string]any{
+		"type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": "private reasoning"}},
+	}})
+	session.handleItemCompleted(state, map[string]any{"item": map[string]any{
+		"type": "agent_message", "content": []any{map[string]any{"type": "output_text", "text": "OK"}},
+	}})
+	session.flushPending(state)
+
+	select {
+	case event := <-session.events:
+		if event.Kind != EventText || event.Text != "OK" {
+			t.Fatalf("public event = %#v, want final text only", event)
+		}
+	default:
+		t.Fatal("missing final text event")
+	}
+	select {
+	case event := <-session.events:
+		t.Fatalf("unexpected leaked event: %#v", event)
+	default:
+	}
+}
+
 func TestAbortKillsCurrentTurnButSessionCanResume(t *testing.T) {
 	readyFile := filepath.Join(t.TempDir(), "ready")
 	session := newTestSession(t, map[string]string{"CODEX_TEST_READY": readyFile})

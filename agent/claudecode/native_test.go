@@ -28,6 +28,28 @@ func TestBuildArgsDisablesAskUserQuestionExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestThinkingBlocksDoNotLeakIntoAssistantText(t *testing.T) {
+	session := &Session{events: make(chan Event, 4), ctx: context.Background()}
+	session.handleAssistant(map[string]any{"message": map[string]any{"content": []any{
+		map[string]any{"type": "thinking", "thinking": "private chain of thought"},
+		map[string]any{"type": "text", "text": "OK"},
+	}}})
+
+	select {
+	case event := <-session.events:
+		if event.Kind != EventText || event.Text != "OK" {
+			t.Fatalf("public event = %#v, want final text only", event)
+		}
+	default:
+		t.Fatal("missing final text event")
+	}
+	select {
+	case event := <-session.events:
+		t.Fatalf("unexpected leaked event: %#v", event)
+	default:
+	}
+}
+
 func TestSessionUsesOnePersistentProcessForMultipleTurns(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "pids")
 	session := startTestSession(t, "normal", map[string]string{"CLAUDE_TEST_PID_FILE": pidFile})
