@@ -511,29 +511,18 @@ func (ws *workerSession) Send(ctx context.Context, input runtime.Input) error {
 	return ws.client.SendInput(ctx, ws.req.SessionID, input)
 }
 
-// Abort cancels the in-flight turn. It is RPC-only: the session is never torn
-// down here, so persistent_process sessions keep their process and serve
-// future turns. Phase-1 adapters implement Abort as a turn-level cancel that
-// does NOT kill the CLI process — claudecode has no stream-json interrupt
-// message, so it marks the turn cancelled and leaves the process alive; if the
-// CLI becomes unrecoverable it exits and the API layer's dead-handle recovery
-// starts a fresh process on the next turn.
+// Abort delegates turn cancellation to the native session. Successful native
+// cancellation keeps the Worker alive; adapters may terminate themselves only
+// when their protocol cannot cancel or cancellation escalation fails.
 func (ws *workerSession) Abort(ctx context.Context) error {
 	ws.mu.Lock()
-	state, err, lifecycle := ws.state, ws.err, ws.lifecycle
+	state, err := ws.state, ws.err
 	ws.mu.Unlock()
 	if state != stateRunning {
 		if err != nil {
 			return err
 		}
 		return nil
-	}
-	if lifecycle == runtime.LifecyclePersistentProcess {
-		// Persistent stream-json CLIs have no turn-level interrupt message.
-		// Closing the execution is the only reliable way to stop an in-flight
-		// turn (including AskUserQuestion waits); the next request can resume
-		// from the adapter's native transcript/session id.
-		return ws.Close(ctx)
 	}
 	return ws.client.Abort(ctx, ws.req.SessionID)
 }
