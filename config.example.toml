@@ -77,4 +77,7 @@ models = ["sonnet", "opus", "haiku"]
 
 [agents.kimi]
 enabled = true
+command = "kimi"
 permission = "auto"
+timeout = "30m"
+models = ["kimi-k3", "eepseek-v4-flash"]

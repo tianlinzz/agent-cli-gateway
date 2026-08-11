@@ -20,6 +20,19 @@ func TestBuildArgsUsesPersistentACP(t *testing.T) {
 	}
 }
 
+func TestBuildArgsPassesConfiguredModelToACP(t *testing.T) {
+	got := strings.Join(BuildArgs(Options{Model: "eepseek-v4-flash"}, "", ""), " ")
+	if got != "--model eepseek-v4-flash acp" {
+		t.Fatalf("args = %q, want --model eepseek-v4-flash acp", got)
+	}
+}
+
+func TestNormalizeOptionsUsesThirtyMinuteDefaultTurnTimeout(t *testing.T) {
+	if got := NormalizeOptions(Options{}).Timeout; got != 30*time.Minute {
+		t.Fatalf("timeout = %s, want 30m", got)
+	}
+}
+
 func TestSessionUsesOneACPProcessForMultipleTurns(t *testing.T) {
 	logFile := filepath.Join(t.TempDir(), "rpc.jsonl")
 	session := startKimiTestSession(t, Options{}, map[string]string{"KIMI_TEST_LOG": logFile})

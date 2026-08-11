@@ -39,7 +39,7 @@ func NormalizeOptions(opts Options) Options {
 		opts.Permission = "auto"
 	}
 	if opts.Timeout <= 0 {
-		opts.Timeout = 8 * time.Second
+		opts.Timeout = 30 * time.Minute
 	}
 	return opts
 }
