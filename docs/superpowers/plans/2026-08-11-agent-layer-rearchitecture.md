@@ -70,7 +70,7 @@ Adapters are responsible for translating canonical message history into `Input.P
 - Test: `internal/archtest/dependencies_test.go`
 - Test: `integration/agent_gateway_test.go`
 
-- [ ] **Step 1: Write the dependency scanner and a failing invariant test**
+- [x] **Step 1: Write the dependency scanner and a failing invariant test**
 
 Create a scanner based on `go/parser` and `go/token`. During extraction, `testdata/allowed_legacy.txt` contains the exact current `agent_ref` and removed-`core` files; the test fails on any new violation and the allowlist is deleted in Task 10. Add this invariant immediately so migration cannot add more debt:
 
@@ -106,7 +106,7 @@ func TestNoNewLegacySources(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run the architecture test and verify the unlisted violation is RED**
+- [x] **Step 2: Run the architecture test and verify the unlisted violation is RED**
 
 Run:
 
@@ -116,7 +116,7 @@ go test ./internal/archtest/ -run 'TestDependencyRules|TestNoNewLegacySources' -
 
 Expected: FAIL naming at least one existing legacy file before `allowed_legacy.txt` is populated.
 
-- [ ] **Step 3: Freeze the exact legacy allowlist and public behavior**
+- [x] **Step 3: Freeze the exact legacy allowlist and public behavior**
 
 Populate `allowed_legacy.txt` from the current tracked files only:
 
@@ -126,7 +126,7 @@ rg -l 'go:build agent_ref|agent-cli-gateway/core' agent | sort > internal/archte
 
 Add integration subtests using the existing fake Worker/CLI harness for `GET /v1/models`, streaming and non-streaming completion, caller-provided session reuse, same-workspace distinct-session concurrency, abort, disconnect, timeout, and Worker crash. Assert HTTP/SSE output and process settlement, never adapter internals.
 
-- [ ] **Step 4: Run the baseline gates and verify GREEN**
+- [x] **Step 4: Run the baseline gates and verify GREEN**
 
 Run:
 
@@ -137,7 +137,7 @@ go test ./...
 
 Expected: PASS; the allowlist permits only the pre-existing legacy files and the public Gateway behavior is frozen.
 
-- [ ] **Step 5: Commit the baseline**
+- [x] **Step 5: Commit the baseline**
 
 ```bash
 git add internal/archtest integration/agent_gateway_test.go
@@ -154,7 +154,7 @@ git commit -m "test: freeze agent gateway architecture baseline"
 - Create: `agent/process/process_unix_test.go`
 - Test: `agent/process/process_test.go`
 
-- [ ] **Step 1: Write failing process lifecycle tests**
+- [x] **Step 1: Write failing process lifecycle tests**
 
 Define tests for environment replacement, cwd, stdout/stderr capture, idempotent wait, graceful stop, forced process-group kill, and reaping descendants. The public API exercised by the test is:
 
@@ -179,7 +179,7 @@ func TestProcessForceKillReapsProcessGroup(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify RED**
+- [x] **Step 2: Run tests to verify RED**
 
 Run:
 
@@ -189,7 +189,7 @@ go test ./agent/process/ -v
 
 Expected: FAIL because `Spec`, `Start`, and `Process` do not exist.
 
-- [ ] **Step 3: Implement the minimum shared process API**
+- [x] **Step 3: Implement the minimum shared process API**
 
 Implement this API without Agent-specific flags or lifecycle policy:
 
@@ -223,7 +223,7 @@ func (p *Process) ForceKill() error
 
 `Start` must reject an empty command, set `Dir`, merge `os.Environ()` with deployment overrides, create requested pipes, prepare a process group before `cmd.Start`, and wrap errors with a safe executable/cwd summary. Unix and Windows files implement process-group operations using the already-proven adapter helpers.
 
-- [ ] **Step 4: Run focused, race, and cross-build tests**
+- [x] **Step 4: Run focused, race, and cross-build tests**
 
 Run:
 
@@ -236,7 +236,7 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -c -o /tmp/agent-process-windows
 
 Expected: PASS on all commands.
 
-- [ ] **Step 5: Commit the process foundation**
+- [x] **Step 5: Commit the process foundation**
 
 ```bash
 git add agent/process
@@ -250,7 +250,7 @@ git commit -m "feat: add shared native agent process lifecycle"
 - Create: `agent/protocol/jsonl_test.go`
 - Test: `agent/protocol/jsonl_test.go`
 
-- [ ] **Step 1: Write failing framing tests**
+- [x] **Step 1: Write failing framing tests**
 
 ```go
 func TestDecoderReadsJSONLines(t *testing.T) {
@@ -271,13 +271,13 @@ func TestDecoderRejectsOversizedFrame(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify RED**
+- [x] **Step 2: Run tests to verify RED**
 
 Run: `go test ./agent/protocol/ -v`
 
 Expected: FAIL because `NewJSONLDecoder`, `FrameError`, and `ErrFrameTooLarge` do not exist.
 
-- [ ] **Step 3: Implement bounded framing only**
+- [x] **Step 3: Implement bounded framing only**
 
 ```go
 type ErrorKind string
@@ -303,7 +303,7 @@ func (d *JSONLDecoder) Decode(dst any) error
 
 The decoder skips blank lines, returns `io.EOF` cleanly, detects a frame exceeding `maxSize` before unmarshalling, wraps malformed JSON as `FrameError`, and contains no Claude/Codex/Kimi event switch.
 
-- [ ] **Step 4: Run focused and race tests**
+- [x] **Step 4: Run focused and race tests**
 
 Run:
 
@@ -314,7 +314,7 @@ go test -race ./agent/protocol/
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit framing**
+- [x] **Step 5: Commit framing**
 
 ```bash
 git add agent/protocol
@@ -335,7 +335,7 @@ git commit -m "feat: add bounded native agent protocol framing"
 - Create: `agent/claudecode/session_test.go`
 - Test: `agent/claudecode/*_test.go`
 
-- [ ] **Step 1: Replace legacy tests with native characterization tests**
+- [x] **Step 1: Replace legacy tests with native characterization tests**
 
 Remove the `agent_ref` test files for Claude-only features that are outside the approved scope. Port the proven tests from `adapters/claudecode/adapter_test.go` for argv, stream event ordering, compaction, permission, usage, native session ID, multi-turn persistent stdin, child-held stdout, close, and abort. Tests target this native API:
 
@@ -366,7 +366,7 @@ func (s *Session) NativeSessionID() string
 
 Include the regression assertion that `BuildArgs` contains exactly one `--disallowedTools AskUserQuestion` entry and that an unexpected native `AskUserQuestion` control request emits a denied permission response without hanging.
 
-- [ ] **Step 2: Run Claude native tests to verify RED**
+- [x] **Step 2: Run Claude native tests to verify RED**
 
 Run:
 
@@ -376,7 +376,7 @@ go test ./agent/claudecode/ -v
 
 Expected: FAIL because the old build-tagged package does not expose the native API.
 
-- [ ] **Step 3: Implement Claude-native types and launch/protocol logic**
+- [x] **Step 3: Implement Claude-native types and launch/protocol logic**
 
 Define native events without importing runtime:
 
@@ -395,7 +395,7 @@ type Event struct {
 
 Move `buildClaudeArgs`, normalization, redaction, result/usage parsing, assistant/tool parsing, control-response JSON, and append-prompt temp-file ownership from the adapter. Use `agent/protocol.JSONLDecoder` with a 10 MiB bound and `agent/process.Process` for launch/reap. Preserve `--input-format stream-json`, `--output-format stream-json`, `--permission-prompt-tool stdio`, resume, persistent stdin, one terminal native error, event-channel single ownership, and lifecycle-aware abort.
 
-- [ ] **Step 4: Run Claude native validation**
+- [x] **Step 4: Run Claude native validation**
 
 Run:
 
@@ -407,7 +407,7 @@ go vet ./agent/claudecode/
 
 Expected: PASS; `rg 'agent-cli-gateway/(runtime|core)' agent/claudecode` returns no matches.
 
-- [ ] **Step 5: Commit the Claude native layer**
+- [x] **Step 5: Commit the Claude native layer**
 
 ```bash
 git add agent/claudecode agent/process agent/protocol
@@ -425,7 +425,7 @@ git commit -m "feat: extract native claude code execution"
 - Delete: `adapters/claudecode/proc_windows.go`
 - Test: `adapters/claudecode/adapter_test.go`
 
-- [ ] **Step 1: Write failing adapter-only mapping tests**
+- [x] **Step 1: Write failing adapter-only mapping tests**
 
 Replace native protocol assertions with mapping tests driven by a fake native session:
 
@@ -449,13 +449,13 @@ func TestStartMapsRuntimeRequestToNativeOptions(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run adapter tests to verify RED**
+- [x] **Step 2: Run adapter tests to verify RED**
 
 Run: `go test ./adapters/claudecode/ -v`
 
 Expected: FAIL because `wrapSession` and the injectable native starter do not exist.
 
-- [ ] **Step 3: Implement runtime conversion and remove native mechanics**
+- [x] **Step 3: Implement runtime conversion and remove native mechanics**
 
 Keep registry setup, descriptor, environment-derived trusted options, prompt conversion, event mapping, and delegation:
 
@@ -482,7 +482,7 @@ func (s *session) Send(ctx context.Context, in runtime.Input) error {
 
 Map every native event exactly once, preserve native session IDs on usage/finish/native-session events, and delegate `Abort`/`Close`. Delete process helpers and raw JSON parsing from the adapter package.
 
-- [ ] **Step 4: Verify the Claude vertical slice**
+- [x] **Step 4: Verify the Claude vertical slice**
 
 Run:
 
@@ -494,7 +494,7 @@ test -z "$(rg -l 'os/exec|bufio\.Scanner|json\.Unmarshal' adapters/claudecode ||
 
 Expected: PASS and the final command prints nothing.
 
-- [ ] **Step 5: Commit the Claude adapter**
+- [x] **Step 5: Commit the Claude adapter**
 
 ```bash
 git add agent/claudecode adapters/claudecode
@@ -514,7 +514,7 @@ git commit -m "refactor: reduce claude adapter to runtime mapping"
 - Replace: `agent/codex/session_test.go`
 - Test: `agent/codex/*_test.go`
 
-- [ ] **Step 1: Replace legacy tests with Codex native characterization tests**
+- [x] **Step 1: Replace legacy tests with Codex native characterization tests**
 
 Port the approved behavior from `adapters/codex/adapter_test.go`: multiline prompt over stdin, fresh and resumed argv, `thread.started` native ID, item event ordering, reasoning/text/tool mappings, last token usage, large JSONL frames, permission events, buffered commentary on abort, per-turn process termination, descendant reaping, and idempotent close. Target:
 
@@ -541,17 +541,17 @@ func (s *Session) Close(ctx context.Context) error
 func (s *Session) NativeSessionID() string
 ```
 
-- [ ] **Step 2: Run Codex native tests to verify RED**
+- [x] **Step 2: Run Codex native tests to verify RED**
 
 Run: `go test ./agent/codex/ -v`
 
 Expected: FAIL because the legacy package does not expose the native API.
 
-- [ ] **Step 3: Implement Codex-native exec JSON lifecycle**
+- [x] **Step 3: Implement Codex-native exec JSON lifecycle**
 
 Move command splitting, argv construction, prompt writing, rollout usage lookup, event parsing, tracked-process bookkeeping, kill loop, redaction, and resume state from `adapters/codex`. Use the shared process and JSONL packages. Exclude old provider switching, app-server integration, MCP/config editing, history listing, and skill management. Every `Send` starts a fresh process and uses the learned native thread ID on the next turn.
 
-- [ ] **Step 4: Run Codex native validation**
+- [x] **Step 4: Run Codex native validation**
 
 Run:
 
@@ -563,7 +563,7 @@ go vet ./agent/codex/
 
 Expected: PASS; `rg 'agent-cli-gateway/(runtime|core)' agent/codex` returns no matches.
 
-- [ ] **Step 5: Commit the Codex native layer**
+- [x] **Step 5: Commit the Codex native layer**
 
 ```bash
 git add agent/codex agent/process agent/protocol
@@ -581,7 +581,7 @@ git commit -m "feat: extract native codex execution"
 - Delete: `adapters/codex/proc_windows.go`
 - Test: `adapters/codex/adapter_test.go`
 
-- [ ] **Step 1: Write failing mapping and lifecycle delegation tests**
+- [x] **Step 1: Write failing mapping and lifecycle delegation tests**
 
 Use a fake Codex native session implementing an adapter-private `nativeSession` interface (the same method set defined explicitly in Task 5, with Codex-native `Input` and `Event` types) to assert runtime input-to-prompt conversion; text, tool, permission, usage, error, finish, and native-session event conversion; resume metadata; and exact delegation of `Abort` and `Close`.
 
@@ -596,17 +596,17 @@ func TestSessionDelegatesAbortAndClose(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run adapter tests to verify RED**
+- [x] **Step 2: Run adapter tests to verify RED**
 
 Run: `go test ./adapters/codex/ -v`
 
 Expected: FAIL because the adapter still owns the concrete process session.
 
-- [ ] **Step 3: Implement the thin Codex bridge and delete native code**
+- [x] **Step 3: Implement the thin Codex bridge and delete native code**
 
 Construct `codex.Options` from deployment-owned adapter options, translate `runtime.StartRequest.Metadata["native_session_id"]`, convert runtime messages to a native prompt, map the native event stream, and delegate lifecycle methods. Reject unsupported configured backend values during trusted adapter construction, not in the native protocol parser.
 
-- [ ] **Step 4: Verify the Codex vertical slice**
+- [x] **Step 4: Verify the Codex vertical slice**
 
 Run:
 
@@ -618,7 +618,7 @@ test -z "$(rg -l 'os/exec|bufio\.Scanner|json\.Unmarshal' adapters/codex || true
 
 Expected: PASS and no native process/protocol match below the adapter.
 
-- [ ] **Step 5: Commit the Codex adapter**
+- [x] **Step 5: Commit the Codex adapter**
 
 ```bash
 git add agent/codex adapters/codex
@@ -640,7 +640,7 @@ git commit -m "refactor: reduce codex adapter to runtime mapping"
 - Replace: `agent/kimi/session_test.go`
 - Test: `agent/kimi/*_test.go`
 
-- [ ] **Step 1: Replace legacy tests with Kimi native characterization tests**
+- [x] **Step 1: Replace legacy tests with Kimi native characterization tests**
 
 Port the approved tests from `adapters/kimi/adapter_test.go`: modern/legacy help probing, conditional `--print`, plan/quiet modes, fresh and resumed argv, native session extraction from stdout and stderr, assistant thinking/text/tool ordering, tool results, usage, process failure, per-turn abort, and close. Target:
 
@@ -665,17 +665,17 @@ func (s *Session) Close(ctx context.Context) error
 func (s *Session) NativeSessionID() string
 ```
 
-- [ ] **Step 2: Run Kimi native tests to verify RED**
+- [x] **Step 2: Run Kimi native tests to verify RED**
 
 Run: `go test ./agent/kimi/ -v`
 
 Expected: FAIL because the old build-tagged Kimi package does not expose the native API.
 
-- [ ] **Step 3: Implement Kimi-native probing and per-turn execution**
+- [x] **Step 3: Implement Kimi-native probing and per-turn execution**
 
 Move flag probing, argv, resume extraction, native parsing, pending text ordering, process lifecycle, timeout, usage, and redaction from `adapters/kimi`. Use shared process/JSONL code and retain the conservative no-`--print` fallback when probing fails.
 
-- [ ] **Step 4: Run Kimi native validation**
+- [x] **Step 4: Run Kimi native validation**
 
 Run:
 
@@ -687,7 +687,7 @@ go vet ./agent/kimi/
 
 Expected: PASS; `rg 'agent-cli-gateway/(runtime|core)' agent/kimi` returns no matches.
 
-- [ ] **Step 5: Commit the Kimi native layer**
+- [x] **Step 5: Commit the Kimi native layer**
 
 ```bash
 git add agent/kimi agent/process agent/protocol
@@ -705,21 +705,21 @@ git commit -m "feat: extract native kimi execution"
 - Delete: `adapters/kimi/proc_windows.go`
 - Test: `adapters/kimi/adapter_test.go`
 
-- [ ] **Step 1: Write failing Kimi adapter mapping tests**
+- [x] **Step 1: Write failing Kimi adapter mapping tests**
 
 Use a fake Kimi native session implementing an adapter-private `nativeSession` interface (the same method set defined explicitly in Task 5, with Kimi-native `Input` and `Event` types) and an injectable probe function to assert descriptor output, trusted option conversion, native resume ID mapping, prompt conversion, all native event mappings, and lifecycle delegation. Assert that probe results are passed to native options and no probe command is run per turn.
 
-- [ ] **Step 2: Run adapter tests to verify RED**
+- [x] **Step 2: Run adapter tests to verify RED**
 
 Run: `go test ./adapters/kimi/ -v`
 
 Expected: FAIL because probing and process management still live in the adapter.
 
-- [ ] **Step 3: Implement the thin Kimi bridge**
+- [x] **Step 3: Implement the thin Kimi bridge**
 
 Keep environment parsing, registry setup, descriptor, runtime prompt conversion, native event conversion, and method delegation. Move all command execution and raw event parsing out, then delete adapter process/protocol files.
 
-- [ ] **Step 4: Verify the Kimi vertical slice**
+- [x] **Step 4: Verify the Kimi vertical slice**
 
 Run:
 
@@ -731,7 +731,7 @@ test -z "$(rg -l 'os/exec|bufio\.Scanner|json\.Unmarshal' adapters/kimi || true)
 
 Expected: PASS and no native process/protocol implementation remains in the adapter.
 
-- [ ] **Step 5: Commit the Kimi adapter**
+- [x] **Step 5: Commit the Kimi adapter**
 
 ```bash
 git add agent/kimi adapters/kimi
@@ -747,7 +747,7 @@ git commit -m "refactor: reduce kimi adapter to runtime mapping"
 - Modify: `.dockerignore`
 - Test: `internal/archtest/dependencies_test.go`
 
-- [ ] **Step 1: Make the final no-legacy assertions RED**
+- [x] **Step 1: Make the final no-legacy assertions RED**
 
 Remove allowlist support from the tests and require zero matches:
 
@@ -772,17 +772,17 @@ func TestAdaptersContainNoNativeExecution(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run final architecture tests to verify RED**
+- [x] **Step 2: Run final architecture tests to verify RED**
 
 Run: `go test ./internal/archtest/ -v`
 
 Expected: FAIL naming any remaining build tag, removed-core import, or native adapter implementation.
 
-- [ ] **Step 3: Delete superseded files and narrow the scan scope correctly**
+- [x] **Step 3: Delete superseded files and narrow the scan scope correctly**
 
 Delete only old files not replaced by Tasks 4, 6, and 8. Remove old hooks, live config, MCP config, provider config/switching, list/history, skill dirs, app-server, and their tests. Do not retain aliases, wrappers, deprecated packages, or hidden build tags. Restrict source scans to active Go/Markdown/config files and exclude `.git` and historical approved design/plan artifacts.
 
-- [ ] **Step 4: Run final architecture and full tests**
+- [x] **Step 4: Run final architecture and full tests**
 
 Run:
 
@@ -794,7 +794,7 @@ test -z "$(rg -l 'go:build agent_ref|agent-cli-gateway/core' agent adapters runt
 
 Expected: PASS and the final command prints nothing.
 
-- [ ] **Step 5: Commit legacy removal**
+- [x] **Step 5: Commit legacy removal**
 
 ```bash
 git add -A agent adapters internal/archtest .dockerignore
@@ -814,17 +814,17 @@ git commit -m "refactor: remove legacy cc-connect agent tree"
 - Modify: `.github/workflows/ci.yml`
 - Test: `internal/archtest/dependencies_test.go`
 
-- [ ] **Step 1: Add failing documentation/provenance assertions**
+- [x] **Step 1: Add failing documentation/provenance assertions**
 
 Extend the architecture test to require each `SOURCE.md` to contain the upstream repository, baseline commit, source file list, migrated behaviors, material local modifications, and local regression test paths. Require `LICENSES/cc-connect-MIT.txt` and reject the phrases `migration-reference`, `never build with -tags agent_ref`, and the old cc-connect package diagram from active root documentation.
 
-- [ ] **Step 2: Run documentation gates to verify RED**
+- [x] **Step 2: Run documentation gates to verify RED**
 
 Run: `go test ./internal/archtest/ -run 'TestProvenance|TestActiveDocumentation' -v`
 
 Expected: FAIL naming missing attribution or stale documentation.
 
-- [ ] **Step 3: Rewrite active documentation and strengthen CI**
+- [x] **Step 3: Rewrite active documentation and strengthen CI**
 
 Document the final data path:
 
@@ -848,7 +848,7 @@ Document the three supported Agents, macOS direct-Worker development, Linux nsja
 
 Retain the real Linux Docker/nsjail smoke as a required release signal; remove `continue-on-error` if present on the job or step.
 
-- [ ] **Step 4: Run documentation and CI-equivalent checks**
+- [x] **Step 4: Run documentation and CI-equivalent checks**
 
 Run:
 
@@ -862,7 +862,7 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit documentation and CI**
+- [x] **Step 5: Commit documentation and CI**
 
 ```bash
 git add LICENSES README.md AGENTS.md CLAUDE.md adapters/*/SOURCE.md .github/workflows/ci.yml internal/archtest
@@ -875,7 +875,7 @@ git commit -m "docs: publish native agent architecture and release gates"
 - Modify: `docs/superpowers/plans/2026-08-11-agent-layer-rearchitecture.md`
 - Test: all packages and local development entrypoints
 
-- [ ] **Step 1: Run formatting and static source scans**
+- [x] **Step 1: Run formatting and static source scans**
 
 Run:
 
@@ -889,7 +889,7 @@ test -z "$(rg -l 'os/exec|exec\.Command|bufio\.Scanner|json\.Unmarshal' adapters
 
 Expected: all commands succeed and both `test -z` commands produce no output.
 
-- [ ] **Step 2: Run the complete Go release gate**
+- [x] **Step 2: Run the complete Go release gate**
 
 Run:
 
@@ -904,7 +904,7 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...
 
 Expected: PASS with no skipped package caused by build tags.
 
-- [ ] **Step 3: Run authenticated macOS Claude Code smoke**
+- [x] **Step 3: Run authenticated macOS Claude Code smoke**
 
 Start the current source with `make dev`, discover models, then send streaming and non-streaming requests to `claude-code/haiku` using the same `X-Workspace-ID` and `X-Gateway-Session-ID`. Verify logs show one persistent Worker session, the second turn reuses it, a client disconnect/abort settles the turn, and no `AskUserQuestion` request can block execution.
 
@@ -919,7 +919,7 @@ curl -fsS http://127.0.0.1:4096/v1/chat/completions \
 
 Expected: HTTP 200, content `OK`, one Gateway session ID reused, and no surviving turn process after abort/close.
 
-- [ ] **Step 4: Run authenticated macOS Codex smoke**
+- [x] **Step 4: Run authenticated macOS Codex smoke**
 
 Use the same workspace with a distinct Codex Gateway session, send two turns, and verify the second process uses the native thread resume ID while the Gateway session remains stable:
 
@@ -933,7 +933,7 @@ curl -fsS http://127.0.0.1:4096/v1/chat/completions \
 
 Expected: HTTP 200, content `OK`, same Gateway session across turns, distinct per-turn CLI PIDs, and a reused native Codex thread ID.
 
-- [ ] **Step 5: Run Linux/nsjail smoke or record the external gate explicitly**
+- [x] **Step 5: Run Linux/nsjail smoke or record the external gate explicitly**
 
 On Linux with Docker available:
 
@@ -946,7 +946,7 @@ docker run --rm --privileged --entrypoint /bin/sh \
 
 Expected: image build succeeds, nsjail version/preflight succeeds, and the minimal jail executes. On macOS without a Linux Docker runtime, do not claim this gate passed; report it as pending CI/release verification.
 
-- [ ] **Step 6: Mark executed checkboxes and commit verification evidence**
+- [x] **Step 6: Mark executed checkboxes and commit verification evidence**
 
 Update only the checkboxes actually executed in this plan. Include command outcomes and explicitly mark the Linux/nsjail smoke as externally pending when it could not run locally.
 
@@ -954,6 +954,38 @@ Update only the checkboxes actually executed in this plan. Include command outco
 git add docs/superpowers/plans/2026-08-11-agent-layer-rearchitecture.md
 git commit -m "test: verify native agent gateway rearchitecture"
 ```
+
+## Verification Record (2026-08-11)
+
+- Formatting and architecture: `gofmt -d` and `git diff --check` were clean;
+  `go test ./internal/archtest/ -v` passed all dependency, legacy-source,
+  adapter-native-execution, provenance, and active-documentation gates. Direct
+  scans found no `agent_ref`, removed `core` import, or native process/JSONL
+  implementation below `adapters/`.
+- Complete Go gate: `go test ./...`, `go test -race ./...`, `go vet ./...`,
+  `go build ./...`, Linux arm64 cross-build, and Windows amd64 cross-build all
+  exited successfully after the final regression fixes.
+- Development discovery: on macOS, `make dev` detected installed Claude Code
+  `2.1.220` and Codex CLI `0.145.0`, omitted unavailable Kimi, and `/v1/models`
+  returned only the three configured Claude variants plus `codex`.
+- Claude Code smoke: non-streaming and SSE turns returned exactly `OK` and
+  `TWO` under Gateway session `smoke-claude`; the Worker created one persistent
+  process. `AskUserQuestion` did not block, abort settled the active request,
+  and the child process was reaped.
+- Codex smoke: three turns reused Gateway session `smoke-codex`; each turn used
+  a separate CLI process and later turns invoked `codex exec resume` with the
+  same native thread ID `019feee3-3d51-7722-9477-9b44dd60f153`.
+- Kimi coverage: the Kimi executable was not installed on this macOS host, so
+  no authenticated real-CLI smoke was claimed. Native fake-CLI regression,
+  race, vet, Linux arm64 compilation, and Windows amd64 compilation passed.
+- Linux/nsjail smoke: Docker Desktop provided a Linux arm64 runtime. Image
+  `agent-gateway:agent-layer-smoke` built successfully; the privileged smoke
+  validated dynamic linkage and executed `/bin/true` in the minimal nsjail,
+  which exited 0 with no PIDs left.
+- Upstream provenance: the selected cc-connect baseline is
+  `3fc360ee6acc9bab13ab1b48ddde3af44062903b`. Its README declares MIT, but that
+  Git tree has no standalone `LICENSE` or `COPYING` file; the local provenance
+  record preserves this caveat and does not invent missing grant text.
 
 ## Completion Audit
 
