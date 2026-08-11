@@ -38,7 +38,6 @@ type streamDelta struct {
 }
 
 const (
-	toolExecutionPrefix       = "gateway.tool_execution.v1:"
 	maxToolSummaryResultBytes = 2000
 )
 
@@ -47,27 +46,22 @@ var (
 	namedSecretPattern  = regexp.MustCompile(`(?im)(authorization|set[_-]?cookie|cookie|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|client[_-]?secret|password|secret|token)(\s*[:=]\s*)[^\r\n,;]+`)
 )
 
-type toolExecutionSummary struct {
-	ID      string `json:"id"`
-	Name    string `json:"name,omitempty"`
-	Status  string `json:"status"`
-	IsError bool   `json:"is_error"`
-	Result  string `json:"result,omitempty"`
-}
-
-func encodeToolExecutionSummary(tool runtime.ToolCall) (string, error) {
-	summary := toolExecutionSummary{
-		ID:      tool.ID,
-		Name:    tool.Name,
-		Status:  "completed",
-		IsError: tool.IsError,
-		Result:  sanitizeToolSummaryResult(tool.Result),
+func formatToolExecutionSummary(tool runtime.ToolCall) string {
+	icon := "⏺"
+	if tool.IsError {
+		icon = "⨯"
 	}
-	data, err := json.Marshal(summary)
-	if err != nil {
-		return "", fmt.Errorf("encode tool execution summary: %w", err)
+	name := strings.TrimSpace(tool.Name)
+	if name == "" {
+		name = "Unknown"
 	}
-	return toolExecutionPrefix + string(data) + "\n", nil
+	result := strings.TrimSpace(sanitizeToolSummaryResult(tool.Result))
+	if result == "" {
+		return icon + " " + name + "\n"
+	}
+	result = strings.ReplaceAll(result, "\n", "\n    ")
+	result = boundUTF8(result, maxToolSummaryResultBytes)
+	return icon + " " + name + "\n  ⎿ " + result + "\n"
 }
 
 func sanitizeToolSummaryResult(result string) string {
@@ -81,14 +75,18 @@ func sanitizeToolSummaryResult(result string) string {
 	}
 	result = bearerSecretPattern.ReplaceAllString(result, "Bearer ***")
 	result = namedSecretPattern.ReplaceAllString(result, "$1$2***")
-	if len(result) <= maxToolSummaryResultBytes {
-		return result
+	return boundUTF8(result, maxToolSummaryResultBytes)
+}
+
+func boundUTF8(value string, maxBytes int) string {
+	if len(value) <= maxBytes {
+		return value
 	}
-	result = result[:maxToolSummaryResultBytes]
-	for !utf8.ValidString(result) {
-		result = result[:len(result)-1]
+	value = value[:maxBytes]
+	for !utf8.ValidString(value) {
+		value = value[:len(value)-1]
 	}
-	return strings.TrimSpace(result) + "..."
+	return strings.TrimSpace(value) + "..."
 }
 
 func redactStructuredSecrets(value any) {
@@ -244,7 +242,8 @@ loop:
 				}
 			case runtime.EventToolUse:
 				// Native Agent tools are already executed. Do not emit OpenAI
-				// delta.tool_calls, which would start a second orchestration loop.
+				// client-executable tool call deltas, which would start a second
+				// orchestration loop.
 				if ev.Tool != nil && ev.Tool.ID != "" {
 					started[ev.Tool.ID] = *ev.Tool
 				}
@@ -269,11 +268,7 @@ loop:
 						tool.Arguments = prior.Arguments
 					}
 				}
-				summary, err := encodeToolExecutionSummary(tool)
-				if err != nil {
-					slog.Warn("openai: encode native tool summary", "tool_id", tool.ID, "error", err)
-					continue
-				}
+				summary := formatToolExecutionSummary(tool)
 				completed[tool.ID] = struct{}{}
 				h.recordServerToolID(sessionID, tool.ID)
 				if err := writeChunk(base.withChoices(streamChoice{

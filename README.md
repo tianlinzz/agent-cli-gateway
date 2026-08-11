@@ -111,16 +111,18 @@ only when the Agent protocol provides content suitable for display. Each native
 tool emits at most one terminal summary after it completes, encoded as:
 
 ```text
-gateway.tool_execution.v1:{"id":"tool-123","name":"Bash","status":"completed","is_error":false,"result":"/workspace"}
+⏺ Bash
+  ⎿ /workspace
 ```
 
 The summary is also carried in `delta.reasoning_content`; it is display and
 persistence data, not a request to execute the tool. Clients that already
-consume reasoning need no new response-field adapter. A client may recognize
-the versioned prefix for a dedicated tool view, or display it as ordinary
-reasoning text. Each encoded summary ends with `\n`, which provides a stable
-record delimiter when clients concatenate streamed reasoning chunks. Clients
-must not submit a tool-result message for this summary.
+consume reasoning need no new response-field adapter or Gateway-specific
+parser. Successful tools use `⏺`; failed tools use `⨯`. The tool name is
+followed by the sanitized, bounded result under `⎿`, with multiline output
+indented beneath it. Each summary ends with `\n`, which provides a stable record
+delimiter when clients concatenate streamed reasoning chunks. Clients must not
+submit a tool-result message for this summary.
 The Gateway never emits native tools as `delta.tool_calls`, tool-role messages,
 or `finish_reason: "tool_calls"`, so an outer Agent runtime never starts a
 second tool loop. Process telemetry is streaming-only in v1; non-streaming

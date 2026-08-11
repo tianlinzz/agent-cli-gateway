@@ -895,41 +895,62 @@ func TestChatCompletions_StreamProjectsReasoningAndTerminalToolSummary(t *testin
 	if len(reasoning) != 2 || reasoning[0] != "checking workspace" {
 		t.Fatalf("reasoning = %#v, want native reasoning and one tool summary", reasoning)
 	}
-	if !strings.HasPrefix(reasoning[1], "gateway.tool_execution.v1:") || !strings.Contains(reasoning[1], `"id":"tool-1"`) || !strings.Contains(reasoning[1], `"name":"Bash"`) {
-		t.Fatalf("tool summary = %q", reasoning[1])
+	if reasoning[1] != "⏺ Bash\n  ⎿ /workspace\n" {
+		t.Fatalf("tool summary = %q, want normalized display text", reasoning[1])
 	}
 	if content.String() != "done" {
 		t.Errorf("content = %q, want done", content.String())
 	}
 }
 
-func TestEncodeToolExecutionSummaryRedactsAndBoundsResult(t *testing.T) {
-	result := "Authorization: Bearer sk-secret\n" + strings.Repeat("x", maxToolSummaryResultBytes+100)
-	encoded, err := encodeToolExecutionSummary(runtime.ToolCall{ID: "tool-1", Name: "Bash", Result: result})
-	if err != nil {
-		t.Fatal(err)
+func TestFormatToolExecutionSummaryUsesIconNameAndResult(t *testing.T) {
+	tests := []struct {
+		name string
+		tool runtime.ToolCall
+		want string
+	}{
+		{name: "success", tool: runtime.ToolCall{Name: "TaskUpdate", Result: "Updated task #2 status"}, want: "⏺ TaskUpdate\n  ⎿ Updated task #2 status\n"},
+		{name: "failure", tool: runtime.ToolCall{Name: "Bash", Result: "command exited with status 1", IsError: true}, want: "⨯ Bash\n  ⎿ command exited with status 1\n"},
+		{name: "empty result", tool: runtime.ToolCall{Name: "Read"}, want: "⏺ Read\n"},
+		{name: "multiline result", tool: runtime.ToolCall{Name: "Bash", Result: "line one\nline two"}, want: "⏺ Bash\n  ⎿ line one\n    line two\n"},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatToolExecutionSummary(tt.tool); got != tt.want {
+				t.Fatalf("summary = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatToolExecutionSummaryRedactsAndBoundsResult(t *testing.T) {
+	result := "Authorization: Bearer sk-secret\n" + strings.Repeat("x", maxToolSummaryResultBytes+100)
+	encoded := formatToolExecutionSummary(runtime.ToolCall{ID: "tool-1", Name: "Bash", Result: result})
 	if strings.Contains(encoded, "sk-secret") {
 		t.Fatalf("encoded summary leaked bearer token: %q", encoded)
 	}
 	if !strings.Contains(encoded, "Authorization: ***") {
 		t.Fatalf("encoded summary did not preserve redacted marker: %q", encoded)
 	}
-	var summary toolExecutionSummary
-	if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(encoded, toolExecutionPrefix))), &summary); err != nil {
-		t.Fatalf("decode summary: %v", err)
-	}
-	if len(summary.Result) > maxToolSummaryResultBytes+3 {
-		t.Fatalf("result length = %d, want bounded", len(summary.Result))
+	if len(encoded) > maxToolSummaryResultBytes+64 {
+		t.Fatalf("summary length = %d, want bounded", len(encoded))
 	}
 }
 
-func TestEncodeToolExecutionSummaryRecursivelyRedactsJSONAndUsesDelimiter(t *testing.T) {
-	result := `{"authorization":"Basic abc","nested":{"access_token":"value-access","items":[{"API-Key":"value-api"},{"refresh_token":"value-refresh","id_token":"value-id","client_secret":"value-client","password":"value-password","secret":"value-secret"}]},"cookie":"sid=123","set-cookie":"sid=456","ok":"visible"}`
-	encoded, err := encodeToolExecutionSummary(runtime.ToolCall{ID: "tool-1", Name: "Bash", Result: result})
-	if err != nil {
-		t.Fatal(err)
+func TestFormatToolExecutionSummaryBoundsMultilineExpansion(t *testing.T) {
+	result := strings.Repeat("x\n", maxToolSummaryResultBytes)
+	summary := formatToolExecutionSummary(runtime.ToolCall{Name: "Bash", Result: result})
+	if len(summary) > maxToolSummaryResultBytes+64 {
+		t.Fatalf("multiline summary length = %d, want bounded", len(summary))
 	}
+	if !utf8.ValidString(summary) {
+		t.Fatalf("multiline summary is invalid UTF-8: %q", summary)
+	}
+}
+
+func TestFormatToolExecutionSummaryRecursivelyRedactsJSONAndUsesDelimiter(t *testing.T) {
+	result := `{"authorization":"Basic abc","nested":{"access_token":"value-access","items":[{"API-Key":"value-api"},{"refresh_token":"value-refresh","id_token":"value-id","client_secret":"value-client","password":"value-password","secret":"value-secret"}]},"cookie":"sid=123","set-cookie":"sid=456","ok":"visible"}`
+	encoded := formatToolExecutionSummary(runtime.ToolCall{ID: "tool-1", Name: "Bash", Result: result})
 	if !strings.HasSuffix(encoded, "\n") {
 		t.Fatalf("summary is missing record delimiter: %q", encoded)
 	}
@@ -938,12 +959,8 @@ func TestEncodeToolExecutionSummaryRecursivelyRedactsJSONAndUsesDelimiter(t *tes
 			t.Fatalf("encoded summary leaked %q: %q", leak, encoded)
 		}
 	}
-	var summary toolExecutionSummary
-	if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(encoded, toolExecutionPrefix))), &summary); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(summary.Result, `"ok":"visible"`) {
-		t.Fatalf("non-secret JSON value was lost: %q", summary.Result)
+	if !strings.Contains(encoded, `"ok":"visible"`) {
+		t.Fatalf("non-secret JSON value was lost: %q", encoded)
 	}
 }
 
@@ -1015,7 +1032,7 @@ func TestChatCompletions_StreamIgnoresToolResultAfterFinish(t *testing.T) {
 	})
 	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, chatReq("codex", true, defaultMessages()))
 	body := readBody(t, resp)
-	if strings.Contains(string(body), toolExecutionPrefix) {
+	if strings.Contains(string(body), "⏺") || strings.Contains(string(body), "⨯") {
 		t.Fatalf("late tool result leaked after finish: %s", body)
 	}
 	sessionID := resp.Header.Get("X-Gateway-Session-Id")

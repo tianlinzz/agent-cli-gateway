@@ -402,7 +402,7 @@ func TestIntegration_ServerExecutedTelemetryUsesReasoningChannel(t *testing.T) {
 			finish = *chunk.Choices[0].FinishReason
 		}
 	}
-	if len(reasoning) != 2 || reasoning[0] != "checking workspace" || !strings.HasPrefix(reasoning[1], "gateway.tool_execution.v1:") {
+	if len(reasoning) != 2 || reasoning[0] != "checking workspace" || reasoning[1] != "⏺ Bash\n  ⎿ /workspace\n" {
 		t.Fatalf("reasoning sequence = %#v", reasoning)
 	}
 	if content.String() != "echo:hello" {
