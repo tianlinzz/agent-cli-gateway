@@ -49,13 +49,14 @@ func TestSessionMapsNativeEventsToRuntime(t *testing.T) {
 	nativeSession := newFakeNativeSession()
 	session := wrapSession(nativeSession)
 	nativeSession.events <- native.Event{Kind: native.EventText, Text: "hello"}
+	nativeSession.events <- native.Event{Kind: native.EventReasoning, Reasoning: &native.Reasoning{ID: "reason-1", Text: "safe summary"}}
 	nativeSession.events <- native.Event{Kind: native.EventToolUse, Tool: &native.ToolCall{ID: "tool-1", Name: "Read", Arguments: map[string]any{"file_path": "a.go"}}}
 	nativeSession.events <- native.Event{Kind: native.EventPermission, Permission: &native.PermissionRequest{ID: "perm-1", Action: "Bash", Detail: "pwd"}}
 	nativeSession.events <- native.Event{Kind: native.EventUsage, Usage: &native.Usage{InputTokens: 2, OutputTokens: 3, TotalTokens: 5}}
 	nativeSession.events <- native.Event{Kind: native.EventFinish, FinishReason: "end_turn", NativeSessionID: "native-1"}
 	close(nativeSession.events)
 
-	want := []runtime.EventType{runtime.EventText, runtime.EventToolUse, runtime.EventPermission, runtime.EventUsage, runtime.EventFinish}
+	want := []runtime.EventType{runtime.EventText, runtime.EventReasoning, runtime.EventToolUse, runtime.EventPermission, runtime.EventUsage, runtime.EventFinish}
 	for i, eventType := range want {
 		event, ok := <-session.Events()
 		if !ok {

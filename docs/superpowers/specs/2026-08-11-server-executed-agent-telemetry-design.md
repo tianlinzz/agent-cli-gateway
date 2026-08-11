@@ -103,7 +103,7 @@ string in the same `reasoning_content` field:
     {
       "index": 0,
       "delta": {
-        "reasoning_content": "gateway.tool_execution.v1:{\"id\":\"tool-123\",\"name\":\"Bash\",\"status\":\"completed\",\"is_error\":false,\"result\":\"/workspace\"}"
+        "reasoning_content": "gateway.tool_execution.v1:{\"id\":\"tool-123\",\"name\":\"Bash\",\"status\":\"completed\",\"is_error\":false,\"result\":\"/workspace\"}\n"
       },
       "finish_reason": null
     }
@@ -128,6 +128,8 @@ recognizable to consumers that want a dedicated tool card later. Consumers that
 do not recognize it still receive an ordinary reasoning string and do not enter
 any tool loop. This is an application-level convention carried through an
 already-consumed compatibility field, not a new OpenAI control field.
+The trailing newline is part of the v1 framing and keeps adjacent summaries or
+later reasoning text separable after a client concatenates streamed deltas.
 
 The Gateway does not stream `started` or incremental tool updates in v1. It
 keeps native start data internally and emits one event only when the matching

@@ -59,12 +59,13 @@ func TestSessionMapsEventsAndDelegatesLifecycle(t *testing.T) {
 	nativeSession := newFakeSession("thread-1")
 	session := wrapSession(nativeSession)
 	nativeSession.events <- native.Event{Kind: native.EventText, Text: "text"}
+	nativeSession.events <- native.Event{Kind: native.EventReasoning, Reasoning: &native.Reasoning{ID: "reason-1", Text: "reasoning"}}
 	nativeSession.events <- native.Event{Kind: native.EventToolUse, Tool: &native.ToolCall{ID: "tool-1", Name: "Bash", Arguments: map[string]any{"command": "pwd"}}}
 	nativeSession.events <- native.Event{Kind: native.EventToolResult, Tool: &native.ToolCall{ID: "tool-1", Name: "Bash", Result: "/workspace"}}
 	nativeSession.events <- native.Event{Kind: native.EventUsage, Usage: &native.Usage{InputTokens: 1, OutputTokens: 2, TotalTokens: 3}}
 	nativeSession.events <- native.Event{Kind: native.EventFinish, FinishReason: "end_turn", NativeSessionID: "thread-1"}
 	close(nativeSession.events)
-	for _, want := range []runtime.EventType{runtime.EventText, runtime.EventToolUse, runtime.EventToolResult, runtime.EventUsage, runtime.EventFinish} {
+	for _, want := range []runtime.EventType{runtime.EventText, runtime.EventReasoning, runtime.EventToolUse, runtime.EventToolResult, runtime.EventUsage, runtime.EventFinish} {
 		if event := <-session.Events(); event.Type != want {
 			t.Fatalf("event type = %q, want %q", event.Type, want)
 		}

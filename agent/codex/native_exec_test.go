@@ -33,8 +33,8 @@ func TestSessionUsesOneAppServerForMultipleTurns(t *testing.T) {
 		if eventOfKind(events, EventFinish) == nil {
 			t.Fatalf("events = %#v", events)
 		}
-		if reasoning := textEvent(events, "private reasoning"); reasoning != nil {
-			t.Fatalf("reasoning leaked into assistant text: %#v", reasoning)
+		if reasoning := eventOfKind(events, EventReasoning); reasoning == nil || reasoning.Reasoning == nil || reasoning.Reasoning.Text != "safe reasoning summary" {
+			t.Fatalf("reasoning summary = %#v", reasoning)
 		}
 	}
 
@@ -64,7 +64,7 @@ func TestSessionResumesThreadOnceDuringStartup(t *testing.T) {
 	assertMethodCount(t, entries, "turn/start", 1)
 }
 
-func TestToolEventsHaveStableIDsAndReasoningStaysPrivate(t *testing.T) {
+func TestToolEventsHaveStableIDsAndSafeReasoningSummary(t *testing.T) {
 	session := startTestSession(t, nil)
 	if err := session.Send(context.Background(), Input{Prompt: "tool"}); err != nil {
 		t.Fatal(err)
@@ -75,8 +75,8 @@ func TestToolEventsHaveStableIDsAndReasoningStaysPrivate(t *testing.T) {
 	if use == nil || result == nil || use.Tool == nil || result.Tool == nil || use.Tool.ID != "item-tool-1" || result.Tool.ID != use.Tool.ID {
 		t.Fatalf("tool events = %#v", events)
 	}
-	if textEvent(events, "private reasoning") != nil {
-		t.Fatalf("reasoning leaked: %#v", events)
+	if reasoning := eventOfKind(events, EventReasoning); reasoning == nil || reasoning.Reasoning == nil || reasoning.Reasoning.Text != "safe reasoning summary" {
+		t.Fatalf("reasoning summary = %#v", reasoning)
 	}
 	if got := eventKindCount(events, EventToolResult); got != 1 {
 		t.Fatalf("tool result count = %d, want 1; events=%#v", got, events)
@@ -338,7 +338,7 @@ func TestCodexAppServerHelper(t *testing.T) {
 }
 
 func emitTurn(turnID, prompt string) {
-	emitRPCNotification("item/started", map[string]any{"threadId": "thread-native-1", "turnId": turnID, "item": map[string]any{"id": "reason-1", "type": "reasoning", "summary": []string{"private reasoning"}}})
+	emitRPCNotification("item/started", map[string]any{"threadId": "thread-native-1", "turnId": turnID, "item": map[string]any{"id": "reason-1", "type": "reasoning", "summary": []string{"safe reasoning summary"}}})
 	if prompt == "tool" {
 		emitRPCNotification("item/started", map[string]any{"threadId": "thread-native-1", "turnId": turnID, "item": map[string]any{"id": "item-tool-1", "type": "commandExecution", "command": "pwd", "status": "inProgress"}})
 		emitRPCNotification("item/completed", map[string]any{"threadId": "thread-native-1", "turnId": turnID, "item": map[string]any{"id": "item-tool-1", "type": "commandExecution", "command": "pwd", "status": "completed", "aggregatedOutput": "/tmp", "exitCode": 0}})

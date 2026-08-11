@@ -118,7 +118,9 @@ The summary is also carried in `delta.reasoning_content`; it is display and
 persistence data, not a request to execute the tool. Clients that already
 consume reasoning need no new response-field adapter. A client may recognize
 the versioned prefix for a dedicated tool view, or display it as ordinary
-reasoning text. Clients must not submit a tool-result message for this summary.
+reasoning text. Each encoded summary ends with `\n`, which provides a stable
+record delimiter when clients concatenate streamed reasoning chunks. Clients
+must not submit a tool-result message for this summary.
 The Gateway never emits native tools as `delta.tool_calls`, tool-role messages,
 or `finish_reason: "tool_calls"`, so an outer Agent runtime never starts a
 second tool loop. Process telemetry is streaming-only in v1; non-streaming

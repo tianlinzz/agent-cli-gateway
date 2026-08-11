@@ -44,7 +44,7 @@ const (
 
 var (
 	bearerSecretPattern = regexp.MustCompile(`(?i)Bearer\s+[^\s,;"}]+`)
-	namedSecretPattern  = regexp.MustCompile(`(?i)(access[_-]?token|api[_-]?key|cookie)(\s*[:=]\s*)[^\s,;"}]+`)
+	namedSecretPattern  = regexp.MustCompile(`(?im)(authorization|set[_-]?cookie|cookie|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|client[_-]?secret|password|secret|token)(\s*[:=]\s*)[^\r\n,;]+`)
 )
 
 type toolExecutionSummary struct {
@@ -67,10 +67,18 @@ func encodeToolExecutionSummary(tool runtime.ToolCall) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("encode tool execution summary: %w", err)
 	}
-	return toolExecutionPrefix + string(data), nil
+	return toolExecutionPrefix + string(data) + "\n", nil
 }
 
 func sanitizeToolSummaryResult(result string) string {
+	result = strings.ToValidUTF8(result, "")
+	var structured any
+	if json.Unmarshal([]byte(result), &structured) == nil {
+		redactStructuredSecrets(structured)
+		if data, err := json.Marshal(structured); err == nil {
+			result = string(data)
+		}
+	}
 	result = bearerSecretPattern.ReplaceAllString(result, "Bearer ***")
 	result = namedSecretPattern.ReplaceAllString(result, "$1$2***")
 	if len(result) <= maxToolSummaryResultBytes {
@@ -81,6 +89,38 @@ func sanitizeToolSummaryResult(result string) string {
 		result = result[:len(result)-1]
 	}
 	return strings.TrimSpace(result) + "..."
+}
+
+func redactStructuredSecrets(value any) {
+	switch current := value.(type) {
+	case map[string]any:
+		for key, child := range current {
+			if isSecretKey(key) {
+				current[key] = "***"
+				continue
+			}
+			redactStructuredSecrets(child)
+		}
+	case []any:
+		for _, child := range current {
+			redactStructuredSecrets(child)
+		}
+	}
+}
+
+func isSecretKey(key string) bool {
+	var normalized strings.Builder
+	for _, char := range strings.ToLower(key) {
+		if char >= 'a' && char <= 'z' || char >= '0' && char <= '9' {
+			normalized.WriteRune(char)
+		}
+	}
+	switch normalized.String() {
+	case "authorization", "cookie", "setcookie", "token", "accesstoken", "refreshtoken", "idtoken", "apikey", "clientsecret", "password", "secret":
+		return true
+	default:
+		return false
+	}
 }
 
 func (c streamChunk) withChoices(choices ...streamChoice) streamChunk {
@@ -213,10 +253,11 @@ loop:
 					_, _ = h.store.Update(context.Background(), sessionID, callerID, func(rec *runtime.SessionRecord) { rec.NativeSessionID = ev.NativeSessionID })
 				}
 			case runtime.EventToolResult:
-				if ev.Tool == nil || ev.Tool.ID == "" {
+				if finishSeen || ev.Tool == nil || ev.Tool.ID == "" {
 					continue
 				}
 				if _, seen := completed[ev.Tool.ID]; seen {
+					slog.Warn("openai: duplicate native tool result", "tool_id", ev.Tool.ID, "session", sessionID)
 					continue
 				}
 				tool := *ev.Tool
@@ -233,14 +274,14 @@ loop:
 					slog.Warn("openai: encode native tool summary", "tool_id", tool.ID, "error", err)
 					continue
 				}
+				completed[tool.ID] = struct{}{}
+				h.recordServerToolID(sessionID, tool.ID)
 				if err := writeChunk(base.withChoices(streamChoice{
 					Index: 0,
 					Delta: streamDelta{ReasoningContent: summary},
 				})); err != nil {
 					return
 				}
-				completed[tool.ID] = struct{}{}
-				h.recordServerToolID(sessionID, tool.ID)
 			case runtime.EventUsage:
 				if ev.Usage != nil {
 					usage = usageFromRuntime(ev.Usage)

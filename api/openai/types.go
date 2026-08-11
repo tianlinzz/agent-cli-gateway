@@ -95,10 +95,11 @@ type Handler struct {
 	newID func() string
 	now   func() time.Time
 
-	mu            sync.Mutex
-	handles       map[string]runtime.ExecutionHandle // sessionID -> live execution
-	turns         map[string]*turnState              // sessionID -> in-flight turn
-	serverToolIDs map[string]map[string]struct{}     // sessionID -> completed native tool IDs
+	mu                 sync.Mutex
+	handles            map[string]runtime.ExecutionHandle // sessionID -> live execution
+	turns              map[string]*turnState              // sessionID -> in-flight turn
+	serverToolIDs      map[string]*serverToolLedger       // sessionID -> completed native tool IDs
+	serverToolSessions []string                           // insertion order for bounded session eviction
 }
 
 // turnState is one in-flight turn on a session, registered so the abort
@@ -123,7 +124,15 @@ func (h *Handler) markTurnSettling(sessionID string) {
 	}
 }
 
-const maxServerToolIDsPerSession = 128
+const (
+	maxServerToolIDsPerSession = 128
+	maxServerToolSessions      = 1024
+)
+
+type serverToolLedger struct {
+	ids   map[string]struct{}
+	order []string
+}
 
 func (h *Handler) recordServerToolID(sessionID, toolID string) {
 	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(toolID) == "" {
@@ -131,25 +140,53 @@ func (h *Handler) recordServerToolID(sessionID, toolID string) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	ids := h.serverToolIDs[sessionID]
-	if ids == nil {
-		ids = make(map[string]struct{})
-		h.serverToolIDs[sessionID] = ids
-	}
-	if len(ids) >= maxServerToolIDsPerSession {
-		for oldest := range ids {
-			delete(ids, oldest)
-			break
+	ledger := h.serverToolIDs[sessionID]
+	if ledger == nil {
+		if len(h.serverToolIDs) >= maxServerToolSessions {
+			oldest := h.serverToolSessions[0]
+			h.serverToolSessions = h.serverToolSessions[1:]
+			delete(h.serverToolIDs, oldest)
 		}
+		ledger = &serverToolLedger{ids: make(map[string]struct{})}
+		h.serverToolIDs[sessionID] = ledger
+		h.serverToolSessions = append(h.serverToolSessions, sessionID)
 	}
-	ids[toolID] = struct{}{}
+	if _, exists := ledger.ids[toolID]; exists {
+		return
+	}
+	if len(ledger.order) >= maxServerToolIDsPerSession {
+		oldest := ledger.order[0]
+		ledger.order = ledger.order[1:]
+		delete(ledger.ids, oldest)
+	}
+	ledger.ids[toolID] = struct{}{}
+	ledger.order = append(ledger.order, toolID)
 }
 
 func (h *Handler) isServerToolID(sessionID, toolID string) bool {
 	h.mu.Lock()
-	_, ok := h.serverToolIDs[sessionID][toolID]
+	ledger := h.serverToolIDs[sessionID]
+	ok := false
+	if ledger != nil {
+		_, ok = ledger.ids[toolID]
+	}
 	h.mu.Unlock()
 	return ok
+}
+
+func (h *Handler) clearServerToolIDs(sessionID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, exists := h.serverToolIDs[sessionID]; !exists {
+		return
+	}
+	delete(h.serverToolIDs, sessionID)
+	for index, id := range h.serverToolSessions {
+		if id == sessionID {
+			h.serverToolSessions = append(h.serverToolSessions[:index], h.serverToolSessions[index+1:]...)
+			return
+		}
+	}
 }
 
 func (h *Handler) hasServerToolReplay(sessionID string, messages []ChatMessage) bool {
@@ -244,7 +281,7 @@ func NewHandler(opts Options) *Handler {
 		now:             now,
 		handles:         make(map[string]runtime.ExecutionHandle),
 		turns:           make(map[string]*turnState),
-		serverToolIDs:   make(map[string]map[string]struct{}),
+		serverToolIDs:   make(map[string]*serverToolLedger),
 	}
 	h.catalog = &modelCatalog{reg: opts.Registry, enabled: opts.Enabled, models: opts.Models}
 	return h

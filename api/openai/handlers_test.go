@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
 )
@@ -910,15 +912,53 @@ func TestEncodeToolExecutionSummaryRedactsAndBoundsResult(t *testing.T) {
 	if strings.Contains(encoded, "sk-secret") {
 		t.Fatalf("encoded summary leaked bearer token: %q", encoded)
 	}
-	if !strings.Contains(encoded, "Bearer ***") {
+	if !strings.Contains(encoded, "Authorization: ***") {
 		t.Fatalf("encoded summary did not preserve redacted marker: %q", encoded)
 	}
 	var summary toolExecutionSummary
-	if err := json.Unmarshal([]byte(strings.TrimPrefix(encoded, toolExecutionPrefix)), &summary); err != nil {
+	if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(encoded, toolExecutionPrefix))), &summary); err != nil {
 		t.Fatalf("decode summary: %v", err)
 	}
 	if len(summary.Result) > maxToolSummaryResultBytes+3 {
 		t.Fatalf("result length = %d, want bounded", len(summary.Result))
+	}
+}
+
+func TestEncodeToolExecutionSummaryRecursivelyRedactsJSONAndUsesDelimiter(t *testing.T) {
+	result := `{"authorization":"Basic abc","nested":{"access_token":"value-access","items":[{"API-Key":"value-api"},{"refresh_token":"value-refresh","id_token":"value-id","client_secret":"value-client","password":"value-password","secret":"value-secret"}]},"cookie":"sid=123","set-cookie":"sid=456","ok":"visible"}`
+	encoded, err := encodeToolExecutionSummary(runtime.ToolCall{ID: "tool-1", Name: "Bash", Result: result})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(encoded, "\n") {
+		t.Fatalf("summary is missing record delimiter: %q", encoded)
+	}
+	for _, leak := range []string{"Basic abc", "value-access", "value-api", "value-refresh", "value-id", "value-client", "value-password", "value-secret", "sid=123", "sid=456"} {
+		if strings.Contains(encoded, leak) {
+			t.Fatalf("encoded summary leaked %q: %q", leak, encoded)
+		}
+	}
+	var summary toolExecutionSummary
+	if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(encoded, toolExecutionPrefix))), &summary); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(summary.Result, `"ok":"visible"`) {
+		t.Fatalf("non-secret JSON value was lost: %q", summary.Result)
+	}
+}
+
+func TestSanitizeToolSummaryResultHandlesPlainTextAndInvalidUTF8(t *testing.T) {
+	plain := "Authorization: Basic abc\nCookie=session=123\napi_key=value-api password=value-password token=value-token"
+	sanitized := sanitizeToolSummaryResult(plain)
+	for _, leak := range []string{"Basic abc", "session=123", "value-api", "value-password", "value-token"} {
+		if strings.Contains(sanitized, leak) {
+			t.Fatalf("plain result leaked %q: %q", leak, sanitized)
+		}
+	}
+	invalid := strings.Repeat("x", maxToolSummaryResultBytes) + string([]byte{0xff, 0xfe}) + "tail"
+	sanitized = sanitizeToolSummaryResult(invalid)
+	if !utf8.ValidString(sanitized) || len(sanitized) > maxToolSummaryResultBytes+3 {
+		t.Fatalf("invalid UTF-8 was not safely bounded: len=%d result=%q", len(sanitized), sanitized)
 	}
 }
 
@@ -962,6 +1002,117 @@ func TestRejectServerExecutedToolReplay(t *testing.T) {
 	}
 	if got := backend.Handle(sessionID).SendCount(); got != 1 {
 		t.Fatalf("native sends = %d, want 1", got)
+	}
+}
+
+func TestChatCompletions_StreamIgnoresToolResultAfterFinish(t *testing.T) {
+	ts, h, backend := newTestServer(t)
+	backend.withScript(func(handle *fakeHandle) {
+		handle.emit(
+			runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"},
+			runtime.Event{Type: runtime.EventToolResult, Tool: &runtime.ToolCall{ID: "late-tool", Result: "late"}},
+		)
+	})
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, chatReq("codex", true, defaultMessages()))
+	body := readBody(t, resp)
+	if strings.Contains(string(body), toolExecutionPrefix) {
+		t.Fatalf("late tool result leaked after finish: %s", body)
+	}
+	sessionID := resp.Header.Get("X-Gateway-Session-Id")
+	if h.isServerToolID(sessionID, "late-tool") {
+		t.Fatal("late tool result was recorded after finish")
+	}
+}
+
+func TestServerToolLedgerIsDeterministicAndBounded(t *testing.T) {
+	_, h, _ := newTestServer(t)
+	const sessionID = "ledger-session"
+	for i := 0; i < maxServerToolIDsPerSession; i++ {
+		h.recordServerToolID(sessionID, fmt.Sprintf("tool-%03d", i))
+	}
+	h.recordServerToolID(sessionID, "tool-000")
+	for i := 0; i < maxServerToolIDsPerSession; i++ {
+		if !h.isServerToolID(sessionID, fmt.Sprintf("tool-%03d", i)) {
+			t.Fatalf("duplicate insertion evicted tool-%03d", i)
+		}
+	}
+	h.recordServerToolID(sessionID, "tool-new")
+	if h.isServerToolID(sessionID, "tool-000") {
+		t.Fatal("oldest tool ID was not evicted")
+	}
+	if !h.isServerToolID(sessionID, "tool-new") || !h.isServerToolID(sessionID, "tool-127") {
+		t.Fatal("newest tool IDs were evicted")
+	}
+}
+
+func TestServerToolLedgerBoundsSessionsAndConcurrentWrites(t *testing.T) {
+	_, h, _ := newTestServer(t)
+	var wg sync.WaitGroup
+	for i := 0; i < maxServerToolSessions+1; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			h.recordServerToolID(fmt.Sprintf("session-%04d", i), "tool")
+		}(i)
+	}
+	wg.Wait()
+	h.mu.Lock()
+	count := len(h.serverToolIDs)
+	h.mu.Unlock()
+	if count != maxServerToolSessions {
+		t.Fatalf("session ledgers = %d, want %d", count, maxServerToolSessions)
+	}
+}
+
+func TestServerToolLedgerClearsWhenSessionIsDeletedOrRecreated(t *testing.T) {
+	ts, h, backend := newTestServer(t)
+	backend.withScript(func(handle *fakeHandle) {
+		handle.emit(runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"})
+	})
+	const sessionID = "reused-session"
+	h.recordServerToolID(sessionID, "old-tool")
+	if err := h.store.Create(context.Background(), runtime.SessionRecord{ID: sessionID, CallerID: testOwner, ModelID: "codex", WorkspaceID: testWorkspace}); err != nil {
+		t.Fatal(err)
+	}
+	h.deleteSession(context.Background(), sessionID, testOwner)
+	if h.isServerToolID(sessionID, "old-tool") {
+		t.Fatal("deleting a session retained its server tool ledger")
+	}
+
+	h.recordServerToolID(sessionID, "old-tool")
+	req := chatReq("codex", false, []map[string]any{{"role": "tool", "tool_call_id": "old-tool", "content": "stale"}, {"role": "user", "content": "new turn"}})
+	resp := doAuthJSONH(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, req, map[string]string{"X-Gateway-Session-Id": sessionID})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("recreated session inherited stale ledger: status=%d body=%s", resp.StatusCode, readBody(t, resp))
+	}
+}
+
+type failAfterResponseWriter struct {
+	header http.Header
+	writes int
+	failAt int
+}
+
+func (w *failAfterResponseWriter) Header() http.Header { return w.header }
+func (w *failAfterResponseWriter) WriteHeader(int)     {}
+func (w *failAfterResponseWriter) Flush()              {}
+func (w *failAfterResponseWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes >= w.failAt {
+		return 0, errors.New("client disconnected")
+	}
+	return len(p), nil
+}
+
+func TestStreamRecordsServerToolBeforeClientWriteFailure(t *testing.T) {
+	_, h, _ := newTestServer(t)
+	handle := newFakeHandle(nil)
+	handle.emit(runtime.Event{Type: runtime.EventToolResult, Tool: &runtime.ToolCall{ID: "tool-before-write", Name: "Bash", Result: "ok"}})
+	w := &failAfterResponseWriter{header: make(http.Header), failAt: 2}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	h.streamTurn(w, req, context.Background(), "codex", "write-failure-session", testOwner, handle, false)
+	if !h.isServerToolID("write-failure-session", "tool-before-write") {
+		t.Fatal("server tool ID was lost when its display chunk could not be written")
 	}
 }
 

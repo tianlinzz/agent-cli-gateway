@@ -28,6 +28,9 @@ func TestSessionUsesOneACPProcessForMultipleTurns(t *testing.T) {
 			t.Fatal(err)
 		}
 		events := readKimiTurn(t, session.Events())
+		if reasoning := findKimiEvent(events, EventReasoning); reasoning == nil || reasoning.Reasoning == nil || reasoning.Reasoning.Text != "safe thought summary" {
+			t.Fatalf("reasoning summary = %#v", reasoning)
+		}
 		if findKimiEvent(events, EventFinish) == nil {
 			t.Fatalf("events = %#v", events)
 		}
@@ -306,6 +309,7 @@ func TestKimiACPHelper(t *testing.T) {
 }
 
 func emitKimiTurn(id json.RawMessage, turn int, prompt, stop string) {
+	emitKimiNotification("session/update", map[string]any{"sessionId": "session-native-1", "update": map[string]any{"sessionUpdate": "agent_thought_chunk", "content": map[string]any{"type": "text", "text": "safe thought summary"}}})
 	if prompt == "tool" {
 		emitKimiNotification("session/update", map[string]any{"sessionId": "session-native-1", "update": map[string]any{"sessionUpdate": "tool_call", "toolCallId": "tool-1", "title": "Shell", "rawInput": map[string]any{"command": "pwd"}, "status": "in_progress"}})
 		emitKimiNotification("session/update", map[string]any{"sessionId": "session-native-1", "update": map[string]any{"sessionUpdate": "tool_call_update", "toolCallId": "tool-1", "status": "completed", "content": []any{map[string]any{"type": "content", "content": map[string]any{"type": "text", "text": "/tmp"}}}}})

@@ -5,6 +5,7 @@ type EventKind string
 
 const (
 	EventText          EventKind = "text"
+	EventReasoning     EventKind = "reasoning"
 	EventToolUse       EventKind = "tool_use"
 	EventToolResult    EventKind = "tool_result"
 	EventPermission    EventKind = "permission"
@@ -24,6 +25,13 @@ type Usage struct {
 	InputTokens  int
 	OutputTokens int
 	TotalTokens  int
+}
+
+// Reasoning is reserved for native protocol fields explicitly documented as
+// safe summaries. Raw Claude thinking blocks are never mapped into it.
+type Reasoning struct {
+	ID   string
+	Text string
 }
 
 // ToolCall is a Claude-native tool invocation or result.
@@ -46,6 +54,7 @@ type PermissionRequest struct {
 type Event struct {
 	Kind            EventKind
 	Text            string
+	Reasoning       *Reasoning
 	Tool            *ToolCall
 	Permission      *PermissionRequest
 	Usage           *Usage

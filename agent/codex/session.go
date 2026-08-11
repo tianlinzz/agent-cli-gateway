@@ -249,6 +249,12 @@ func approvalDetail(params map[string]any) string {
 }
 
 func (s *Session) handleItemStarted(item map[string]any) {
+	if stringValue(item["type"]) == "reasoning" {
+		if text := reasoningSummary(item["summary"]); text != "" {
+			s.emit(Event{Kind: EventReasoning, Reasoning: &Reasoning{ID: stringValue(item["id"]), Text: text}})
+		}
+		return
+	}
 	tool, ok := toolFromItem(item)
 	if !ok {
 		return
@@ -266,6 +272,20 @@ func (s *Session) handleItemStarted(item map[string]any) {
 	turn.tools[tool.ID] = tool
 	s.mu.Unlock()
 	s.emit(Event{Kind: EventToolUse, Tool: &tool})
+}
+
+func reasoningSummary(value any) string {
+	values, ok := value.([]any)
+	if !ok {
+		return ""
+	}
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+			parts = append(parts, strings.TrimSpace(text))
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 func (s *Session) handleItemCompleted(item map[string]any) {

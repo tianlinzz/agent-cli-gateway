@@ -82,6 +82,7 @@ func TestSessionMapsEveryNativeEventAndDelegatesLifecycle(t *testing.T) {
 	nativeSession := newFakeSession("native-1")
 	session := wrapSession(nativeSession)
 	nativeSession.events <- native.Event{Kind: native.EventText, Text: "text"}
+	nativeSession.events <- native.Event{Kind: native.EventReasoning, Reasoning: &native.Reasoning{ID: "reason-1", Text: "thought"}}
 	nativeSession.events <- native.Event{Kind: native.EventToolUse, Tool: &native.ToolCall{ID: "tool-1", Name: "Shell", Arguments: map[string]any{"command": "pwd"}}}
 	nativeSession.events <- native.Event{Kind: native.EventToolResult, Tool: &native.ToolCall{ID: "tool-1", Result: "/workspace", IsError: false}}
 	nativeSession.events <- native.Event{Kind: native.EventPermission, Permission: &native.PermissionRequest{ID: "perm-1", Action: "Shell", Detail: "pwd"}}
@@ -92,7 +93,7 @@ func TestSessionMapsEveryNativeEventAndDelegatesLifecycle(t *testing.T) {
 	close(nativeSession.events)
 
 	want := []runtime.EventType{
-		runtime.EventText, runtime.EventToolUse, runtime.EventToolResult,
+		runtime.EventText, runtime.EventReasoning, runtime.EventToolUse, runtime.EventToolResult,
 		runtime.EventPermission, runtime.EventUsage, runtime.EventNativeSession,
 		runtime.EventFinish, runtime.EventError,
 	}

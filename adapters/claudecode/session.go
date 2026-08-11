@@ -32,6 +32,11 @@ func mapEvent(event native.Event) runtime.Event {
 	switch event.Kind {
 	case native.EventText:
 		mapped.Type, mapped.Text = runtime.EventText, event.Text
+	case native.EventReasoning:
+		mapped.Type = runtime.EventReasoning
+		if event.Reasoning != nil {
+			mapped.Reasoning = &runtime.Reasoning{ID: event.Reasoning.ID, Text: event.Reasoning.Text}
+		}
 	case native.EventToolUse:
 		mapped.Type, mapped.Tool = runtime.EventToolUse, mapTool(event.Tool)
 	case native.EventToolResult:

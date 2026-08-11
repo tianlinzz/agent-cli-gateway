@@ -227,6 +227,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		}
 		if createErr := h.store.Create(r.Context(), rec); createErr == nil {
 			created = true
+			h.clearServerToolIDs(sessionID)
 			err = nil
 		} else if errors.Is(createErr, runtime.ErrSessionExists) {
 			// Concurrent first requests may race to create the caller-provided
@@ -457,7 +458,9 @@ func (h *Handler) deleteSession(ctx context.Context, id, callerID string) {
 	defer cancel()
 	if err := h.store.Delete(ctx, id, callerID); err != nil {
 		slog.Debug("openai: delete session", "session", id, "error", err)
+		return
 	}
+	h.clearServerToolIDs(id)
 }
 
 // handleAbort serves POST /v1/sessions/{id}/abort: it cancels the in-flight
@@ -561,7 +564,7 @@ func (h *Handler) aggregateTurn(ctx context.Context, sessionID, callerID string,
 				// them as OpenAI tool_calls would make an upstream Agent framework
 				// execute them again and resubmit the same user turn.
 			case runtime.EventToolResult:
-				if ev.Tool != nil {
+				if !finishSeen && ev.Tool != nil {
 					h.recordServerToolID(sessionID, ev.Tool.ID)
 				}
 			case runtime.EventUsage:

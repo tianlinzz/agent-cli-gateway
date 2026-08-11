@@ -4,6 +4,7 @@ type EventKind string
 
 const (
 	EventText          EventKind = "text"
+	EventReasoning     EventKind = "reasoning"
 	EventToolUse       EventKind = "tool_use"
 	EventToolResult    EventKind = "tool_result"
 	EventPermission    EventKind = "permission"
@@ -19,6 +20,11 @@ type Usage struct {
 	InputTokens  int
 	OutputTokens int
 	TotalTokens  int
+}
+
+type Reasoning struct {
+	ID   string
+	Text string
 }
 
 type ToolCall struct {
@@ -38,6 +44,7 @@ type PermissionRequest struct {
 type Event struct {
 	Kind            EventKind
 	Text            string
+	Reasoning       *Reasoning
 	Tool            *ToolCall
 	Permission      *PermissionRequest
 	Usage           *Usage

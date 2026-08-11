@@ -185,6 +185,13 @@ func (s *Session) handleNotification(message agentprotocol.RPCMessage) {
 				s.emit(Event{Kind: EventText, Text: text})
 			}
 		}
+	case "agent_thought_chunk":
+		content := objectValue(update["content"])
+		if stringValue(content["type"]) == "text" {
+			if text := stringValue(content["text"]); text != "" {
+				s.emit(Event{Kind: EventReasoning, Reasoning: &Reasoning{Text: text}})
+			}
+		}
 	case "tool_call":
 		s.handleToolStart(update)
 	case "tool_call_update":
