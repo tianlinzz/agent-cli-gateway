@@ -2,6 +2,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+source ./scripts/dev-agents.sh
 
 PORT="${PORT:-4096}"
 DEV_DIR="${DEV_DIR:-$PWD/.gateway-dev}"
@@ -28,6 +29,13 @@ elif [[ ! -s "$TOKEN_FILE" ]]; then
 fi
 chmod 600 "$TOKEN_FILE"
 TOKEN="$(<"$TOKEN_FILE")"
+
+CLAUDE_COMMAND="${CC_GATEWAY_CLAUDE_COMMAND:-claude}"
+CODEX_COMMAND="${CC_GATEWAY_CODEX_COMMAND:-codex}"
+KIMI_COMMAND="${CC_GATEWAY_KIMI_COMMAND:-kimi}"
+CLAUDE_ENABLED="$(dev_agent_enabled "${DEV_ENABLE_CLAUDE:-auto}" "$CLAUDE_COMMAND")"
+CODEX_ENABLED="$(dev_agent_enabled "${DEV_ENABLE_CODEX:-auto}" "$CODEX_COMMAND")"
+KIMI_ENABLED="$(dev_agent_enabled "${DEV_ENABLE_KIMI:-auto}" "$KIMI_COMMAND")"
 
 OS="$(uname -s)"
 if [[ "$OS" == "Linux" && "${DEV_ISOLATION:-on}" != "off" ]]; then
@@ -61,17 +69,20 @@ binary_path = "/usr/local/bin/nsjail"
 policy = "$SECCOMP"
 
 [agents.codex]
-enabled = true
+enabled = $CODEX_ENABLED
+command = "$(toml_quote "$CODEX_COMMAND")"
 permission = "auto"
 
 [agents.claude-code]
-enabled = true
+enabled = $CLAUDE_ENABLED
+command = "$(toml_quote "$CLAUDE_COMMAND")"
 permission = "auto"
 default_model = "sonnet"
 models = ["sonnet", "opus", "haiku"]
 
 [agents.kimi]
-enabled = true
+enabled = $KIMI_ENABLED
+command = "$(toml_quote "$KIMI_COMMAND")"
 permission = "auto"
 EOF
 
@@ -81,6 +92,7 @@ echo "    Worker: $WORKER_MODE"
 if [[ "$REQUIRED" == true ]]; then echo "    nsjail: enabled"; else echo "    nsjail: disabled (local development only)"; fi
 echo "    Token 文件: $TOKEN_FILE"
 echo "    配置文件: $CONFIG"
+echo "    Agents: claude-code=$CLAUDE_ENABLED codex=$CODEX_ENABLED kimi=$KIMI_ENABLED"
 echo "    按 Ctrl+C 停止"
 export GATEWAY_RUNTIME_DIR="$RUNTIME_DIR"
 exec "$PWD/bin/gateway" -config "$CONFIG" -worker-exec "$WORKER_EXEC"
