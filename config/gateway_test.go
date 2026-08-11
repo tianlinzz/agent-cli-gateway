@@ -5,7 +5,97 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestDefaultGatewayConfig_LifecycleGovernance(t *testing.T) {
+	c := DefaultGatewayConfig()
+
+	if c.Server.DrainTimeout != 30*time.Second {
+		t.Errorf("Server.DrainTimeout = %v, want 30s", c.Server.DrainTimeout)
+	}
+	if c.Worker.StopGracePeriod != 10*time.Second {
+		t.Errorf("Worker.StopGracePeriod = %v, want 10s", c.Worker.StopGracePeriod)
+	}
+	if c.Worker.HeartbeatInterval != 15*time.Second || c.Worker.HeartbeatTimeout != 3*time.Second || c.Worker.HeartbeatFailures != 3 {
+		t.Errorf("Worker heartbeat defaults = %v/%v/%d, want 15s/3s/3", c.Worker.HeartbeatInterval, c.Worker.HeartbeatTimeout, c.Worker.HeartbeatFailures)
+	}
+	if c.Sessions.IdleTimeout != 2*time.Hour || c.Sessions.ReapInterval != time.Minute {
+		t.Errorf("Session lifecycle defaults = %v/%v, want 2h/1m", c.Sessions.IdleTimeout, c.Sessions.ReapInterval)
+	}
+}
+
+func TestLoadGateway_LifecycleGovernance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.toml")
+	content := `
+mode = "test"
+
+[server]
+drain_timeout = "41s"
+
+[worker]
+stop_grace_period = "7s"
+heartbeat_interval = "9s"
+heartbeat_timeout = "2s"
+heartbeat_failures = 4
+
+[sessions]
+idle_timeout = "45m"
+reap_interval = "20s"
+
+[auth]
+required = false
+
+[workspace]
+root = "workspaces"
+
+[isolation]
+required = false
+
+[isolation.seccomp]
+policy = "off"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadGateway(path)
+	if err != nil {
+		t.Fatalf("LoadGateway: %v", err)
+	}
+	if c.Server.DrainTimeout != 41*time.Second || c.Worker.StopGracePeriod != 7*time.Second {
+		t.Fatalf("shutdown settings = %v/%v, want 41s/7s", c.Server.DrainTimeout, c.Worker.StopGracePeriod)
+	}
+	if c.Worker.HeartbeatInterval != 9*time.Second || c.Worker.HeartbeatTimeout != 2*time.Second || c.Worker.HeartbeatFailures != 4 {
+		t.Fatalf("heartbeat settings = %v/%v/%d", c.Worker.HeartbeatInterval, c.Worker.HeartbeatTimeout, c.Worker.HeartbeatFailures)
+	}
+	if c.Sessions.IdleTimeout != 45*time.Minute || c.Sessions.ReapInterval != 20*time.Second {
+		t.Fatalf("session settings = %v/%v", c.Sessions.IdleTimeout, c.Sessions.ReapInterval)
+	}
+}
+
+func TestLoadGatewayRejectsRemovedShutdownTimeout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.toml")
+	content := `
+mode = "test"
+[server]
+shutdown_timeout = "10s"
+[auth]
+required = false
+[workspace]
+root = "workspaces"
+[isolation]
+required = false
+[isolation.seccomp]
+policy = "off"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadGateway(path)
+	if err == nil || !strings.Contains(err.Error(), "shutdown_timeout") {
+		t.Fatalf("LoadGateway error = %v, want removed shutdown_timeout rejection", err)
+	}
+}
 
 func TestDefaultGatewayConfig_IsolationRequired(t *testing.T) {
 	c := DefaultGatewayConfig()

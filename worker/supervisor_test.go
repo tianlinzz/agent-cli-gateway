@@ -90,7 +90,7 @@ func newTestSupervisor(t *testing.T, mutCfg func(*Config), opts ...Option) *Supe
 	cfg.RuntimeDir = testRuntimeDir(t)
 	cfg.WorkerExec = stubWorkerBin
 	cfg.StartTimeout = 5 * time.Second
-	cfg.ShutdownTimeout = 2 * time.Second
+	cfg.StopGracePeriod = 2 * time.Second
 	if mutCfg != nil {
 		mutCfg(&cfg)
 	}
@@ -215,6 +215,145 @@ func TestSupervisor_StartCloseDirect(t *testing.T) {
 	if n := sup.SessionCount(); n != 0 {
 		t.Errorf("sessions left in supervisor after close: %d", n)
 	}
+}
+
+func TestSupervisor_IdleReaperClosesOnlyIdleWorker(t *testing.T) {
+	sup := newTestSupervisor(t, func(c *Config) {
+		c.SessionIdleTimeout = 120 * time.Millisecond
+		c.SessionReapInterval = 20 * time.Millisecond
+		c.HeartbeatInterval = 0
+	})
+	ws, err := sup.StartSession(context.Background(), testRequest("idle-reap-1"))
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	waitEvent(t, ws, grt.EventStatus, time.Second)
+	waitEventsClosed(t, ws, 2*time.Second)
+	if n := sup.SessionCount(); n != 0 {
+		t.Fatalf("idle worker still registered: %d", n)
+	}
+}
+
+func TestWorkerSession_IdleClaimPublishesTerminationBeforeAsyncClose(t *testing.T) {
+	sup := newTestSupervisor(t, func(c *Config) {
+		c.SessionIdleTimeout = time.Hour
+		c.HeartbeatInterval = 0
+	})
+	ws, err := sup.StartSession(context.Background(), testRequest("idle-claim-1"))
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	waitEvent(t, ws, grt.EventStatus, time.Second)
+	if !ws.claimIdle(time.Now().Add(2*time.Hour), time.Hour) {
+		t.Fatal("idle worker was not claimed")
+	}
+	if !ws.Terminating() {
+		t.Fatal("claimed idle worker must publish terminating before asynchronous close")
+	}
+	if err := ws.Send(context.Background(), grt.Input{Messages: []grt.Message{{Role: "user", Content: "race"}}}); err == nil {
+		t.Fatal("claimed idle worker accepted a new turn")
+	}
+	go ws.closeClaimed(context.Background())
+	select {
+	case <-ws.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("claimed idle worker did not finish closing")
+	}
+}
+
+func TestSupervisor_IdleReaperExemptsActiveTurn(t *testing.T) {
+	t.Setenv("GW_TESTWORKER_BEHAVIOR", "slow-echo")
+	sup := newTestSupervisor(t, func(c *Config) {
+		c.SessionIdleTimeout = 80 * time.Millisecond
+		c.SessionReapInterval = 10 * time.Millisecond
+		c.HeartbeatInterval = 0
+	})
+	ws, err := sup.StartSession(context.Background(), testRequest("idle-active-1"))
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	waitEvent(t, ws, grt.EventStatus, time.Second)
+	if err := ws.Send(context.Background(), grt.Input{Messages: []grt.Message{{Role: "user", Content: "long"}}}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	time.Sleep(250 * time.Millisecond)
+	select {
+	case <-ws.Done():
+		t.Fatal("idle reaper closed worker with an active turn")
+	default:
+	}
+}
+
+func TestSupervisor_CompletedTurnStaysAliveBeforeIdleTimeout(t *testing.T) {
+	sup := newTestSupervisor(t, func(c *Config) {
+		c.SessionIdleTimeout = 500 * time.Millisecond
+		c.SessionReapInterval = 20 * time.Millisecond
+		c.HeartbeatInterval = 0
+	})
+	ws, err := sup.StartSession(context.Background(), testRequest("idle-finish-1"))
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	waitEvent(t, ws, grt.EventStatus, time.Second)
+	if err := ws.Send(context.Background(), grt.Input{Messages: []grt.Message{{Role: "user", Content: "hello"}}}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	waitEvent(t, ws, grt.EventFinish, time.Second)
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-ws.Done():
+		t.Fatal("completed worker was reclaimed before idle timeout")
+	default:
+	}
+}
+
+func TestSupervisor_HeartbeatTerminatesAtConsecutiveFailureThreshold(t *testing.T) {
+	t.Setenv("GW_TESTWORKER_BEHAVIOR", "fail-health-after-start")
+	logPath := filepath.Join(t.TempDir(), "worker.log")
+	t.Setenv("GW_TESTWORKER_LOG", logPath)
+	sup := newTestSupervisor(t, func(c *Config) {
+		c.SessionIdleTimeout = 0
+		c.HeartbeatInterval = 40 * time.Millisecond
+		c.HeartbeatTimeout = 20 * time.Millisecond
+		c.HeartbeatFailures = 3
+	})
+	ws, err := sup.StartSession(context.Background(), testRequest("heartbeat-fail-1"))
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	waitEvent(t, ws, grt.EventStatus, time.Second)
+
+	waitForLogCount(t, logPath, "health", 3, time.Second) // handshake + 2 failures
+	select {
+	case <-ws.Done():
+		t.Fatal("worker terminated before consecutive heartbeat failure threshold")
+	default:
+	}
+
+	select {
+	case <-ws.Done():
+	case <-time.After(time.Second):
+		t.Fatal("worker did not terminate after heartbeat failure threshold")
+	}
+}
+
+func waitForLogCount(t *testing.T, path, line string, want int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		data, _ := os.ReadFile(path)
+		count := 0
+		for _, got := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			if got == line {
+				count++
+			}
+		}
+		if count >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("log %s did not contain %q %d times", path, line, want)
 }
 
 func TestSupervisor_DevProfileUsesNsjailWrapper(t *testing.T) {
@@ -535,7 +674,7 @@ func TestSupervisor_AbortReachesWorker(t *testing.T) {
 
 func TestSupervisor_CloseTimeoutEscalatesToSIGKILL(t *testing.T) {
 	t.Setenv("GW_TESTWORKER_BEHAVIOR", "ignore-close")
-	sup := newTestSupervisor(t, func(c *Config) { c.ShutdownTimeout = 1 * time.Second })
+	sup := newTestSupervisor(t, func(c *Config) { c.StopGracePeriod = 1 * time.Second })
 
 	ws, err := sup.StartSession(context.Background(), testRequest("stubborn-1"))
 	if err != nil {
@@ -643,7 +782,7 @@ func TestSupervisor_SocketPathUnderLimit(t *testing.T) {
 // first Close escalates to SIGKILL and leaves the stale socket behind.
 func TestSupervisor_SessionIDReusableAfterClose(t *testing.T) {
 	t.Setenv("GW_TESTWORKER_BEHAVIOR", "ignore-close")
-	sup := newTestSupervisor(t, func(c *Config) { c.ShutdownTimeout = 1 * time.Second })
+	sup := newTestSupervisor(t, func(c *Config) { c.StopGracePeriod = 1 * time.Second })
 	const sessionID = "resume-1"
 
 	ws, err := sup.StartSession(context.Background(), testRequest(sessionID))
@@ -812,7 +951,7 @@ func TestLocalExecutionBackend_StartAndDrive(t *testing.T) {
 	cfg.RuntimeDir = testRuntimeDir(t)
 	cfg.WorkerExec = stubWorkerBin
 	cfg.StartTimeout = 5 * time.Second
-	cfg.ShutdownTimeout = 2 * time.Second
+	cfg.StopGracePeriod = 2 * time.Second
 
 	backend, err := NewLocalExecutionBackend(cfg)
 	if err != nil {

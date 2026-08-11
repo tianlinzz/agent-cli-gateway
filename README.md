@@ -166,7 +166,10 @@ See [`config.example.toml`](config.example.toml) for a full annotated example.
 |---|---|---|---|
 | (root) | `mode` | `prod` | `prod` / `dev` / `test`. Only `test` may disable nsjail |
 | `[server]` | `listen_addr` | `:4096` | HTTP listen address |
-| `[server]` | `shutdown_timeout` | `10s` | Graceful shutdown bound |
+| `[server]` | `drain_timeout` | `30s` | HTTP request drain bound during Gateway shutdown |
+| `[worker]` | `stop_grace_period` | `10s` | CloseSession/SIGTERM grace before SIGKILL |
+| `[worker]` | `heartbeat_interval` / `heartbeat_timeout` / `heartbeat_failures` | `15s` / `3s` / `3` | Runtime Worker failure detection |
+| `[sessions]` | `idle_timeout` / `reap_interval` | `2h` / `1m` | Idle Worker reclamation; conversation/native session identity is retained |
 | `[auth]` | `callers` | *(empty)* | Bearer token to caller ID mappings |
 | `[workspace]` | `root` | `workspaces` | Root all workspace ids resolve under |
 | `[isolation]` | `required` | `true` | Must be true outside the test profile |
@@ -233,7 +236,8 @@ The image is multi-stage: it compiles `google/nsjail` from a pinned tag
 runtime stage copies the nsjail binary plus its `ldd`-resolved shared libs and
 the agent CLIs the deployment needs. `docker/entrypoint.sh` prepares the
 runtime dirs, writes a default config when none is mounted, and `exec`s the
-gateway so it is PID 1 and receives SIGTERM directly; the supervisor then
+Gateway beneath Tini. Tini runs as PID 1, forwards signals, and reaps orphaned
+descendants; the supervisor then
 propagates shutdown API → worker(nsjail) → CLI and reaps the process group.
 See the `Dockerfile` header for the k8s `securityContext` and Linux-CI
 validation hooks.

@@ -50,7 +50,17 @@ mode = "$MODE"
 
 [server]
 listen_addr = "127.0.0.1:$PORT"
-shutdown_timeout = "10s"
+drain_timeout = "30s"
+
+[worker]
+stop_grace_period = "10s"
+heartbeat_interval = "15s"
+heartbeat_timeout = "3s"
+heartbeat_failures = 3
+
+[sessions]
+idle_timeout = "2h"
+reap_interval = "1m"
 
 [auth]
 required = true

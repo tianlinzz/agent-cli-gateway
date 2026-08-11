@@ -46,18 +46,31 @@ type Config struct {
 	Agents map[string]runtime.AgentExecutionConfig
 	// StartTimeout bounds the socket + handshake. Default 30s.
 	StartTimeout time.Duration
-	// ShutdownTimeout bounds graceful shutdown (CloseSession RPC + SIGTERM)
+	// StopGracePeriod bounds graceful shutdown (CloseSession RPC + SIGTERM)
 	// before the supervisor escalates to a process-group SIGKILL. Default 10s.
-	ShutdownTimeout time.Duration
+	StopGracePeriod time.Duration
+	// HeartbeatInterval controls runtime Worker probes. Zero disables them.
+	HeartbeatInterval time.Duration
+	HeartbeatTimeout  time.Duration
+	HeartbeatFailures int
+	// SessionIdleTimeout reclaims idle Worker/Agent processes while retaining
+	// Gateway/native session identity. Zero disables idle reclamation.
+	SessionIdleTimeout  time.Duration
+	SessionReapInterval time.Duration
 }
 
 // DefaultConfig returns the recommended supervisor config.
 func DefaultConfig() Config {
 	return Config{
-		Mode:            config.ModeProd,
-		RuntimeDir:      "gateway-run",
-		StartTimeout:    30 * time.Second,
-		ShutdownTimeout: 10 * time.Second,
+		Mode:                config.ModeProd,
+		RuntimeDir:          "gateway-run",
+		StartTimeout:        30 * time.Second,
+		StopGracePeriod:     10 * time.Second,
+		HeartbeatInterval:   15 * time.Second,
+		HeartbeatTimeout:    3 * time.Second,
+		HeartbeatFailures:   3,
+		SessionIdleTimeout:  2 * time.Hour,
+		SessionReapInterval: time.Minute,
 	}
 }
 
@@ -71,8 +84,19 @@ func (c Config) defaults() Config {
 	if c.StartTimeout <= 0 {
 		c.StartTimeout = 30 * time.Second
 	}
-	if c.ShutdownTimeout <= 0 {
-		c.ShutdownTimeout = 10 * time.Second
+	if c.StopGracePeriod <= 0 {
+		c.StopGracePeriod = 10 * time.Second
+	}
+	if c.HeartbeatInterval > 0 {
+		if c.HeartbeatTimeout <= 0 {
+			c.HeartbeatTimeout = 3 * time.Second
+		}
+		if c.HeartbeatFailures <= 0 {
+			c.HeartbeatFailures = 3
+		}
+	}
+	if c.SessionIdleTimeout > 0 && c.SessionReapInterval <= 0 {
+		c.SessionReapInterval = time.Minute
 	}
 	return c
 }
@@ -109,6 +133,9 @@ type Supervisor struct {
 	spawn    spawnFunc
 	sessions map[string]*workerSession
 	slots    map[string]chan struct{}
+	stopOnce sync.Once
+	stop     chan struct{}
+	reapDone chan struct{}
 }
 
 // Option customizes a Supervisor. Options are applied after construction and
@@ -152,6 +179,8 @@ func NewSupervisor(cfg Config, opts ...Option) (*Supervisor, error) {
 		spawn:    defaultSpawner(cfg),
 		sessions: make(map[string]*workerSession),
 		slots:    make(map[string]chan struct{}),
+		stop:     make(chan struct{}),
+		reapDone: make(chan struct{}),
 	}
 	for name, a := range cfg.Agents {
 		if a.MaxConcurrency > 0 {
@@ -160,6 +189,11 @@ func NewSupervisor(cfg Config, opts ...Option) (*Supervisor, error) {
 	}
 	for _, o := range opts {
 		o(s)
+	}
+	if cfg.SessionIdleTimeout > 0 {
+		go s.reapIdleLoop()
+	} else {
+		close(s.reapDone)
 	}
 	return s, nil
 }
@@ -296,20 +330,22 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 	}
 
 	ws := &workerSession{
-		sup:         s,
-		req:         req,
-		events:      make(chan runtime.Event, 128),
-		stopping:    make(chan struct{}),
-		done:        make(chan struct{}),
-		reaped:      make(chan struct{}),
-		cmd:         cmd,
-		outerPID:    cmd.Process.Pid,
-		pgid:        cmd.Process.Pid, // Setpgid: the child is its own group leader
-		sessionDir:  sessionDir,
-		socketDir:   socketDir,
-		socketPath:  socketPath,
-		profilePath: profilePath,
-		state:       stateStarting,
+		sup:          s,
+		req:          req,
+		events:       make(chan runtime.Event, 128),
+		stopping:     make(chan struct{}),
+		done:         make(chan struct{}),
+		reaped:       make(chan struct{}),
+		cmd:          cmd,
+		outerPID:     cmd.Process.Pid,
+		pgid:         cmd.Process.Pid, // Setpgid: the child is its own group leader
+		sessionDir:   sessionDir,
+		socketDir:    socketDir,
+		socketPath:   socketPath,
+		profilePath:  profilePath,
+		state:        stateStarting,
+		turnActive:   req.FirstInput != nil,
+		lastActivity: time.Now(),
 	}
 	if slot := s.slots[req.ModelID]; slot != nil {
 		ws.releaseSlot = func() { <-slot }
@@ -358,6 +394,9 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 	}
 
 	go ws.bridge()
+	if s.cfg.HeartbeatInterval > 0 {
+		go ws.heartbeat()
+	}
 
 	slog.Info("worker: session started",
 		"session", req.SessionID,
@@ -382,6 +421,12 @@ func (s *Supervisor) Preflight(ctx context.Context) error {
 // Close shuts every running session down and waits for the process groups to
 // be reaped. It is used by the gateway's graceful shutdown.
 func (s *Supervisor) Close(ctx context.Context) error {
+	s.stopOnce.Do(func() { close(s.stop) })
+	select {
+	case <-s.reapDone:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	s.mu.Lock()
 	sessions := make([]*workerSession, 0, len(s.sessions))
 	for _, ws := range s.sessions {
@@ -389,13 +434,56 @@ func (s *Supervisor) Close(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 
-	var firstErr error
+	errCh := make(chan error, len(sessions))
+	var wg sync.WaitGroup
 	for _, ws := range sessions {
-		if err := ws.Close(ctx); err != nil && firstErr == nil {
-			firstErr = err
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := ws.Close(ctx); err != nil {
+				errCh <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		return err
+	}
+	return nil
+}
+
+func (s *Supervisor) reapIdleLoop() {
+	defer close(s.reapDone)
+	ticker := time.NewTicker(s.cfg.SessionReapInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case now := <-ticker.C:
+			s.reapIdle(now)
+		case <-s.stop:
+			return
 		}
 	}
-	return firstErr
+}
+
+func (s *Supervisor) reapIdle(now time.Time) {
+	s.mu.Lock()
+	sessions := make([]*workerSession, 0, len(s.sessions))
+	for _, ws := range s.sessions {
+		if ws.claimIdle(now, s.cfg.SessionIdleTimeout) {
+			sessions = append(sessions, ws)
+		}
+	}
+	s.mu.Unlock()
+	for _, ws := range sessions {
+		slog.Info("worker: reclaiming idle session process", "session", ws.req.SessionID, "idle_timeout", s.cfg.SessionIdleTimeout)
+		go func() {
+			if err := ws.closeClaimed(context.Background()); err != nil {
+				slog.Warn("worker: reclaim idle session process", "session", ws.req.SessionID, "error", err)
+			}
+		}()
+	}
 }
 
 // SessionCount returns the number of currently tracked sessions.
@@ -466,11 +554,14 @@ type workerSession struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu        sync.Mutex
-	state     sessionState
-	closing   bool
-	lifecycle string
-	err       error
+	mu           sync.Mutex
+	state        sessionState
+	closing      bool
+	lifecycle    string
+	err          error
+	turnActive   bool
+	idleReaping  bool
+	lastActivity time.Time
 
 	client   *client
 	events   chan runtime.Event
@@ -499,18 +590,41 @@ func (ws *workerSession) Events() <-chan runtime.Event {
 func (ws *workerSession) Send(ctx context.Context, input runtime.Input) error {
 	ws.mu.Lock()
 	state, err := ws.state, ws.err
-	ws.mu.Unlock()
 	switch state {
 	case stateClosed:
+		ws.mu.Unlock()
 		if err != nil {
 			return fmt.Errorf("worker: session %q: %w", ws.req.SessionID, err)
 		}
 		return fmt.Errorf("worker: session %q is closed", ws.req.SessionID)
 	case stateRunning:
+		ws.turnActive = true
+		ws.lastActivity = time.Now()
+		ws.mu.Unlock()
 	default:
+		ws.mu.Unlock()
 		return fmt.Errorf("worker: session %q is not running (state %d)", ws.req.SessionID, state)
 	}
-	return ws.client.SendInput(ctx, ws.req.SessionID, input)
+	if err := ws.client.SendInput(ctx, ws.req.SessionID, input); err != nil {
+		ws.mu.Lock()
+		ws.turnActive = false
+		ws.lastActivity = time.Now()
+		ws.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (ws *workerSession) claimIdle(now time.Time, timeout time.Duration) bool {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	if ws.state != stateRunning || ws.turnActive || ws.idleReaping || now.Sub(ws.lastActivity) < timeout {
+		return false
+	}
+	ws.idleReaping = true
+	ws.state = stateClosing
+	ws.closing = true
+	return true
 }
 
 // Abort delegates turn cancellation to the native session. Successful native
@@ -551,10 +665,16 @@ func (ws *workerSession) Close(ctx context.Context) error {
 	ws.state = stateClosing
 	ws.closing = true
 	ws.mu.Unlock()
+	return ws.closeClaimed(ctx)
+}
 
+// closeClaimed performs teardown after the caller atomically moved the
+// session to stateClosing. Idle reclamation uses it so no new Send can enter
+// between selecting a session and starting asynchronous teardown.
+func (ws *workerSession) closeClaimed(ctx context.Context) error {
 	var closeErr error
 	if ws.client != nil {
-		cctx, cancel := context.WithTimeout(ctx, ws.sup.cfg.ShutdownTimeout)
+		cctx, cancel := context.WithTimeout(ctx, ws.sup.cfg.StopGracePeriod)
 		closeErr = ws.client.CloseSession(cctx, ws.req.SessionID)
 		cancel()
 	}
@@ -564,7 +684,7 @@ func (ws *workerSession) Close(ctx context.Context) error {
 
 	select {
 	case <-ws.reaped:
-	case <-time.After(ws.sup.cfg.ShutdownTimeout):
+	case <-time.After(ws.sup.cfg.StopGracePeriod):
 		slog.Warn("worker: process group did not exit after SIGTERM, sending SIGKILL",
 			"session", ws.req.SessionID, "pgid", ws.pgid)
 		ws.killGroup(syscall.SIGKILL)
@@ -642,6 +762,40 @@ func (ws *workerSession) monitor() {
 	ws.terminate(nil)
 }
 
+// heartbeat detects a wedged or disconnected Worker after the initial
+// handshake. Consecutive successes reset the failure count; only the
+// configured threshold publishes terminal state and triggers lazy recovery
+// on the next Gateway turn.
+func (ws *workerSession) heartbeat() {
+	ticker := time.NewTicker(ws.sup.cfg.HeartbeatInterval)
+	defer ticker.Stop()
+	failures := 0
+	for {
+		select {
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), ws.sup.cfg.HeartbeatTimeout)
+			_, pid, err := ws.client.Health(ctx)
+			cancel()
+			if err == nil && int(pid) != ws.workerPID {
+				err = fmt.Errorf("worker pid changed from %d to %d", ws.workerPID, pid)
+			}
+			if err == nil {
+				failures = 0
+				continue
+			}
+			failures++
+			if failures < ws.sup.cfg.HeartbeatFailures {
+				slog.Warn("worker: heartbeat failed", "session", ws.req.SessionID, "failures", failures, "threshold", ws.sup.cfg.HeartbeatFailures, "error", err)
+				continue
+			}
+			ws.terminate(fmt.Errorf("worker heartbeat failed %d consecutive times: %w", failures, err))
+			return
+		case <-ws.stopping:
+			return
+		}
+	}
+}
+
 // bridge forwards canonical events from the worker's gRPC stream into the
 // handle's Events channel. It is the only writer of ws.events and closes it
 // when the session ends. terminations cancel ws.ctx so a blocked Recv
@@ -684,6 +838,12 @@ func (ws *workerSession) bridge() {
 			return
 		}
 		ev := fromFrame(frame)
+		if ev.Type == runtime.EventFinish || ev.Type == runtime.EventError {
+			ws.mu.Lock()
+			ws.turnActive = false
+			ws.lastActivity = time.Now()
+			ws.mu.Unlock()
+		}
 		select {
 		case ws.events <- ev:
 		case <-ws.stopping:

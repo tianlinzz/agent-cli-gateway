@@ -5,9 +5,9 @@
 # The gateway binary is the API process AND the worker Supervisor; the
 # supervisor forks one nsjail-wrapped gateway-worker per session. The
 # entrypoint just prepares the shared runtime dirs, writes a default config
-# when none is mounted, and then exec's the gateway so it is PID 1 and
-# receives SIGTERM directly. Signal propagation API -> worker(nsjail) -> CLI
-# and process-group reaping happen inside the supervisor.
+# when none is mounted, and then exec's Gateway beneath Tini. Signal
+# propagation API -> worker(nsjail) -> CLI and session-aware process-group
+# teardown happen inside the supervisor; Tini is the container-level reaper.
 #
 # Runtime dirs (both are created idempotently, so they also work on a fresh
 # persistent volume):
@@ -32,12 +32,16 @@ if [ ! -f "$CONFIG_PATH" ]; then
   mkdir -p "$(dirname "$CONFIG_PATH")"
   {
     printf 'mode = "prod"\n\n'
-    printf '[server]\nlisten_addr = ":4096"\nshutdown_timeout = "10s"\n\n'
-    printf '[auth]\n'
+    printf '[server]\nlisten_addr = ":4096"\ndrain_timeout = "30s"\n\n'
+    printf '[worker]\nstop_grace_period = "10s"\n'
+    printf 'heartbeat_interval = "15s"\nheartbeat_timeout = "3s"\nheartbeat_failures = 3\n\n'
+    printf '[sessions]\nidle_timeout = "2h"\nreap_interval = "1m"\n\n'
+    printf '[auth]\nrequired = true\n'
     if [ -n "${GATEWAY_TOKEN:-}" ]; then
-      printf 'token = "%s"\n' "$GATEWAY_TOKEN"
+      escaped_token=$(printf '%s' "$GATEWAY_TOKEN" | sed 's/\\/\\\\/g; s/"/\\"/g')
+      printf 'callers = [{ id = "container", tokens = ["%s"] }]\n' "$escaped_token"
     else
-      printf '# token = ""  # auth disabled (dev/test only)\n'
+      printf 'callers = [] # set GATEWAY_TOKEN or mount a production config\n'
     fi
     printf '\n[workspace]\nroot = "%s"\n\n' "$WORKSPACE_ROOT"
     printf '[isolation]\nrequired = true\nnsjail_version = "3.6"\n'
@@ -59,6 +63,6 @@ if [ ! -x /usr/local/bin/nsjail ]; then
   exit 1
 fi
 
-# exec: the gateway becomes PID 1 and receives SIGTERM/SIGINT directly. The
-# configured CMD ("gateway") and any extra args are forwarded.
+# exec replaces the shell beneath Tini. The configured CMD ("gateway") and
+# any extra args are forwarded.
 exec "$@"

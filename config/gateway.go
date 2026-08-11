@@ -43,6 +43,8 @@ type GatewayConfig struct {
 	Mode string `toml:"mode"`
 
 	Server    ServerConfig    `toml:"server"`
+	Worker    WorkerConfig    `toml:"worker"`
+	Sessions  SessionsConfig  `toml:"sessions"`
 	Auth      AuthConfig      `toml:"auth"`
 	Workspace WorkspaceConfig `toml:"workspace"`
 	Isolation IsolationConfig `toml:"isolation"`
@@ -56,8 +58,32 @@ type GatewayConfig struct {
 type ServerConfig struct {
 	// ListenAddr is the address the HTTP API binds to. Default ":4096".
 	ListenAddr string `toml:"listen_addr"`
-	// ShutdownTimeout bounds graceful shutdown. Default 10s.
-	ShutdownTimeout time.Duration `toml:"shutdown_timeout"`
+	// DrainTimeout bounds HTTP request draining during Gateway shutdown.
+	DrainTimeout time.Duration `toml:"drain_timeout"`
+}
+
+// WorkerConfig controls disposable Worker process lifecycle. These settings
+// do not determine how long a Gateway conversation exists.
+type WorkerConfig struct {
+	// StopGracePeriod bounds CloseSession + SIGTERM before SIGKILL escalation.
+	StopGracePeriod time.Duration `toml:"stop_grace_period"`
+	// HeartbeatInterval controls runtime Worker health probes. Zero disables
+	// heartbeat monitoring.
+	HeartbeatInterval time.Duration `toml:"heartbeat_interval"`
+	// HeartbeatTimeout bounds one health probe.
+	HeartbeatTimeout time.Duration `toml:"heartbeat_timeout"`
+	// HeartbeatFailures is the consecutive failure threshold before teardown.
+	HeartbeatFailures int `toml:"heartbeat_failures"`
+}
+
+// SessionsConfig controls reclamation of idle Worker/Agent processes. The
+// Gateway session record and native session ID survive process reclamation.
+type SessionsConfig struct {
+	// IdleTimeout is how long an idle Worker is retained. Zero disables idle
+	// reclamation. Active turns are always exempt.
+	IdleTimeout time.Duration `toml:"idle_timeout"`
+	// ReapInterval controls how often idle Workers are scanned.
+	ReapInterval time.Duration `toml:"reap_interval"`
 }
 
 // AuthConfig configures HTTP API authentication. A token authenticates a
@@ -197,8 +223,18 @@ func DefaultGatewayConfig() GatewayConfig {
 	return GatewayConfig{
 		Mode: ModeProd,
 		Server: ServerConfig{
-			ListenAddr:      ":4096",
-			ShutdownTimeout: 10 * time.Second,
+			ListenAddr:   ":4096",
+			DrainTimeout: 30 * time.Second,
+		},
+		Worker: WorkerConfig{
+			StopGracePeriod:   10 * time.Second,
+			HeartbeatInterval: 15 * time.Second,
+			HeartbeatTimeout:  3 * time.Second,
+			HeartbeatFailures: 3,
+		},
+		Sessions: SessionsConfig{
+			IdleTimeout:  2 * time.Hour,
+			ReapInterval: time.Minute,
 		},
 		Auth: AuthConfig{Required: true},
 		Workspace: WorkspaceConfig{
@@ -244,8 +280,16 @@ func LoadGateway(path string) (*GatewayConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read gateway config: %w", err)
 	}
-	if err := toml.Unmarshal(data, &cfg); err != nil {
+	meta, err := toml.Decode(string(data), &cfg)
+	if err != nil {
 		return nil, fmt.Errorf("parse gateway config: %w", err)
+	}
+	if undecoded := meta.Undecoded(); len(undecoded) > 0 {
+		keys := make([]string, 0, len(undecoded))
+		for _, key := range undecoded {
+			keys = append(keys, key.String())
+		}
+		return nil, fmt.Errorf("parse gateway config: unknown keys: %s", strings.Join(keys, ", "))
 	}
 	cfg.normalize()
 	if err := cfg.Validate(); err != nil {
@@ -300,6 +344,24 @@ func (c *GatewayConfig) Validate() error {
 	}
 	if !c.Isolation.Required && c.Mode != ModeTest {
 		return fmt.Errorf("config: isolation.required must be true in mode %q; only the test profile may disable nsjail", c.Mode)
+	}
+	if c.Server.DrainTimeout <= 0 {
+		return fmt.Errorf("config: server.drain_timeout must be positive")
+	}
+	if c.Worker.StopGracePeriod <= 0 {
+		return fmt.Errorf("config: worker.stop_grace_period must be positive")
+	}
+	if c.Worker.HeartbeatInterval < 0 || c.Worker.HeartbeatTimeout < 0 || c.Worker.HeartbeatFailures < 0 {
+		return fmt.Errorf("config: worker heartbeat settings must not be negative")
+	}
+	if c.Worker.HeartbeatInterval > 0 && (c.Worker.HeartbeatTimeout <= 0 || c.Worker.HeartbeatFailures <= 0) {
+		return fmt.Errorf("config: worker heartbeat_timeout and heartbeat_failures must be positive when heartbeat is enabled")
+	}
+	if c.Sessions.IdleTimeout < 0 || c.Sessions.ReapInterval < 0 {
+		return fmt.Errorf("config: session lifecycle settings must not be negative")
+	}
+	if c.Sessions.IdleTimeout > 0 && c.Sessions.ReapInterval <= 0 {
+		return fmt.Errorf("config: sessions.reap_interval must be positive when idle reclamation is enabled")
 	}
 	if c.Isolation.Required {
 		if strings.TrimSpace(c.Isolation.NsjailVersion) == "" {

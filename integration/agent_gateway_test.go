@@ -151,7 +151,7 @@ func newHarness(t *testing.T, mutCfg func(*worker.Config)) *harness {
 		RuntimeDir:      runtimeDir,
 		WorkerExec:      stubWorkerBin,
 		StartTimeout:    10 * time.Second,
-		ShutdownTimeout: 5 * time.Second,
+		StopGracePeriod: 5 * time.Second,
 	}
 	if mutCfg != nil {
 		mutCfg(&cfg)

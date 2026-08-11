@@ -8,9 +8,8 @@
 #   Stage 2 (gobuild): builds the `gateway` (API + worker supervisor) and
 #     `gateway-worker` (per-session worker child) binaries from this repo.
 #   Stage 3 (runtime): the deployable image — nsjail + Go binaries + the agent
-#     CLIs the deployment needs. The gateway process is PID 1; it owns the
-#     worker Supervisor, which forks one nsjail-wrapped `gateway-worker` per
-#     session.
+#     CLIs the deployment needs. Tini is PID 1 and launches the gateway, whose
+#     Supervisor forks one nsjail-wrapped `gateway-worker` per session.
 #
 # Security model (决策对齐 #5b / the rewrite design spec):
 #   - nsjail runs UNPRIVILEGED: user namespace, NO CAP_SYS_ADMIN, NOT
@@ -116,6 +115,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         git \
         python3 \
+        tini \
     && rm -rf /var/lib/apt/lists/*
 
 # nsjail + its runtime shared-lib deps. ldd is used so the image never carries
@@ -165,13 +165,11 @@ EXPOSE 4096
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -fsS http://localhost:4096/health/live || exit 1
 
-# Minimal signal-aware entrypoint: it exec's the gateway binary so the gateway
-# (which owns the worker Supervisor) is PID 1 and receives SIGTERM directly.
-# SIGTERM propagation API -> worker(nsjail) -> CLI is handled inside the
-# supervisor (CloseSession RPC, SIGTERM to the process group, SIGKILL
-# escalation, group reap).
+# Tini is PID 1: it forwards signals and reaps orphaned descendants. The shell
+# entrypoint prepares configuration and execs Gateway; Gateway's Supervisor
+# owns session-aware propagation API -> worker(nsjail) -> Agent CLI.
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
 CMD ["gateway"]

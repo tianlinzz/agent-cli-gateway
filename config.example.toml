@@ -9,12 +9,24 @@ mode = "prod"
 
 [server]
 listen_addr = ":4096"
-shutdown_timeout = "10s"
+drain_timeout = "30s"
+
+[worker]
+stop_grace_period = "10s"
+heartbeat_interval = "15s"
+heartbeat_timeout = "3s"
+heartbeat_failures = 3
+
+[sessions]
+# Reclaims only the disposable Worker/Agent process. Gateway conversation
+# identity and the native session ID remain available for recovery.
+idle_timeout = "2h"
+reap_interval = "1m"
 
 [auth]
-# Shared bearer token accepted by /v1/* endpoints. Empty disables auth
-# (dev/test only). Health probes are always unauthenticated.
-# token = "change-me"
+# Tokens authenticate callers, not end users. Health probes are always
+# unauthenticated. Production requires at least one caller.
+callers = [{ id = "example-client", tokens = ["change-me"] }]
 
 [workspace]
 # Directory all opaque workspace_ids resolve under. Only the server owns this

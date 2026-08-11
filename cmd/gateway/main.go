@@ -104,14 +104,19 @@ func main() {
 	// API process never starts an agent CLI directly; all execution flows
 	// through this backend.
 	backend, err := worker.NewLocalExecutionBackend(worker.Config{
-		Mode:            cfg.Mode,
-		Isolation:       cfg.Isolation,
-		WorkspaceRoot:   rootAbs,
-		RuntimeDir:      envOrDefault("GATEWAY_RUNTIME_DIR", "gateway-run"),
-		WorkerExec:      *workerExec,
-		StartTimeout:    30 * time.Second,
-		ShutdownTimeout: cfg.Server.ShutdownTimeout,
-		Agents:          agentExecutionConfigs(cfg.Agents),
+		Mode:                cfg.Mode,
+		Isolation:           cfg.Isolation,
+		WorkspaceRoot:       rootAbs,
+		RuntimeDir:          envOrDefault("GATEWAY_RUNTIME_DIR", "gateway-run"),
+		WorkerExec:          *workerExec,
+		StartTimeout:        30 * time.Second,
+		StopGracePeriod:     cfg.Worker.StopGracePeriod,
+		HeartbeatInterval:   cfg.Worker.HeartbeatInterval,
+		HeartbeatTimeout:    cfg.Worker.HeartbeatTimeout,
+		HeartbeatFailures:   cfg.Worker.HeartbeatFailures,
+		SessionIdleTimeout:  cfg.Sessions.IdleTimeout,
+		SessionReapInterval: cfg.Sessions.ReapInterval,
+		Agents:              agentExecutionConfigs(cfg.Agents),
 	})
 	if err != nil {
 		slog.Error("create execution backend", "error", err)
@@ -184,12 +189,14 @@ func main() {
 	// Graceful shutdown: drain in-flight HTTP requests (aborting client
 	// disconnects at the worker), then tear the supervisor down so every
 	// worker process group is reaped.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
-	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), cfg.Server.DrainTimeout)
+	if err := srv.Shutdown(drainCtx); err != nil {
 		slog.Warn("gateway http shutdown", "error", err)
 	}
-	if err := backend.Supervisor().Close(shutdownCtx); err != nil {
+	cancelDrain()
+	workerCtx, cancelWorkers := context.WithTimeout(context.Background(), cfg.Worker.StopGracePeriod+2*time.Second)
+	defer cancelWorkers()
+	if err := backend.Supervisor().Close(workerCtx); err != nil {
 		slog.Warn("gateway supervisor close", "error", err)
 	}
 	slog.Info("gateway stopped")

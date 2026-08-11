@@ -81,13 +81,14 @@ func main() {
 
 // stubHandler implements worker.Handler over a scripted event stream.
 type stubHandler struct {
-	mu        sync.Mutex
-	behavior  string
-	logPath   string
-	events    chan runtime.Event
-	closed    bool
-	turnTimer *time.Timer
-	onClose   func()
+	mu          sync.Mutex
+	behavior    string
+	logPath     string
+	events      chan runtime.Event
+	closed      bool
+	turnTimer   *time.Timer
+	healthCalls int
+	onClose     func()
 }
 
 func newStubHandler(behavior, logPath string) *stubHandler {
@@ -119,8 +120,12 @@ func (h *stubHandler) emit(ev runtime.Event) {
 }
 
 func (h *stubHandler) Health(_ context.Context) (string, error) {
+	h.mu.Lock()
+	h.healthCalls++
+	healthCalls := h.healthCalls
+	h.mu.Unlock()
 	h.logf("health")
-	if h.behavior == "fail-health" {
+	if h.behavior == "fail-health" || (h.behavior == "fail-health-after-start" && healthCalls > 1) {
 		return "", errors.New("stub: health failed")
 	}
 	return "testworker-1.0", nil

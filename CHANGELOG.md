@@ -3,6 +3,12 @@
 ## Unreleased
 
 ### Added
+- **Worker lifecycle governance**: split HTTP drain and Worker stop timeouts,
+  retain persistent Agent CLI processes across normal turns, reclaim only idle
+  processes with active-turn exemption, detect unhealthy Workers with bounded
+  heartbeats, and run Tini as the container PID 1. The removed
+  `server.shutdown_timeout` key is rejected; use `server.drain_timeout`,
+  `worker.stop_grace_period`, and `[sessions]` lifecycle settings.
 - **Reasonix agent**: new agent adapter for Reasonix multi-model coding agent, bridging via HTTP serve API (POST /submit, SSE /events, POST /approve). Supports default/yolo/plan permission modes, SSE auto-reconnect with backoff, and thinking accumulator. (#1281)
 
 ## Unreleased
