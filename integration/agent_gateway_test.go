@@ -399,6 +399,63 @@ func TestIntegration_MultiTurnResumeReusesExecution(t *testing.T) {
 	}
 }
 
+// TestIntegration_CallerProvidedSessionCreatedOnFirstUse freezes the public
+// contract used by upstream systems such as f1-web: a business conversation
+// id may be supplied on the first request and becomes the stable Gateway
+// session id instead of requiring a separate create-session call.
+func TestIntegration_CallerProvidedSessionCreatedOnFirstUse(t *testing.T) {
+	h := newHarness(t, nil)
+	const sessionID = "business-conversation-517f05c4"
+
+	resp1 := h.do("POST", "/v1/chat/completions", chatBody("claude-code", false, "ws-1"),
+		map[string]string{"X-Gateway-Session-Id": sessionID})
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("first turn status = %d (body %s)", resp1.StatusCode, readBody(t, resp1))
+	}
+	if got := resp1.Header.Get("X-Gateway-Session-Id"); got != sessionID {
+		t.Fatalf("gateway session id = %q, want caller id %q", got, sessionID)
+	}
+
+	resp2 := h.do("POST", "/v1/chat/completions", chatBody("claude-code", false, "ws-1"),
+		map[string]string{"X-Gateway-Session-Id": sessionID})
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("second turn status = %d (body %s)", resp2.StatusCode, readBody(t, resp2))
+	}
+	if n := h.sup.SessionCount(); n != 1 {
+		t.Fatalf("supervisor sessions = %d, want 1", n)
+	}
+}
+
+// TestIntegration_SameWorkspaceDifferentSessionsRunConcurrently guards the
+// intended concurrency boundary: only turns within one session serialize.
+// Distinct sessions sharing a workspace are allowed to run at the same time.
+func TestIntegration_SameWorkspaceDifferentSessionsRunConcurrently(t *testing.T) {
+	h := newHarness(t, nil)
+	h.setWorkerBehavior("slow-echo")
+
+	resp1 := h.do("POST", "/v1/chat/completions", chatBody("codex", true, "shared-workspace"),
+		map[string]string{"X-Gateway-Session-Id": "shared-session-a"})
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("session A status = %d (body %s)", resp1.StatusCode, readBody(t, resp1))
+	}
+
+	resp2 := h.do("POST", "/v1/chat/completions", chatBody("codex", true, "shared-workspace"),
+		map[string]string{"X-Gateway-Session-Id": "shared-session-b"})
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("session B status = %d (body %s)", resp2.StatusCode, readBody(t, resp2))
+	}
+	if n := h.sup.SessionCount(); n != 2 {
+		t.Fatalf("concurrent supervisor sessions = %d, want 2", n)
+	}
+
+	for name, resp := range map[string]*http.Response{"A": resp1, "B": resp2} {
+		events := splitSSE(t, readBody(t, resp))
+		if len(events) == 0 || events[len(events)-1] != "[DONE]" {
+			t.Errorf("session %s did not finish cleanly: %v", name, events)
+		}
+	}
+}
+
 // TestIntegration_AbortCancelsInFlightTurn verifies POST /v1/sessions/{id}/abort
 // reaches the worker (the Abort RPC is logged by the stub) and that the
 // in-flight SSE stream terminates.
