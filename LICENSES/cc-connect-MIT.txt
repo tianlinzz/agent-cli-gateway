@@ -1,0 +1,18 @@
+cc-connect upstream licensing notice
+====================================
+
+Upstream repository: https://github.com/chenhg5/cc-connect
+Reviewed baseline: 3fc360ee6acc9bab13ab1b48ddde3af44062903b
+
+At this baseline, the upstream README.md License section states exactly:
+
+    MIT License
+
+The README badge links to a root LICENSE path, but a standalone LICENSE file is absent
+from the Git tree at the reviewed baseline. GitHub's repository license API also
+returns no detected license file. Consequently this notice does not invent a
+copyright holder or reproduce an unavailable grant text. It records the upstream
+declaration and the exact baseline used for the selectively migrated Agent code.
+
+Review upstream licensing before redistributing the migrated portions if the
+upstream repository changes or publishes a complete license file.

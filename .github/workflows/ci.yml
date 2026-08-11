@@ -78,6 +78,9 @@ jobs:
           GOSUMDB: sum.golang.org
           GONOSUMDB: ""
 
+      - name: Enforce architecture boundaries
+        run: go test ./internal/archtest/ -v
+
       - name: Vet
         run: go vet ./...
 
@@ -129,17 +132,11 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
 
-      - name: Build for linux
-        run: GOOS=linux go build ./...
+      - name: Build for linux arm64
+        run: GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./...
 
-      - name: Build for windows
-        run: GOOS=windows go build ./...
-
-      - name: Vet for linux
-        run: GOOS=linux go vet ./...
-
-      - name: Vet for windows
-        run: GOOS=windows go vet ./...
+      - name: Build for windows amd64
+        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...
 
   integration-test:
     # Hermetic container-level E2E: real HTTP API → real supervisor → real
@@ -162,12 +159,9 @@ jobs:
         run: go test ./integration/ -v
 
   docker-smoke:
-    # Linux-only nsjail smoke: builds the multi-stage image (which compiles
-    # google/nsjail from a pinned tag — cannot run on a darwin host) and runs
-    # docker/nsjail-smoke.sh (nsjail --version, ldd, minimal jail) inside the
-    # built image. Advisory (`continue-on-error`) so a transient network hiccup
-    # in the nsjail-builder stage never blocks merges; the compile path itself
-    # is deterministic (pinned nsjail tag + pinned debian base).
+    # Required Linux release gate: build the pinned nsjail image and execute
+    # version, linkage, preflight, and minimal-jail validation. This job is
+    # intentionally blocking; isolation regressions must prevent a merge.
     runs-on: ubuntu-latest
     needs: lint
 

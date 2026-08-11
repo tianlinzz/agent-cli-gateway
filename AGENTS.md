@@ -16,6 +16,13 @@ OpenAI-compatible surface and a process-isolation-first execution model.
 
 ## Architecture
 
+Canonical data path:
+
+```text
+OpenAI HTTP/SSE -> runtime.ExecutionBackend -> Worker Supervisor/RPC
+-> adapters/<name> -> agent/<name> -> Agent CLI process
+```
+
 ```
 HTTP client (any OpenAI client)
         │  /v1/* + SSE (Bearer token, X-User-Id)
@@ -32,7 +39,8 @@ cmd/gateway  (API process + worker Supervisor)
               │  fork: nsjail -Mo --config profile -- gateway-worker
               ▼
 cmd/gateway-worker   (one per session; the ONLY process that runs agent CLIs)
-  └── adapters/{codex,claudecode,kimi}   native CLI process mgmt + parsing
+  └── adapters/{codex,claudecode,kimi}   runtime/native mapping only
+        └── agent/{codex,claudecode,kimi} native CLI + protocol
 ```
 
 ### Key Design Principles
@@ -55,7 +63,8 @@ them and names from config are wired into the process-wide registry
 cmd/gateway → config/, runtime/, api/openai/, worker/
 cmd/gateway-worker → adapters/*, runtime/
 api/openai → runtime/   (never adapters/, worker/, or config/)
-adapters/* → runtime/   (never api/, worker/, or each other)
+adapters/<name> → agent/<name>, runtime/ (never api/, worker/, or another agent)
+agent/<name> → agent/process, agent/protocol, stdlib only
 worker/     → runtime/, workspace/, config/ (never adapters/ or api/)
 workspace/  → stdlib only
 runtime/    → stdlib only
@@ -117,9 +126,11 @@ if handle, ok := someBackend.(OptionalCapability); ok {
 
 ### 4. High Cohesion, Low Coupling
 
-- Each `adapters/X/` package is self-contained: process lifecycle, output
-  parsing, and session management for agent X, speaking only the runtime
-  contract.
+- Each `agent/X/` package owns native CLI launch, protocol parsing, resume,
+  usage, abort, and teardown without importing Gateway layers.
+- Each `adapters/X/` package is a thin bridge for trusted options, prompt/event
+  conversion, and lifecycle delegation. It must not launch a process, manage a
+  process group, decode raw JSONL, or switch on raw Agent-native messages.
 - `worker/` owns everything about process isolation: the supervisor, the gRPC
   RPC layer, and `worker/nsjail/` profile generation + preflight.
 - `api/openai/` translates OpenAI shapes ↔ runtime contract and holds no
@@ -163,6 +174,9 @@ if handle, ok := someBackend.(OptionalCapability); ok {
 - Use `context.Context` for cancellation propagation, especially across the
   API → supervisor → worker(nsjail) → CLI boundary.
 - Channels should have clear ownership; document who closes them.
+- The concurrency rule is **one active turn per session**. Different sessions
+  in the **same workspace** may execute concurrently; the caller owns any
+  resulting filesystem coordination policy.
 
 ## Code Style
 
@@ -215,22 +229,20 @@ go test ./integration/ -v
 - Real nsjail smoke (version + ldd + minimal jail) is Linux-CI-only via
   `docker/nsjail-smoke.sh`; it cannot run on the darwin dev host.
 
-### Build Tags
+### Agent Wiring
 
 - Adapters are wired into both binaries via `plugin_agent_*.go` files with a
   `//go:build !no_<agent>` tag (e.g. `!no_codex`).
-- `agent/{codex,claudecode,kimi}/` are **migration-reference only**: they are
-  the pre-rewrite cc-connect-era implementations cited by
-  `adapters/*/SOURCE.md` and are compiled out behind a `//go:build agent_ref`
-  tag. They still import the deleted `core` package and deliberately do **not**
-  compile — never build with `-tags agent_ref`, and do not edit them unless you
-  are also updating the corresponding `adapters/*/SOURCE.md` provenance.
+- The supported native packages are `agent/claudecode`, `agent/codex`, and
+  `agent/kimi`. There are no compatibility implementations or duplicate Agent
+  trees. Provenance lives in `adapters/<name>/SOURCE.md`.
 
 ## Pre-Commit Checklist
 
 1. **Build passes**: `go build ./...`
-2. **Cross-platform build passes**: `GOOS=linux go build ./...` and
-   `GOOS=windows go build ./...`
+2. **Cross-platform build passes**:
+   `GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./...` and
+   `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...`
 3. **Tests pass**: `go test ./...`
 4. **Race tests pass** (for concurrency changes): `go test -race ./...`
 5. **Integration tests pass** (for api/runtime/worker changes):
@@ -243,14 +255,15 @@ go test ./integration/ -v
 
 ## Adding a New Agent
 
-1. Create `adapters/newagent/newagent.go` implementing `runtime.AgentAdapter`
-   and `runtime.Session`.
-2. Register in `init()`: `runtime.Register("newagent", factory)`.
+1. Create `agent/newagent/` for native process, protocol, event, and lifecycle
+   behavior. It must not import Gateway runtime or transport packages.
+2. Create `adapters/newagent/` as the thin `runtime.AgentAdapter` bridge and
+   register it with `runtime.Register("newagent", factory)`.
 3. Create `cmd/gateway/plugin_agent_newagent.go` AND
    `cmd/gateway-worker/plugin_agent_newagent.go`, both with
    `//go:build !no_newagent`.
 4. Add config example in `config.example.toml` under `[agents.newagent]`.
-5. Add unit tests using a hermetic fake CLI (no real binary required).
+5. Add native fake-CLI tests and adapter mapping tests separately.
 
 ## Adding a New Endpoint
 

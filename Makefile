@@ -42,7 +42,7 @@ vet:
 	go vet ./...
 
 fmt:
-	gofmt -w api runtime worker adapters config cmd integration
+	gofmt -w agent api runtime worker adapters config cmd integration internal/archtest
 
 # Run all unit + integration tests.
 test: vet

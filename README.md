@@ -16,8 +16,8 @@ OpenAI-compatible surface and a process-isolation-first execution model.
 - **OpenAI-compatible API** — drop-in for existing OpenAI clients.
 - **Per-session process isolation** — one `nsjail`-wrapped worker child per
   session, forked and reaped by a supervisor in the gateway process.
-- **Three first-generation agents** — `codex`, `claude-code`, `kimi`, each a
-  self-contained adapter (`adapters/`) driving the agent's native CLI protocol.
+- **Three focused agents** — `codex`, `claude-code`, and `kimi`; native CLI
+  execution lives in `agent/` and thin runtime mapping lives in `adapters/`.
 - **Controlled workspaces** — clients reference workspaces by opaque
   `workspace_id`; the server resolves them to directories under a configured
   root. No client-controlled path can ever be injected (resolver + nsjail
@@ -39,20 +39,11 @@ make test                          # vet + full test suite
 ./bin/gateway -config config.example.toml
 ```
 
-Dev on macOS (no nsjail): use the `test` profile, which disables isolation:
-
-```toml
-mode = "test"
-[workspace]
-root = "./workspaces"
-```
+Dev on macOS uses the direct Worker development profile because nsjail is
+Linux-only:
 
 ```bash
-./bin/gateway -config /dev/stdin <<'EOF'
-mode = "test"
-[workspace]
-root = "./workspaces"
-EOF
+make dev
 ```
 
 > The test profile spawns workers directly (no nsjail). Production and dev
@@ -100,6 +91,11 @@ supplied) and the generated id is returned in the `X-Gateway-Session-Id`
 response header. Resume by sending that header back on the next request; the
 gateway reuses the running worker execution.
 
+The concurrency boundary is explicit: there is **one active turn per session**.
+Different sessions in the **same workspace** may run concurrently and may
+therefore modify the same files; filesystem conflict policy belongs to the
+caller that owns the workspace.
+
 ## Agents
 
 | Model id | Adapter | Lifecycle |
@@ -108,11 +104,10 @@ gateway reuses the running worker execution.
 | `claude-code` | `adapters/claudecode` | persistent process |
 | `kimi` | `adapters/kimi` | resume per turn |
 
-Adapters are registered by name into a process-wide runtime registry
-(`runtime/`). Each adapter implements the canonical `runtime.AgentAdapter`
-contract and drives its agent's native CLI (exec stream-json / JSON-RPC),
-converting CLI output into canonical runtime events. The gateway API layer is
-adapter-agnostic — it only speaks the canonical contract.
+Adapters are registered by name into the runtime registry. `agent/<name>` owns
+native CLI launch, protocol parsing, resume IDs, usage, abort, and process
+teardown. `adapters/<name>` only converts trusted configuration, prompts,
+events, and lifecycle calls to the canonical `runtime.AgentAdapter` contract.
 
 ## Isolation
 
@@ -164,6 +159,13 @@ contract; provider secrets remain worker/container environment configuration.
 
 ## Architecture
 
+The complete data path is:
+
+```text
+OpenAI HTTP/SSE -> runtime.ExecutionBackend -> Worker Supervisor/RPC
+-> adapters/<name> -> agent/<name> -> Agent CLI process
+```
+
 ```
 HTTP client (any OpenAI client)
         │  /v1/* + SSE (Bearer token, X-User-Id)
@@ -180,15 +182,15 @@ cmd/gateway  (API process + worker Supervisor)
               │  fork: nsjail -Mo --config profile -- gateway-worker
               ▼
 cmd/gateway-worker   (one per session; the ONLY process that runs agent CLIs)
-  └── adapters/{codex,claudecode,kimi}   native CLI process mgmt + parsing
+  └── adapters/{codex,claudecode,kimi}   runtime/native mapping only
+        └── agent/{codex,claudecode,kimi} native execution + protocol
 ```
 
 - The API process **never** launches an agent CLI — every execution flows
   through `worker.LocalExecutionBackend` → supervisor → jailed worker.
-- `core/`, `server/`, `platform/`, `daemon/`, `web/`, `npm/` (the IM-gateway
-  layer) were removed in this rewrite. `agent/{codex,claudecode,kimi}/` are
-  kept as the migration reference the `adapters/*/SOURCE.md` files cite; they
-  are compiled out behind the `agent_ref` build tag.
+- Native packages cannot import `runtime`, adapters, Worker, API, or config.
+  Adapters cannot launch processes or parse raw Agent protocols. Worker and API
+  packages never contain concrete Agent protocol knowledge.
 
 ## Docker
 
@@ -215,7 +217,7 @@ validation hooks.
 ## Development
 
 ```bash
-make fmt                 # gofmt across api runtime worker adapters config cmd integration
+make fmt                 # gofmt across agent api runtime worker adapters config cmd integration
 make vet                 # go vet ./...
 make test                # vet + go test ./...
 make test-race           # go test -race ./...  (CI)
@@ -228,9 +230,9 @@ Cross-platform builds (the darwin dev host, Linux production, and Windows dev)
 are all supported:
 
 ```bash
-GOOS=linux go build ./...
-GOOS=darwin go build ./...
-GOOS=windows go build ./...
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./...
+GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build ./...
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...
 ```
 
 ### Testing
@@ -244,6 +246,11 @@ GOOS=windows go build ./...
 - Real nsjail smoke (version + ldd + minimal jail) runs on Linux CI via
   `docker/nsjail-smoke.sh`.
 
-## License
+## License and provenance
 
-Forked from cc-connect. See upstream for license details.
+Agent CLI lifecycle and protocol behavior was selectively migrated from
+[cc-connect](https://github.com/chenhg5/cc-connect) at commit
+`3fc360ee6acc9bab13ab1b48ddde3af44062903b`. See each
+`adapters/<name>/SOURCE.md` and `LICENSES/cc-connect-MIT.txt`. The upstream
+README declares MIT License, but its linked standalone license file is absent
+at that baseline; the notice records this caveat explicitly.

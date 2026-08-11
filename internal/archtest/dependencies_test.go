@@ -12,6 +12,7 @@ import (
 )
 
 const modulePath = "github.com/tianlinzz/agent-cli-gateway"
+const ccConnectBaseline = "3fc360ee6acc9bab13ab1b48ddde3af44062903b"
 
 func TestDependencyRules(t *testing.T) {
 	root := moduleRoot(t)
@@ -75,6 +76,77 @@ func TestAdaptersContainNoNativeExecution(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestProvenance(t *testing.T) {
+	root := moduleRoot(t)
+	for _, agent := range []string{"claudecode", "codex", "kimi"} {
+		relative := filepath.Join("adapters", agent, "SOURCE.md")
+		data, err := os.ReadFile(filepath.Join(root, relative))
+		if err != nil {
+			t.Errorf("read %s: %v", relative, err)
+			continue
+		}
+		content := string(data)
+		for _, required := range []string{
+			"https://github.com/chenhg5/cc-connect",
+			ccConnectBaseline,
+			"Upstream source files",
+			"Migrated behaviors",
+			"Material local modifications",
+			"Local regression tests",
+			"agent/" + agent + "/",
+		} {
+			if !strings.Contains(content, required) {
+				t.Errorf("%s missing %q", relative, required)
+			}
+		}
+	}
+
+	license := filepath.Join(root, "LICENSES", "cc-connect-MIT.txt")
+	data, err := os.ReadFile(license)
+	if err != nil {
+		t.Fatalf("read upstream license: %v", err)
+	}
+	for _, required := range []string{
+		"MIT License",
+		"README.md",
+		ccConnectBaseline,
+		"standalone LICENSE file is absent",
+	} {
+		if !strings.Contains(string(data), required) {
+			t.Errorf("upstream license missing %q", required)
+		}
+	}
+}
+
+func TestActiveDocumentation(t *testing.T) {
+	root := moduleRoot(t)
+	for _, relative := range []string{"README.md", "AGENTS.md", "CLAUDE.md"} {
+		data, err := os.ReadFile(filepath.Join(root, relative))
+		if err != nil {
+			t.Errorf("read %s: %v", relative, err)
+			continue
+		}
+		content := string(data)
+		for _, forbidden := range []string{"migration-reference", "agent_ref", "never build with"} {
+			if strings.Contains(content, forbidden) {
+				t.Errorf("%s contains stale documentation %q", relative, forbidden)
+			}
+		}
+		for _, required := range []string{
+			"agent/<name>",
+			"adapters/<name>",
+			"OpenAI HTTP/SSE",
+			"Worker Supervisor/RPC",
+			"one active turn per session",
+			"same workspace",
+		} {
+			if !strings.Contains(content, required) {
+				t.Errorf("%s missing final architecture statement %q", relative, required)
+			}
+		}
+	}
 }
 
 func moduleRoot(t *testing.T) string {
