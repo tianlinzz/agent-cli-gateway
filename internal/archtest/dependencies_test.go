@@ -61,6 +61,46 @@ func TestNoLegacyAgentSources(t *testing.T) {
 	})
 }
 
+func TestNoResumePerTurnCompatibility(t *testing.T) {
+	root := moduleRoot(t)
+	forbidden := []string{
+		"Lifecycle" + "ResumePerTurn",
+		"resume" + "_per_turn",
+		"CC_GATEWAY_CODEX_" + "BACKEND",
+		"Probe" + "Flags(",
+		"Flag" + "Support",
+	}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" || entry.Name() == "vendor" || entry.Name() == ".superpowers" || filepath.ToSlash(path) == filepath.ToSlash(filepath.Join(root, "docs", "superpowers")) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		ext := filepath.Ext(path)
+		if ext != ".go" && ext != ".toml" && ext != ".md" && ext != ".sh" {
+			return nil
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		relative, _ := filepath.Rel(root, path)
+		for _, needle := range forbidden {
+			if strings.Contains(string(data), needle) {
+				t.Errorf("obsolete lifecycle compatibility remains: %s contains %q", filepath.ToSlash(relative), needle)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAdaptersContainNoNativeExecution(t *testing.T) {
 	root := moduleRoot(t)
 	needles := []string{"os/exec", "exec.Command", "bufio.Scanner", "json.Unmarshal"}

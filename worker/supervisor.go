@@ -701,7 +701,7 @@ func (ws *workerSession) terminate(err error) {
 		// The per-session socket dir holds w.sock, the worker's listen path.
 		// net.Listen("unix", ...) fails with EADDRINUSE on a stale socket file,
 		// so it MUST be removed on every terminal path or a later StartSession
-		// with the same SessionID (resume_per_turn) dies at bind time.
+		// with the same SessionID dies at bind time.
 		if ws.socketDir != "" {
 			if err := os.RemoveAll(ws.socketDir); err != nil {
 				slog.Warn("worker: cleanup socket dir", "session", ws.req.SessionID, "error", err)

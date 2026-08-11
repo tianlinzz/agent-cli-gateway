@@ -32,22 +32,14 @@ type Descriptor struct {
 	DisplayName string
 	// Description is an optional one-line summary.
 	Description string
-	// LifecycleMode declares how the adapter drives its CLI across turns:
-	// LifecyclePersistentProcess or LifecycleResumePerTurn.
+	// LifecycleMode declares the adapter's persistent CLI lifecycle.
 	LifecycleMode string
 	// Capabilities advertises the optional features this adapter supports.
 	Capabilities Capabilities
 }
 
-// Lifecycle modes for Descriptor.LifecycleMode. Workers must not assume every
-// agent uses the same session model.
-const (
-	// LifecyclePersistentProcess keeps one CLI process alive across turns.
-	LifecyclePersistentProcess = "persistent_process"
-	// LifecycleResumePerTurn restarts the CLI for each turn, resuming via a
-	// native session ID.
-	LifecycleResumePerTurn = "resume_per_turn"
-)
+// LifecyclePersistentProcess keeps one CLI process alive across turns.
+const LifecyclePersistentProcess = "persistent_process"
 
 // Capabilities describes optional adapter features. Permission is a canonical
 // capability: even in phase 1 where permission is auto-approved, the event

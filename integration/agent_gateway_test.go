@@ -109,7 +109,7 @@ func registerFake(t *testing.T, reg *runtime.Registry, name, display string) {
 			ModelID:       name,
 			DisplayName:   display,
 			Description:   "hermetic fake adapter for integration tests",
-			LifecycleMode: runtime.LifecycleResumePerTurn,
+			LifecycleMode: runtime.LifecyclePersistentProcess,
 			Capabilities: runtime.Capabilities{
 				Streaming: true, ToolCalls: true, Reasoning: true,
 				Permission: true, Resume: true, MultiTurn: true,

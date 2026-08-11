@@ -322,7 +322,7 @@ func (x *AgentExecutionConfig) GetEnv() map[string]string {
 type StartSessionResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// lifecycle_mode mirrors runtime.Descriptor.LifecycleMode
-	// ("persistent_process" or "resume_per_turn"). The supervisor uses it to
+	// ("persistent_process"). The supervisor uses it to
 	// decide whether an abort tears down the process or just cancels the turn.
 	LifecycleMode string `protobuf:"bytes,1,opt,name=lifecycle_mode,json=lifecycleMode,proto3" json:"lifecycle_mode,omitempty"`
 	unknownFields protoimpl.UnknownFields

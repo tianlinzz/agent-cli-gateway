@@ -630,11 +630,11 @@ func TestSupervisor_SocketPathUnderLimit(t *testing.T) {
 	}
 }
 
-// TestSupervisor_SessionIDReusableAfterClose guards the resume_per_turn
+// TestSupervisor_SessionIDReusableAfterClose guards persistent crash recovery
 // session-id-reuse bug: a terminated session left its per-session socket dir
 // (and the w.sock file inside it) behind, and net.Listen("unix", ...) fails
 // with EADDRINUSE on a stale path — so a later StartSession with the SAME
-// SessionID (exactly what resume_per_turn needs: same session, a NEW process
+// SessionID (same logical session, a NEW process
 // per turn) died at bind time. The socket survives whenever the worker is
 // killed hard (SIGKILL escalation, crash, wrapper death) — the graceful-close
 // path unlinks it, the kill paths do not — so terminate must remove the
@@ -667,7 +667,7 @@ func TestSupervisor_SessionIDReusableAfterClose(t *testing.T) {
 		t.Errorf("sessions left in supervisor after close: %d", n)
 	}
 
-	// resume_per_turn: the same SessionID starts a NEW process per turn after
+	// Recovery: the same SessionID starts a NEW process after
 	// the previous one closed. The stale socket must not block the re-bind.
 	ws2, err := sup.StartSession(context.Background(), testRequest(sessionID))
 	if err != nil {

@@ -370,7 +370,7 @@ func (h *Handler) deliverTurn(ctx context.Context, sessionID string, handle runt
 
 	// The session/worker is gone. Drop the stale handle (the supervisor has
 	// already reaped the dead worker and removed its session) and start a fresh
-	// execution. For resume_per_turn adapters this is the normal model; for
+	// execution. For persistent adapters this is the recovery path after a
 	// persistent_process (claude-code) a fresh process loses in-process state
 	// but native transcript on disk allows resume — strictly better than the
 	// permanent 500 that otherwise wedges the session until gateway restart.

@@ -41,7 +41,7 @@ type SessionRecord struct {
 	// ModelID is the public model/agent identifier (StartRequest.ModelID).
 	ModelID string
 	// NativeSessionID is the agent-native session ID used to resume a
-	// resume_per_turn adapter.
+	// recovered persistent adapter session.
 	NativeSessionID string
 	// CallerID is the tenant/user that owns the session. All access is scoped
 	// to it.

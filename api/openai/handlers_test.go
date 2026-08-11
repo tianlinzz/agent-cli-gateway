@@ -191,7 +191,7 @@ var codexDesc = runtime.Descriptor{
 	ModelID:       "codex",
 	DisplayName:   "Codex",
 	Description:   "fake codex for api tests",
-	LifecycleMode: runtime.LifecycleResumePerTurn,
+	LifecycleMode: runtime.LifecyclePersistentProcess,
 	Capabilities: runtime.Capabilities{
 		Streaming: true, ToolCalls: true, Reasoning: true,
 		Permission: true, Resume: true, MultiTurn: true,

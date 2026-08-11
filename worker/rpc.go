@@ -168,7 +168,7 @@ type Handler interface {
 	// Health reports worker liveness and version.
 	Health(ctx context.Context) (version string, err error)
 	// StartSession begins the session and returns the adapter's lifecycle mode
-	// (runtime.LifecyclePersistentProcess or runtime.LifecycleResumePerTurn).
+	// (runtime.LifecyclePersistentProcess).
 	StartSession(ctx context.Context, req StartSessionReq) (lifecycleMode string, err error)
 	// SendInput delivers a turn.
 	SendInput(ctx context.Context, input runtime.Input) error

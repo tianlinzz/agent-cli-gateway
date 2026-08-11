@@ -72,7 +72,7 @@ var kimiDesc = runtime.Descriptor{
 	ModelID:       "kimi",
 	DisplayName:   "Kimi",
 	Description:   "fake kimi for api tests",
-	LifecycleMode: runtime.LifecycleResumePerTurn,
+	LifecycleMode: runtime.LifecyclePersistentProcess,
 	Capabilities: runtime.Capabilities{
 		Streaming: true, ToolCalls: true, Reasoning: true,
 		Resume: true, MultiTurn: true,

@@ -78,7 +78,7 @@ message AgentExecutionConfig {
 
 message StartSessionResponse {
   // lifecycle_mode mirrors runtime.Descriptor.LifecycleMode
-  // ("persistent_process" or "resume_per_turn"). The supervisor uses it to
+  // ("persistent_process"). The supervisor uses it to
   // decide whether an abort tears down the process or just cancels the turn.
   string lifecycle_mode = 1;
 }
