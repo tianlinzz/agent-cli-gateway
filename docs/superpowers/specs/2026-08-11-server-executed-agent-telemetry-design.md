@@ -94,8 +94,8 @@ An Agent that has no safe reasoning event emits none.
 
 ### Terminal Native Tool Summary
 
-Each native tool produces at most one terminal display summary, encoded as a
-string in the same `reasoning_content` field:
+Each native tool produces at most one terminal display summary as normalized
+CLI-style text in the same `reasoning_content` field:
 
 ```json
 {
@@ -103,7 +103,7 @@ string in the same `reasoning_content` field:
     {
       "index": 0,
       "delta": {
-        "reasoning_content": "gateway.tool_execution.v1:{\"id\":\"tool-123\",\"name\":\"Bash\",\"status\":\"completed\",\"is_error\":false,\"result\":\"/workspace\"}\n"
+        "reasoning_content": "⏺ Bash\n  ⎿ /workspace\n"
       },
       "finish_reason": null
     }
@@ -111,25 +111,22 @@ string in the same `reasoning_content` field:
 }
 ```
 
-The payload after the stable prefix is JSON with these fields:
+Successful and failed executions use these forms:
 
-```go
-type ToolExecutionSummary struct {
-    ID      string `json:"id"`
-    Name    string `json:"name,omitempty"`
-    Status  string `json:"status"` // always "completed" in v1
-    IsError bool   `json:"is_error"`
-    Result  string `json:"result,omitempty"`
-}
+```text
+⏺ TaskUpdate
+  ⎿ Updated task #2 status
+
+⨯ Bash
+  ⎿ command exited with status 1
 ```
 
-The `gateway.tool_execution.v1:` prefix is stable and makes the message
-recognizable to consumers that want a dedicated tool card later. Consumers that
-do not recognize it still receive an ordinary reasoning string and do not enter
-any tool loop. This is an application-level convention carried through an
-already-consumed compatibility field, not a new OpenAI control field.
-The trailing newline is part of the v1 framing and keeps adjacent summaries or
-later reasoning text separable after a client concatenates streamed deltas.
+The Gateway owns this normalization. Consumers receive immediately displayable
+reasoning text and do not parse a Gateway-specific prefix or JSON payload. The
+tool name is preserved for recognition and UI icon mapping, while native tool
+IDs remain internal for duplicate suppression and defensive replay rejection.
+An empty result emits only the icon and tool-name line. Every summary ends with
+a newline so adjacent summaries remain separable when deltas are concatenated.
 
 The Gateway does not stream `started` or incremental tool updates in v1. It
 keeps native start data internally and emits one event only when the matching
@@ -226,9 +223,8 @@ Projection rules are:
 2. `EventReasoning` writes `delta.reasoning_content` when text is non-empty.
 3. `EventToolUse` records the tool by stable ID and writes no client frame.
 4. `EventToolResult` merges missing name data from the recorded start, applies
-   redaction and output bounds, serializes `ToolExecutionSummary` with the
-   `gateway.tool_execution.v1:` prefix, and writes it as one
-   `delta.reasoning_content` frame.
+   redaction and output bounds, formats one CLI-style icon/name/result summary,
+   and writes it as one `delta.reasoning_content` frame.
 5. A repeated result ID is ignored and logged as a structured warning.
 6. A result without a prior start is still emitted using the available result
    data; this preserves protocols that report only terminal updates.
@@ -316,8 +312,8 @@ Handler tests must verify:
 
 - reasoning becomes `delta.reasoning_content`;
 - a tool start produces no SSE frame;
-- a tool result produces one terminal `delta.reasoning_content` frame with the
-  `gateway.tool_execution.v1:` prefix;
+- a successful tool result produces one `⏺ <name>` terminal frame;
+- a failed tool result produces one `⨯ <name>` terminal frame;
 - missing result fields are correlated from the start event;
 - duplicate results are suppressed;
 - no response contains `delta.tool_calls` or `finish_reason: "tool_calls"`;
@@ -350,9 +346,7 @@ the repository pre-commit checklist.
 
 The following work is deliberately outside this Gateway implementation:
 
-- f1-web parsing of the `gateway.tool_execution.v1:` reasoning payload;
-- conversion to f1-web `ChatStreamProtocol` display events and dedicated UI;
-- UI rendering and historical persistence;
+- optional tool-specific icon replacement in a richer client UI;
 - client-owned OpenAI function tools;
 - incremental tool progress or argument previews;
 - non-streaming telemetry aggregation;
