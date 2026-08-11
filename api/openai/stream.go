@@ -7,7 +7,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
 )
@@ -34,7 +37,15 @@ type streamDelta struct {
 	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
-const toolExecutionPrefix = "gateway.tool_execution.v1:"
+const (
+	toolExecutionPrefix       = "gateway.tool_execution.v1:"
+	maxToolSummaryResultBytes = 2000
+)
+
+var (
+	bearerSecretPattern = regexp.MustCompile(`(?i)Bearer\s+[^\s,;"}]+`)
+	namedSecretPattern  = regexp.MustCompile(`(?i)(access[_-]?token|api[_-]?key|cookie)(\s*[:=]\s*)[^\s,;"}]+`)
+)
 
 type toolExecutionSummary struct {
 	ID      string `json:"id"`
@@ -50,13 +61,26 @@ func encodeToolExecutionSummary(tool runtime.ToolCall) (string, error) {
 		Name:    tool.Name,
 		Status:  "completed",
 		IsError: tool.IsError,
-		Result:  tool.Result,
+		Result:  sanitizeToolSummaryResult(tool.Result),
 	}
 	data, err := json.Marshal(summary)
 	if err != nil {
 		return "", fmt.Errorf("encode tool execution summary: %w", err)
 	}
 	return toolExecutionPrefix + string(data), nil
+}
+
+func sanitizeToolSummaryResult(result string) string {
+	result = bearerSecretPattern.ReplaceAllString(result, "Bearer ***")
+	result = namedSecretPattern.ReplaceAllString(result, "$1$2***")
+	if len(result) <= maxToolSummaryResultBytes {
+		return result
+	}
+	result = result[:maxToolSummaryResultBytes]
+	for !utf8.ValidString(result) {
+		result = result[:len(result)-1]
+	}
+	return strings.TrimSpace(result) + "..."
 }
 
 func (c streamChunk) withChoices(choices ...streamChoice) streamChunk {

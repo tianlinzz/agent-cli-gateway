@@ -901,6 +901,27 @@ func TestChatCompletions_StreamProjectsReasoningAndTerminalToolSummary(t *testin
 	}
 }
 
+func TestEncodeToolExecutionSummaryRedactsAndBoundsResult(t *testing.T) {
+	result := "Authorization: Bearer sk-secret\n" + strings.Repeat("x", maxToolSummaryResultBytes+100)
+	encoded, err := encodeToolExecutionSummary(runtime.ToolCall{ID: "tool-1", Name: "Bash", Result: result})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(encoded, "sk-secret") {
+		t.Fatalf("encoded summary leaked bearer token: %q", encoded)
+	}
+	if !strings.Contains(encoded, "Bearer ***") {
+		t.Fatalf("encoded summary did not preserve redacted marker: %q", encoded)
+	}
+	var summary toolExecutionSummary
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(encoded, toolExecutionPrefix)), &summary); err != nil {
+		t.Fatalf("decode summary: %v", err)
+	}
+	if len(summary.Result) > maxToolSummaryResultBytes+3 {
+		t.Fatalf("result length = %d, want bounded", len(summary.Result))
+	}
+}
+
 func TestRejectServerExecutedToolReplay(t *testing.T) {
 	ts, _, backend := newTestServer(t)
 	backend.withScript(func(h *fakeHandle) {
