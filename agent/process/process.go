@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // Spec describes one native Agent CLI process. Command contains the executable
@@ -189,13 +190,21 @@ func (p *Process) ForceKill() error {
 // worker memory.
 const defaultStderrCap = 256 * 1024
 
+// stderrTruncationMarker is prepended to the captured stderr when the buffer
+// dropped older output, so a caller can tell the diagnostics are partial.
+const stderrTruncationMarker = "...[stderr truncated]...\n"
+
 // lockedBuffer is a bounded, mutex-guarded buffer that retains the most recent
-// tail of what is written to it. It never grows beyond roughly 2*max bytes
-// transiently; once it crosses 2*max it is trimmed back to the last max bytes.
+// tail of what is written to it. After every Write the retained content is at
+// most max bytes (defaultStderrCap when max <= 0) and starts on a UTF-8 rune
+// boundary. A single Write larger than max never buffers the whole input: only
+// its final max bytes are kept. String prepends a truncation marker when older
+// output was dropped.
 type lockedBuffer struct {
-	mu  sync.Mutex
-	b   []byte
-	max int
+	mu        sync.Mutex
+	b         []byte
+	max       int
+	truncated bool
 }
 
 func (b *lockedBuffer) cap() int {
@@ -205,13 +214,30 @@ func (b *lockedBuffer) cap() int {
 	return defaultStderrCap
 }
 
+// trimToRuneStart drops leading bytes that cannot begin a UTF-8 rune so the
+// retained tail is valid UTF-8 at its start.
+func trimToRuneStart(p []byte) []byte {
+	for len(p) > 0 && !utf8.RuneStart(p[0]) {
+		p = p[1:]
+	}
+	return p
+}
+
 func (b *lockedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.b = append(b.b, p...)
-	if cap := 2 * b.cap(); len(b.b) > cap {
-		tail := b.cap()
-		b.b = append([]byte(nil), b.b[len(b.b)-tail:]...)
+	max := b.cap()
+	switch {
+	case len(p) >= max:
+		// The whole retained tail comes from this write; never buffer all of p.
+		b.truncated = true
+		b.b = append([]byte(nil), trimToRuneStart(p[len(p)-max:])...)
+	default:
+		b.b = append(b.b, p...)
+		if len(b.b) > max {
+			b.truncated = true
+			b.b = append([]byte(nil), trimToRuneStart(b.b[len(b.b)-max:])...)
+		}
 	}
 	return len(p), nil
 }
@@ -219,5 +245,8 @@ func (b *lockedBuffer) Write(p []byte) (int, error) {
 func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return string(b.b)
+	if !b.truncated {
+		return string(b.b)
+	}
+	return stderrTruncationMarker + string(b.b)
 }
