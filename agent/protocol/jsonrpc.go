@@ -54,6 +54,17 @@ type rpcResult struct {
 // drain (but never the reader loop).
 type OverflowHandler func(dropped int)
 
+// NotifyClassifier reports whether a notification method is critical (must never
+// be dropped to overflow) or display (may be dropped and marked). Critical
+// notifications — turn completion, native session/thread identity, usage — drive
+// the Gateway state machine; losing them would leave a turn unfinished or a
+// resume ID unsaved. Display notifications — text deltas, tool progress,
+// reasoning — are telemetry and may be truncated under sustained backpressure.
+// Returning true routes the notification through a dedicated blocking queue
+// (done-guarded, never dropped); false routes it through the non-blocking
+// display queue (overflow drops with a truncation marker).
+type NotifyClassifier func(method string) bool
+
 // JSONRPCClient owns bounded JSONL framing, request correlation, and reverse
 // message dispatch for one stdio JSON-RPC connection.
 type JSONRPCClient struct {
@@ -63,22 +74,29 @@ type JSONRPCClient struct {
 	reverse         ReverseHandler
 	notify          NotificationHandler
 	overflow        OverflowHandler
-	dropped         atomic.Int64 // notifications dropped to queue overflow
+	classify        NotifyClassifier
+	dropped         atomic.Int64 // display notifications dropped to queue overflow
 	overflowPending atomic.Bool  // an overflow episode awaits a flush
 
-	// notifyQueue decouples the reader loop from the notification consumer.
-	// The reader enqueues NON-blocking: a full queue never stalls the reader,
-	// so RPC responses and reverse requests are always correlated/processed.
-	// Overflowing notifications are dropped and counted; once the drain catches
-	// up (the queue empties) the overflow handler fires once with the dropped
-	// count so the consumer can surface a truncation marker. A sync marker item
-	// lets a caller wait until notifications enqueued before it are delivered.
+	// criticalQueue carries control-critical notifications (turn completion,
+	// identity, usage). It is enqueued with a done-guarded BLOCKING send: the
+	// reader waits until the drain has room or the connection terminates, so a
+	// critical notification is never dropped. The drain processes it before
+	// display notifications, preserving ordering relative to the turn lifecycle.
+	criticalQueue chan RPCMessage
+	// notifyQueue carries display notifications. The reader enqueues
+	// NON-blocking: a full queue never stalls the reader. Overflowing
+	// notifications are dropped and counted; the overflow handler fires once
+	// when the drain catches up. A sync marker item lets a caller wait until
+	// notifications enqueued before it have been delivered.
 	notifyQueue chan notifyItem
-	// notifyDone is closed when the drain goroutine exits. A session that
-	// closes a channel its notify handler sends on must wait on NotifyDone()
-	// (after cancelling whatever context unblocks the handler) before closing,
-	// so the drain never sends on a closed channel.
-	notifyDone chan struct{}
+	// notifyDone is closed when BOTH drain goroutines (display + critical)
+	// have exited. A session that closes a channel its notify handler sends
+	// on must wait on NotifyDone() (after cancelling whatever context
+	// unblocks the handler) before closing, so a drain never sends on a
+	// closed channel.
+	notifyDone   chan struct{}
+	criticalDone chan struct{}
 
 	writeMu sync.Mutex
 	mu      sync.Mutex
@@ -89,13 +107,18 @@ type JSONRPCClient struct {
 	close   sync.Once
 }
 
-// notifyQueueSize bounds the decoupled notification buffer. The reader never
-// blocks on it: when full, notifications are dropped (and counted) until the
-// consumer catches up or the session is torn down. It is sized to absorb
-// realistic bursts well beyond a downstream events channel without loss.
+// notifyQueueSize bounds the display-notification buffer. The reader never
+// blocks on it: when full, display notifications are dropped (and counted)
+// until the consumer catches up or the session is torn down.
 const notifyQueueSize = 256
 
-// notifyItem is one entry in the decoupled notification queue: a notification
+// criticalQueueSize bounds the critical-notification buffer. It is small
+// because critical notifications are infrequent (a handful per turn) and the
+// enqueue is blocking+done-guarded — the reader pauses briefly only if the
+// drain is stalled, then resumes.
+const criticalQueueSize = 16
+
+// notifyItem is one entry in the display notification queue: a notification
 // to deliver, or a sync marker a caller is waiting on.
 type notifyItem struct {
 	msg  RPCMessage
@@ -103,27 +126,59 @@ type notifyItem struct {
 }
 
 // NewJSONRPCClient starts a single reader loop for the supplied stdio pair.
-// onOverflow, when non-nil, is called once per overflow episode with the number
-// of dropped notifications.
-func NewJSONRPCClient(stdin io.WriteCloser, stdout io.Reader, maxFrame int, reverse ReverseHandler, notify NotificationHandler, onOverflow OverflowHandler) *JSONRPCClient {
+// onOverflow, when non-nil, is called once per display-overflow episode with
+// the number of dropped notifications. classify, when non-nil, routes
+// control-critical notifications through a never-dropped path with its own
+// drain goroutine so a stalled display consumer cannot starve critical
+// delivery; when nil every notification is treated as display.
+func NewJSONRPCClient(stdin io.WriteCloser, stdout io.Reader, maxFrame int, reverse ReverseHandler, notify NotificationHandler, onOverflow OverflowHandler, classify NotifyClassifier) *JSONRPCClient {
 	c := &JSONRPCClient{
-		stdin: stdin, stdout: stdout, reverse: reverse, notify: notify, overflow: onOverflow,
+		stdin: stdin, stdout: stdout, reverse: reverse, notify: notify, overflow: onOverflow, classify: classify,
 		pending: make(map[string]chan rpcResult), done: make(chan struct{}),
 	}
 	if notify != nil {
 		c.notifyQueue = make(chan notifyItem, notifyQueueSize)
 		c.notifyDone = make(chan struct{})
+		if classify != nil {
+			c.criticalQueue = make(chan RPCMessage, criticalQueueSize)
+			c.criticalDone = make(chan struct{})
+			go c.drainCritical()
+		}
 		go c.drainNotifications()
 	}
 	go c.readLoop(maxFrame)
 	return c
 }
 
-// enqueueNotify adds a notification to the drain queue without ever blocking
-// the reader. On overflow it drops the notification, counts it, and marks an
-// overflow episode; the drain flushes the episode (firing the overflow handler)
-// once it has caught up.
+// drainCritical delivers control-critical notifications on a dedicated
+// goroutine so a stalled display consumer (blocked in the display drain's
+// notify call) cannot prevent turn-completion / identity / usage from being
+// processed. Both drains call the same notify handler; the handler must be
+// safe for concurrent calls (agent emit is: it selects on a channel or ctx).
+func (c *JSONRPCClient) drainCritical() {
+	defer close(c.criticalDone)
+	for {
+		select {
+		case msg := <-c.criticalQueue:
+			c.notify(msg)
+		case <-c.done:
+			return
+		}
+	}
+}
+
+// enqueueNotify routes a notification to the appropriate queue. Critical
+// notifications (per classify) go through a blocking, done-guarded send — never
+// dropped. Display notifications go through a non-blocking send — dropped and
+// counted on overflow.
 func (c *JSONRPCClient) enqueueNotify(msg RPCMessage) {
+	if c.classify != nil && c.classify(msg.Method) {
+		select {
+		case c.criticalQueue <- msg:
+		case <-c.done:
+		}
+		return
+	}
 	select {
 	case c.notifyQueue <- notifyItem{msg: msg}:
 	default:
@@ -132,10 +187,11 @@ func (c *JSONRPCClient) enqueueNotify(msg RPCMessage) {
 	}
 }
 
-// drainNotifications delivers queued notifications to the handler serially,
-// preserving order, on a goroutine separate from the reader loop. When the
-// queue empties after an overflow episode, it fires the overflow handler once
-// with the number dropped so the consumer can surface a truncation marker.
+// drainNotifications delivers display notifications to the handler serially,
+// on a goroutine separate from the reader loop. Critical notifications are
+// handled by a separate drain goroutine so they are never starved by a stalled
+// display consumer. When the display queue empties after an overflow episode,
+// it fires the overflow handler once with the number dropped.
 func (c *JSONRPCClient) drainNotifications() {
 	defer close(c.notifyDone)
 	for {
@@ -146,7 +202,6 @@ func (c *JSONRPCClient) drainNotifications() {
 				continue
 			}
 			c.notify(item.msg)
-			// Once the queue has drained, flush any pending overflow episode.
 			if c.overflowPending.Load() && len(c.notifyQueue) == 0 {
 				c.flushOverflow()
 			}
@@ -168,12 +223,24 @@ func (c *JSONRPCClient) flushOverflow() {
 	}
 }
 
-// NotifyDone returns a channel that closes when the notification drain
-// goroutine has fully exited, or nil if no notification handler was configured.
-// A caller that closes a channel its notify handler sends on should cancel the
-// handler's unblock signal first, then wait on this before closing, so the
-// drain never sends on a closed channel.
-func (c *JSONRPCClient) NotifyDone() <-chan struct{} { return c.notifyDone }
+// NotifyDone returns a channel that closes when every notification drain
+// goroutine (display + critical) has fully exited, or nil if no notification
+// handler was configured. A caller that closes a channel its notify handler
+// sends on should cancel the handler's unblock signal first, then wait on this
+// before closing, so a drain never sends on a closed channel.
+func (c *JSONRPCClient) NotifyDone() <-chan struct{} {
+	if c.criticalDone != nil {
+		// Merge: close a single channel when both drains exit.
+		merged := make(chan struct{})
+		go func() {
+			<-c.notifyDone
+			<-c.criticalDone
+			close(merged)
+		}()
+		return merged
+	}
+	return c.notifyDone
+}
 
 // DroppedNotifications returns the total notifications dropped to queue
 // overflow for diagnostics. It does not reset the counter.

@@ -67,7 +67,7 @@ func Start(ctx context.Context, options Options) (*Session, error) {
 
 	s := &Session{opts: opts, process: proc, events: make(chan Event, 64), ctx: sessionCtx, cancel: cancel, done: make(chan struct{})}
 	s.threadID.Store("")
-	s.rpc = agentprotocol.NewJSONRPCClient(proc.Stdin(), proc.Stdout(), maxAppServerFrame, s.handleReverse, s.handleNotification, s.onNotifyOverflow)
+	s.rpc = agentprotocol.NewJSONRPCClient(proc.Stdin(), proc.Stdout(), maxAppServerFrame, s.handleReverse, s.handleNotification, s.onNotifyOverflow, isCriticalCodexNotification)
 	if err := s.initialize(ctx); err != nil {
 		s.cleanupFailedStart()
 		return nil, err
@@ -182,6 +182,19 @@ func (s *Session) Send(ctx context.Context, input Input) error {
 	}
 	s.mu.Unlock()
 	return nil
+}
+
+// isCriticalCodexNotification reports whether a notification method drives the
+// Gateway state machine (turn lifecycle, thread/session identity, usage) and
+// must never be dropped to queue overflow. Display notifications (text deltas,
+// tool progress) may be truncated under sustained backpressure.
+func isCriticalCodexNotification(method string) bool {
+	switch method {
+	case "turn/started", "turn/completed",
+		"thread/started", "thread/tokenUsage/updated":
+		return true
+	}
+	return false
 }
 
 func (s *Session) handleNotification(message agentprotocol.RPCMessage) {
@@ -339,6 +352,12 @@ func (s *Session) recordUsage(params map[string]any) {
 }
 
 func (s *Session) completeTurn(params map[string]any) {
+	// turn/completed arrives on the wire after the turn's item/* notifications.
+	// It is routed through the critical (never-dropped) path, so it may be
+	// processed on a separate goroutine from the display drain. Wait for the
+	// display queue to flush the turn's item events before finalizing, so
+	// finish never precedes tool/text events the consumer reads up to finish.
+	s.rpc.Sync()
 	turnValue := objectValue(params["turn"])
 	id := stringValue(turnValue["id"])
 	s.mu.Lock()

@@ -61,7 +61,10 @@ func Start(ctx context.Context, options Options) (*Session, error) {
 	}
 	s := &Session{opts: opts, process: proc, events: make(chan Event, 64), ctx: sessionCtx, cancel: cancel, done: make(chan struct{})}
 	s.sessionID.Store("")
-	s.rpc = agentprotocol.NewJSONRPCClient(proc.Stdin(), proc.Stdout(), maxACPFrame, s.handleReverse, s.handleNotification, s.onNotifyOverflow)
+	// Kimi's turn completion is RPC-response-driven (session/prompt), not
+	// notification-driven, so no notification is control-critical. Pass nil so
+	// all notifications use the display path (overflow drop+marker).
+	s.rpc = agentprotocol.NewJSONRPCClient(proc.Stdin(), proc.Stdout(), maxACPFrame, s.handleReverse, s.handleNotification, s.onNotifyOverflow, nil)
 	if err := s.initialize(ctx); err != nil {
 		s.cleanupFailedStart()
 		return nil, err

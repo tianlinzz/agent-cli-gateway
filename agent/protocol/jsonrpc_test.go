@@ -15,7 +15,7 @@ import (
 func TestJSONRPCCorrelatesOutOfOrderResponses(t *testing.T) {
 	serverRead, clientIn := io.Pipe()
 	clientOut, serverWrite := io.Pipe()
-	client := NewJSONRPCClient(clientIn, clientOut, 1024, nil, nil, nil)
+	client := NewJSONRPCClient(clientIn, clientOut, 1024, nil, nil, nil, nil)
 	t.Cleanup(func() { _ = client.Close() })
 
 	type result struct {
@@ -65,6 +65,7 @@ func TestJSONRPCDispatchesNotificationAndReverseRequest(t *testing.T) {
 			return map[string]string{"decision": "accept"}, nil
 		},
 		func(msg RPCMessage) { notifications <- msg },
+		nil,
 		nil,
 	)
 	t.Cleanup(func() { _ = client.Close() })
@@ -121,6 +122,7 @@ func TestJSONRPCStalledNotifyDoesNotBlockResponses(t *testing.T) {
 			}
 			<-proceed // simulate a stalled consumer
 		},
+		nil,
 		nil,
 	)
 	t.Cleanup(func() {
@@ -184,6 +186,7 @@ func TestJSONRPCOverflowNeverBlocksReader(t *testing.T) {
 			<-proceed // stall the drain
 		},
 		func(dropped int) { overflowSeen.Add(int64(dropped)) },
+		nil,
 	)
 	t.Cleanup(func() { releaseDrain(); _ = client.Close() })
 
@@ -240,10 +243,63 @@ func TestJSONRPCOverflowNeverBlocksReader(t *testing.T) {
 	}
 }
 
+// TestJSONRPCOverflowNeverDropsCriticalNotifications is the O-A2 control-
+// notification reliability test the final review required: with the display
+// consumer permanently stalled and the display queue overflowing, critical
+// notifications (turn/completed, thread/tokenUsage/updated) must still be
+// delivered — the turn finishes and usage is recorded, never lost to overflow.
+func TestJSONRPCOverflowNeverDropsCriticalNotifications(t *testing.T) {
+	_, clientIn := io.Pipe()
+	clientOut, serverWrite := io.Pipe()
+	_ = clientOut
+	proceed := make(chan struct{})
+	var proceedOnce sync.Once
+	releaseDrain := func() { proceedOnce.Do(func() { close(proceed) }) }
+	var deliveredCritical atomic.Int64
+	client := NewJSONRPCClient(clientIn, clientOut, 1024, nil,
+		func(msg RPCMessage) {
+			if isCriticalTestNotification(msg.Method) {
+				deliveredCritical.Add(1)
+				return // critical notifications are never stalled
+			}
+			<-proceed // stall the display consumer
+		},
+		nil,
+		isCriticalTestNotification,
+	)
+	t.Cleanup(func() { releaseDrain(); _ = client.Close() })
+
+	// Flood display notifications to fill the queue, then send critical ones.
+	for i := 0; i < 400; i++ {
+		writeRPCMessage(t, serverWrite, RPCMessage{JSONRPC: "2.0", Method: "item/agentMessage/delta"})
+	}
+	writeRPCMessage(t, serverWrite, RPCMessage{JSONRPC: "2.0", Method: "turn/completed"})
+	writeRPCMessage(t, serverWrite, RPCMessage{JSONRPC: "2.0", Method: "thread/tokenUsage/updated"})
+
+	// Critical notifications must be delivered despite the stalled display
+	// consumer and the overflowing display queue. They go through the blocking
+	// critical queue, so the reader pauses until the drain processes them.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && deliveredCritical.Load() < 2 {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := deliveredCritical.Load(); got != 2 {
+		t.Fatalf("critical notifications delivered = %d, want 2 (turn/completed + usage) — dropped to overflow", got)
+	}
+	// Display overflow was counted.
+	if client.DroppedNotifications() <= 0 {
+		t.Fatal("display overflow not counted (expected display notifications dropped)")
+	}
+}
+
+func isCriticalTestNotification(method string) bool {
+	return method == "turn/completed" || method == "thread/tokenUsage/updated"
+}
+
 func TestJSONRPCCanceledCallDoesNotPoisonLaterCalls(t *testing.T) {
 	serverRead, clientIn := io.Pipe()
 	clientOut, serverWrite := io.Pipe()
-	client := NewJSONRPCClient(clientIn, clientOut, 1024, nil, nil, nil)
+	client := NewJSONRPCClient(clientIn, clientOut, 1024, nil, nil, nil, nil)
 	t.Cleanup(func() { _ = client.Close() })
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -267,7 +323,7 @@ func TestJSONRPCCanceledCallDoesNotPoisonLaterCalls(t *testing.T) {
 func TestJSONRPCEOFFailsAllPendingCallsAndClosesOnce(t *testing.T) {
 	serverRead, clientIn := io.Pipe()
 	clientOut, serverWrite := io.Pipe()
-	client := NewJSONRPCClient(clientIn, clientOut, 1024, nil, nil, nil)
+	client := NewJSONRPCClient(clientIn, clientOut, 1024, nil, nil, nil, nil)
 
 	errs := make(chan error, 2)
 	for range 2 {
@@ -297,7 +353,7 @@ func TestJSONRPCEOFFailsAllPendingCallsAndClosesOnce(t *testing.T) {
 func TestJSONRPCRejectsOversizedFrame(t *testing.T) {
 	_, clientIn := io.Pipe()
 	clientOut, serverWrite := io.Pipe()
-	client := NewJSONRPCClient(clientIn, clientOut, 32, nil, nil, nil)
+	client := NewJSONRPCClient(clientIn, clientOut, 32, nil, nil, nil, nil)
 	go func() {
 		_, _ = io.WriteString(serverWrite, `{"jsonrpc":"2.0","method":"`+string(make([]byte, 128))+`"}`+"\n")
 		_ = serverWrite.Close()
