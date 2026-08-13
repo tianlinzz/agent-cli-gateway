@@ -80,8 +80,16 @@ var kimiDesc = runtime.Descriptor{
 }
 
 // newThreeAgentServer builds the OpenAI handler with the three fake adapters
-// registered by their public model ids.
+// registered by their public model ids. It also returns the handler so tests
+// can inspect the session store directly.
 func newThreeAgentServer(t *testing.T) (*httptest.Server, *threeAgentBackend) {
+	t.Helper()
+	ts, backend, _ := newThreeAgentServerH(t)
+	return ts, backend
+}
+
+// newThreeAgentServerH is like newThreeAgentServer but also returns the Handler.
+func newThreeAgentServerH(t *testing.T) (*httptest.Server, *threeAgentBackend, *Handler) {
 	t.Helper()
 	reg := runtime.NewRegistry()
 	mustRegister(t, reg, "codex", codexDesc, nil)
@@ -101,7 +109,7 @@ func newThreeAgentServer(t *testing.T) (*httptest.Server, *threeAgentBackend) {
 	t.Cleanup(h.Close)
 	ts := httptest.NewServer(h.Routes())
 	t.Cleanup(ts.Close)
-	return ts, backend
+	return ts, backend, h
 }
 
 // TestThreeAgentDiscovery verifies /v1/models advertises exactly the three
@@ -184,6 +192,115 @@ func TestThreeAgentRouting(t *testing.T) {
 		if !seen[m] {
 			t.Errorf("no execution started for model %q", m)
 		}
+	}
+}
+
+// TestThreeAgentResumeIdServerOwned is the O-F03 evidence: for every agent, a
+// client must not be able to select or override the native resume target. On a
+// brand-new session the attacker keys are stripped (none reach StartRequest);
+// on an existing session with a stored native ID, the attacker keys are still
+// stripped and the server-owned ID is injected unchanged.
+func TestThreeAgentResumeIdServerOwned(t *testing.T) {
+	ts, backend, h := newThreeAgentServerH(t)
+	attackMetadata := map[string]any{
+		"workspace_id":      testWorkspace,
+		"native_session_id": "attacker-native",
+		"codex_thread_id":   "attacker-thread",
+		"claude_session_id": "attacker-claude",
+		"kimi_session_id":   "attacker-kimi",
+	}
+
+	for _, model := range []string{"codex", "claude-code", "kimi"} {
+		t.Run(model, func(t *testing.T) {
+			// New session: attacker keys stripped, none reach StartRequest.Metadata.
+			body := map[string]any{
+				"model":    model,
+				"messages": defaultMessages(),
+				"metadata": attackMetadata,
+			}
+			resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("new session: status = %d (body %s)", resp.StatusCode, readBody(t, resp))
+			}
+			sid := resp.Header.Get("X-Gateway-Session-Id")
+			if sid == "" {
+				t.Fatalf("no X-Gateway-Session-Id")
+			}
+			reqs := backend.StartRequests()
+			sr := reqs[len(reqs)-1]
+			for _, key := range []string{"native_session_id", "codex_thread_id", "claude_session_id", "kimi_session_id"} {
+				if v, ok := sr.Metadata[key]; ok {
+					t.Errorf("new session: attacker key %q reached StartRequest: %q", key, v)
+				}
+			}
+
+			// Existing session: seed a server-owned native ID into the store, then
+			// re-request with attacker keys. The server-owned ID must survive and
+			// no attacker value must appear.
+			serverOwned := "server-owned-" + model
+			_, _ = h.store.Update(context.Background(), sid, testOwner, func(rec *runtime.SessionRecord) {
+				rec.NativeSessionID = serverOwned
+			})
+			resp2 := doAuthJSONH(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body,
+				map[string]string{"X-Gateway-Session-Id": sid})
+			if resp2.StatusCode != http.StatusOK {
+				t.Fatalf("existing session: status = %d (body %s)", resp2.StatusCode, readBody(t, resp2))
+			}
+			rec, err := h.store.Get(context.Background(), sid, testOwner)
+			if err != nil {
+				t.Fatalf("store get: %v", err)
+			}
+			if rec.NativeSessionID != serverOwned {
+				t.Errorf("existing session: stored native id = %q, want %q (attacker overrode it)", rec.NativeSessionID, serverOwned)
+			}
+		})
+	}
+}
+
+// TestThreeAgentResumeIdCrossCaller proves a second caller cannot inject resume
+// keys to hijack another caller's session: a cross-caller request with attacker
+// keys is rejected (404) and never reaches an adapter.
+func TestThreeAgentResumeIdCrossCaller(t *testing.T) {
+	reg := runtime.NewRegistry()
+	mustRegister(t, reg, "codex", codexDesc, nil)
+	mustRegister(t, reg, "claude-code", claudeDesc, nil)
+	mustRegister(t, reg, "kimi", kimiDesc, nil)
+	backend := &threeAgentBackend{handles: make(map[string]*fakeHandle)}
+	h := NewHandler(Options{
+		Registry:     reg,
+		Store:        runtime.NewMemorySessionStore(),
+		Backend:      backend,
+		CallerTokens: map[string]string{testToken: testOwner, testTokenB: testOwnerB},
+		TurnTimeout:  5 * time.Second,
+		UsageGrace:   15 * time.Millisecond,
+		Enabled:      func(name string) bool { return true },
+	})
+	t.Cleanup(h.Close)
+	ts := httptest.NewServer(h.Routes())
+	t.Cleanup(ts.Close)
+
+	// Caller A creates a codex session.
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", false, defaultMessages()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("caller A: status = %d", resp.StatusCode)
+	}
+	sid := resp.Header.Get("X-Gateway-Session-Id")
+
+	// Caller B attempts to resume A's session with attacker resume keys.
+	attackBody := map[string]any{
+		"model":    "codex",
+		"messages": defaultMessages(),
+		"metadata": map[string]any{
+			"workspace_id":      testWorkspace,
+			"native_session_id": "attacker-native",
+			"codex_thread_id":   "attacker-thread",
+		},
+	}
+	resp2 := doAuthJSONH(t, "POST", ts.URL+"/v1/chat/completions", testTokenB, testOwnerB, attackBody,
+		map[string]string{"X-Gateway-Session-Id": sid})
+	if resp2.StatusCode != http.StatusNotFound {
+		t.Fatalf("cross-caller resume: status = %d, want 404 (body %s)", resp2.StatusCode, readBody(t, resp2))
 	}
 }
 
