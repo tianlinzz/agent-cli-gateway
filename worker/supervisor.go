@@ -586,6 +586,15 @@ func (ws *workerSession) Events() <-chan runtime.Event {
 	return ws.events
 }
 
+// snapshotClient returns the current gRPC client and worker PID under the lock.
+// The monitor goroutine starts before handshake assigns client/workerPID, so
+// any read that can race with handshake must go through here.
+func (ws *workerSession) snapshotClient() (*client, int) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	return ws.client, ws.workerPID
+}
+
 // Send delivers a turn to the worker.
 func (ws *workerSession) Send(ctx context.Context, input runtime.Input) error {
 	ws.mu.Lock()
@@ -774,10 +783,15 @@ func (ws *workerSession) heartbeat() {
 		select {
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), ws.sup.cfg.HeartbeatTimeout)
-			_, pid, err := ws.client.Health(ctx)
+			cl, expectedPID := ws.snapshotClient()
+			if cl == nil {
+				cancel()
+				continue
+			}
+			_, pid, err := cl.Health(ctx)
 			cancel()
-			if err == nil && int(pid) != ws.workerPID {
-				err = fmt.Errorf("worker pid changed from %d to %d", ws.workerPID, pid)
+			if err == nil && int(pid) != expectedPID {
+				err = fmt.Errorf("worker pid changed from %d to %d", expectedPID, pid)
 			}
 			if err == nil {
 				failures = 0
@@ -870,8 +884,13 @@ func (ws *workerSession) terminate(err error) {
 		if ws.stopping != nil {
 			close(ws.stopping)
 		}
-		if ws.client != nil {
-			ws.client.Close()
+		// Snapshot client under the lock: the monitor goroutine (started before
+		// handshake) can reach here while handshake is still assigning it.
+		ws.mu.Lock()
+		client := ws.client
+		ws.mu.Unlock()
+		if client != nil {
+			client.Close()
 		}
 		ws.sup.removeSession(ws.req.SessionID)
 		if ws.releaseSlot != nil {
@@ -927,7 +946,12 @@ dial:
 	if err != nil {
 		return fmt.Errorf("dial worker: %w", err)
 	}
+	// client/workerPID are read by the monitor goroutine (started before
+	// handshake) if the process exits mid-handshake, so their writes are
+	// guarded by ws.mu to avoid a data race with terminate.
+	ws.mu.Lock()
 	ws.client = c
+	ws.mu.Unlock()
 
 	var lastErr error
 	for {
@@ -935,7 +959,9 @@ dial:
 		version, pid, herr := c.Health(hctx)
 		cancel()
 		if herr == nil {
+			ws.mu.Lock()
 			ws.workerPID = int(pid)
+			ws.mu.Unlock()
 			slog.Debug("worker: handshake ok", "session", ws.req.SessionID, "version", version, "worker_pid", pid)
 			break
 		}

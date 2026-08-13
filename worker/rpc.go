@@ -84,6 +84,11 @@ type client struct {
 	c    workerpb.WorkerClient
 }
 
+// maxRPCMsgSize raises gRPC's default 4 MiB recv/send ceiling. Outbound
+// EventFrames (e.g. a large tool result) are otherwise unbounded and a single
+// frame over the default kills the event stream and the session.
+const maxRPCMsgSize = 16 * 1024 * 1024
+
 // dial connects a gRPC client to the worker endpoint. Connection is lazy;
 // the first RPC triggers the actual connect. The caller must call Close.
 func dial(ctx context.Context, ep Endpoint) (*client, error) {
@@ -93,6 +98,10 @@ func dial(ctx context.Context, ep Endpoint) (*client, error) {
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
 			return ep.DialContext(ctx)
 		}),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(maxRPCMsgSize),
+			grpc.MaxCallSendMsgSize(maxRPCMsgSize),
+		),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("worker: grpc dial: %w", err)
@@ -189,7 +198,10 @@ func Serve(ctx context.Context, ep Endpoint, h Handler) error {
 	if err != nil {
 		return fmt.Errorf("worker: serve: %w", err)
 	}
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(
+		grpc.MaxRecvMsgSize(maxRPCMsgSize),
+		grpc.MaxSendMsgSize(maxRPCMsgSize),
+	)
 	workerpb.RegisterWorkerServer(srv, &workerServer{h: h})
 
 	serveErr := make(chan error, 1)

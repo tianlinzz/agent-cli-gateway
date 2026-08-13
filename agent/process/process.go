@@ -2,7 +2,6 @@
 package process
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -185,19 +184,40 @@ func (p *Process) ForceKill() error {
 	return forceKillProcessGroup(p.cmd)
 }
 
+// defaultStderrCap bounds captured child stderr to the recent tail. A chatty
+// CLI run with --verbose over a long-lived session could otherwise exhaust
+// worker memory.
+const defaultStderrCap = 256 * 1024
+
+// lockedBuffer is a bounded, mutex-guarded buffer that retains the most recent
+// tail of what is written to it. It never grows beyond roughly 2*max bytes
+// transiently; once it crosses 2*max it is trimmed back to the last max bytes.
 type lockedBuffer struct {
-	mu sync.Mutex
-	b  bytes.Buffer
+	mu  sync.Mutex
+	b   []byte
+	max int
+}
+
+func (b *lockedBuffer) cap() int {
+	if b.max > 0 {
+		return b.max
+	}
+	return defaultStderrCap
 }
 
 func (b *lockedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.b.Write(p)
+	b.b = append(b.b, p...)
+	if cap := 2 * b.cap(); len(b.b) > cap {
+		tail := b.cap()
+		b.b = append([]byte(nil), b.b[len(b.b)-tail:]...)
+	}
+	return len(p), nil
 }
 
 func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.b.String()
+	return string(b.b)
 }

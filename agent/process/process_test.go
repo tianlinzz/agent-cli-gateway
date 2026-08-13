@@ -12,6 +12,33 @@ import (
 	"time"
 )
 
+// TestLockedBufferBoundedToTail is a regression test for O-B1: captured stderr
+// must be bounded so a chatty CLI (--verbose) over a long-lived session cannot
+// exhaust worker memory. The most recent tail is preserved for diagnostics.
+func TestLockedBufferBoundedToTail(t *testing.T) {
+	var b lockedBuffer
+	b.max = 256
+
+	var sb strings.Builder
+	for i := 0; i < 100; i++ {
+		chunk := []byte(fmt.Sprintf("chunk-%03d-", i) + strings.Repeat("y", 20) + "\n")
+		sb.Write(chunk)
+		b.Write(chunk)
+	}
+	got := b.String()
+	if len(got) > 2*b.max {
+		t.Fatalf("stderr buffer grew to %d bytes, want <= %d", len(got), 2*b.max)
+	}
+	// The recent tail is preserved exactly.
+	if want := sb.String(); !strings.HasSuffix(want, got) {
+		t.Fatalf("bounded buffer did not preserve the recent tail; got suffix %q", got)
+	}
+	// The earliest content has been evicted.
+	if strings.Contains(got, "chunk-000-") {
+		t.Fatalf("earliest stderr was not evicted: %q", got)
+	}
+}
+
 func TestStartUsesDirectoryEnvironmentAndPipes(t *testing.T) {
 	t.Setenv("GO_WANT_AGENT_PROCESS_HELPER", "1")
 	dir := t.TempDir()
