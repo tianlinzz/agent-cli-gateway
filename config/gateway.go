@@ -26,6 +26,15 @@ const (
 	PermissionDeny = "deny"
 )
 
+// agentsHonoringTurnTimeout lists the adapters that currently consume the
+// per-agent agents.<id>.timeout setting as a native turn bound. Other adapters
+// silently ignore it today, so a configured timeout on them is a
+// misconfiguration that fails closed at startup. This set is removed once the
+// unified turn-deadline contract (O-F09b) makes every adapter honor it.
+var agentsHonoringTurnTimeout = map[string]bool{
+	"kimi": true,
+}
+
 // Seccomp policy modes for IsolationConfig.Seccomp.Policy.
 const (
 	SeccompKafel = "kafel"
@@ -414,6 +423,13 @@ func (c *GatewayConfig) Validate() error {
 		default:
 			return fmt.Errorf("config: agents.%s.permission %q invalid (want %q, %q, or %q)",
 				name, agent.Permission, PermissionAuto, PermissionAsk, PermissionDeny)
+		}
+		// Per-agent timeout is consumed by only some adapters today; the rest
+		// silently ignore it. Fail closed so an operator never configures a
+		// safety bound that is then dropped. Removed by the unified
+		// turn-deadline contract (O-F09b).
+		if agent.Timeout > 0 && !agentsHonoringTurnTimeout[name] {
+			return fmt.Errorf("config: agents.%s.timeout is not honored by this adapter (only the kimi adapter consumes per-agent timeout today); remove this setting", name)
 		}
 	}
 	if c.Mode == ModeProd {

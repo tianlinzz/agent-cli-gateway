@@ -89,6 +89,9 @@ models = ["sonnet", "opus", "haiku"]
 enabled = true
 command = "kimi"
 permission = "auto"
+# Per-agent turn bound. Only the kimi adapter honors agents.<id>.timeout today;
+# configuring it on codex or claude-code fails closed at startup until the
+# unified turn-deadline contract lands.
 timeout = "30m"
 models = ["kimi-k3", "deepseek-v4-flash"]
 # inject_system_prompt = false
