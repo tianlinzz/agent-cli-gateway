@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -129,6 +130,10 @@ func (h *fakeHandle) Abort(ctx context.Context) error {
 }
 
 func (h *fakeHandle) Aborted() <-chan struct{} { return h.aborted }
+
+// Done exposes the terminal signal (closed by Close) so the handle satisfies the
+// terminatingHandle capability the watcher in registerHandle listens for.
+func (h *fakeHandle) Done() <-chan struct{} { return h.closed }
 
 func (h *fakeHandle) setOnAbort(onAbort func(h *fakeHandle)) {
 	h.mu.Lock()
@@ -334,6 +339,119 @@ func TestHandlerPruneLoopEvictsExpiredRecordAndClosesHandle(t *testing.T) {
 	case <-fh.closed:
 	case <-time.After(time.Second):
 		t.Fatal("expired session handle was not closed by prune loop")
+	}
+}
+
+// TestHandlerDeadHandleDroppedWithoutRequest is a regression test for the
+// U1 dead-handle closure (Done()): a worker/CLI that dies while the session is
+// idle must be dropped from the handle map promptly, without waiting for TTL
+// prune or the next request to discover it.
+func TestHandlerDeadHandleDroppedWithoutRequest(t *testing.T) {
+	reg := runtime.NewRegistry()
+	mustRegister(t, reg, "codex", codexDesc, nil)
+	h, _ := newTestHandler(t, nil)
+
+	fh := newFakeHandle(nil)
+	const sid = "sess-idle-death"
+	h.registerHandle(sid, fh)
+	if h.getHandle(sid) == nil {
+		t.Fatal("handle not registered")
+	}
+	// The worker dies while idle (Done() fires). The watcher must drop the
+	// handle without any request arriving.
+	fh.Close(context.Background())
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && h.getHandle(sid) != nil {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := h.getHandle(sid); got != nil {
+		t.Fatalf("idle-dead handle not dropped by Done() watcher: %v", got)
+	}
+}
+
+// TestHandlerPruneReclaimsSessionsAtScale is the 1000-session churn regression:
+// after a burst of sessions expire, store records, cached handles, and tool
+// ledgers all reclaim, and every per-handle termination watcher exits.
+func TestHandlerPruneReclaimsSessionsAtScale(t *testing.T) {
+	reg := runtime.NewRegistry()
+	mustRegister(t, reg, "codex", codexDesc, nil)
+	store := runtime.NewMemorySessionStore()
+	// Controllable clock so records are alive during creation and expired only
+	// after we advance time, avoiding a race between creation and the prune loop.
+	// Guarded because the prune loop reads it from another goroutine.
+	var clockMu sync.Mutex
+	clock := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	nowFn := func() time.Time { clockMu.Lock(); defer clockMu.Unlock(); return clock }
+	h := NewHandler(Options{
+		Registry:         reg,
+		Store:            store,
+		Backend:          newFakeBackend(),
+		SessionRecordTTL: time.Hour,
+		PruneInterval:    5 * time.Millisecond,
+		Now:              nowFn,
+	})
+	t.Cleanup(h.Close)
+
+	ctx := context.Background()
+	const n = 1000
+	handles := make([]*fakeHandle, 0, n)
+	for i := 0; i < n; i++ {
+		id := "sess-" + strconv.Itoa(i)
+		rec := runtime.SessionRecord{
+			ID: id, CallerID: testOwner, ModelID: "codex",
+			Status: runtime.SessionActive, ExpiresAt: clock.Add(time.Hour), // alive vs clock
+		}
+		if err := store.Create(ctx, rec); err != nil {
+			t.Fatalf("Create(%s): %v", id, err)
+		}
+		fh := newFakeHandle(nil)
+		h.registerHandle(id, fh)
+		h.recordServerToolID(id, "tool-"+strconv.Itoa(i))
+		handles = append(handles, fh)
+	}
+	h.mu.Lock()
+	startHandles := len(h.handles)
+	h.mu.Unlock()
+	if startHandles != n {
+		t.Fatalf("registered %d handles, want %d", startHandles, n)
+	}
+
+	// Advance the clock past every record's TTL; the prune loop then evicts all.
+	clockMu.Lock()
+	clock = clock.Add(2 * time.Hour)
+	clockMu.Unlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		remaining := len(h.handles)
+		h.mu.Unlock()
+		if remaining == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	h.mu.Lock()
+	remainingHandles := len(h.handles)
+	remainingLedgers := len(h.serverToolIDs)
+	h.mu.Unlock()
+	if remainingHandles != 0 {
+		t.Fatalf("%d handles leaked after prune (want 0)", remainingHandles)
+	}
+	if remainingLedgers != 0 {
+		t.Fatalf("%d tool ledgers leaked after prune (want 0)", remainingLedgers)
+	}
+	if recs, _ := store.List(ctx, testOwner); len(recs) != 0 {
+		t.Fatalf("%d records leaked after prune (want 0)", len(recs))
+	}
+	// Every termination watcher exited: dropHandleByID closed each handle, so
+	// its Done() channel is closed.
+	for i, fh := range handles {
+		select {
+		case <-fh.closed:
+		default:
+			t.Fatalf("watcher for sess-%d did not close its handle", i)
+		}
 	}
 }
 
@@ -1935,16 +2053,16 @@ func TestNormalizer_NoWorkDirInjection(t *testing.T) {
 			}},
 		},
 		"metadata": map[string]any{
-			"workdir":            "/etc",
-			"cwd":                "/tmp",
-			"working_directory":  "/var",
-			"workspace_id":       "ws-norm",
-			"trace_id":           "abc",
-			"native_session_id":  "attacker-native",
-			"codex_thread_id":    "attacker-thread",
-			"claude_session_id":  "attacker-claude",
-			"kimi_session_id":    "attacker-kimi",
-			"Native_Session_ID":  "attacker-cased",
+			"workdir":           "/etc",
+			"cwd":               "/tmp",
+			"working_directory": "/var",
+			"workspace_id":      "ws-norm",
+			"trace_id":          "abc",
+			"native_session_id": "attacker-native",
+			"codex_thread_id":   "attacker-thread",
+			"claude_session_id": "attacker-claude",
+			"kimi_session_id":   "attacker-kimi",
+			"Native_Session_ID": "attacker-cased",
 		},
 	}
 	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body)

@@ -106,10 +106,10 @@ type Handler struct {
 	newID func() string
 	now   func() time.Time
 
-	recordTTL  time.Duration
-	pruneStop  chan struct{}
-	pruneDone  chan struct{}
-	pruneClose sync.Once
+	recordTTL     time.Duration
+	stop          chan struct{} // closed in Close; bounds pruneLoop + handle watchers
+	pruneLoopDone chan struct{} // non-nil only when the prune loop is running
+	closeOnce     sync.Once
 
 	mu                 sync.Mutex
 	handles            map[string]runtime.ExecutionHandle // sessionID -> live execution
@@ -307,36 +307,41 @@ func NewHandler(opts Options) *Handler {
 		serverToolIDs:   make(map[string]*serverToolLedger),
 	}
 	h.catalog = &modelCatalog{reg: opts.Registry, enabled: opts.Enabled, models: opts.Models}
+	// stop is always created so Close can signal every background goroutine
+	// (prune loop + handle-termination watchers) even when record expiry is off.
+	h.stop = make(chan struct{})
 	// A record TTL with a positive interval runs a background prune loop that
-	// bounds session-record and handle growth. It is stopped by Close.
+	// bounds session-record and handle growth.
 	if h.recordTTL > 0 && opts.PruneInterval > 0 {
-		h.pruneStop = make(chan struct{})
-		h.pruneDone = make(chan struct{})
+		h.pruneLoopDone = make(chan struct{})
 		go h.pruneLoop(opts.PruneInterval)
 	}
 	return h
 }
 
-// Close stops the background prune loop. It is safe to call concurrently and
-// more than once. The HTTP server and execution backend are owned by the
-// caller and are not closed here.
+// Close stops the background prune loop and the handle-termination watchers.
+// It is safe to call concurrently and more than once. The HTTP server and
+// execution backend are owned by the caller and are not closed here.
 func (h *Handler) Close() {
-	if h.pruneStop == nil {
+	if h.stop == nil {
 		return
 	}
-	h.pruneClose.Do(func() { close(h.pruneStop) })
-	<-h.pruneDone
+	h.closeOnce.Do(func() { close(h.stop) })
+	if h.pruneLoopDone != nil {
+		<-h.pruneLoopDone
+	}
 }
 
 // pruneLoop periodically evicts expired session records and drops their cached
 // execution handles so neither grows unbounded over the process lifetime.
+// Active turns are exempt (see SessionStore.Prune).
 func (h *Handler) pruneLoop(interval time.Duration) {
-	defer close(h.pruneDone)
+	defer close(h.pruneLoopDone)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-h.pruneStop:
+		case <-h.stop:
 			return
 		case <-ticker.C:
 			removed, err := h.store.Prune(context.Background(), h.now())
@@ -458,15 +463,35 @@ func cloneStringMap(in map[string]string) map[string]string {
 
 // registerHandle stores a live execution handle for a session, returning any
 // pre-existing handle if one is already registered (single execution per
-// session).
+// session). When the handle exposes a terminal signal, a watcher drops it the
+// moment the underlying worker/CLI dies — even while the session is idle and
+// no request observes it — so a dead handle never lingers for TTL prune or the
+// next request to discover.
 func (h *Handler) registerHandle(sessionID string, handle runtime.ExecutionHandle) runtime.ExecutionHandle {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if existing, ok := h.handles[sessionID]; ok {
+		h.mu.Unlock()
 		return existing
 	}
 	h.handles[sessionID] = handle
+	h.mu.Unlock()
+	if th, ok := handle.(terminatingHandle); ok {
+		go h.watchHandleTermination(sessionID, handle, th)
+	}
 	return handle
+}
+
+// watchHandleTermination drops the handle when its execution terminates or the
+// Handler shuts down. It removes only the cached handle (not the session's tool
+// ledger): the session record may still be live and resume later via a fresh
+// execution, in which case the replay ledger must persist. dropHandle's
+// same-handle check makes it idempotent.
+func (h *Handler) watchHandleTermination(sessionID string, handle runtime.ExecutionHandle, th terminatingHandle) {
+	select {
+	case <-th.Done():
+		h.dropHandle(sessionID, handle)
+	case <-h.stop:
+	}
 }
 
 func (h *Handler) getHandle(sessionID string) runtime.ExecutionHandle {
@@ -486,11 +511,12 @@ func (h *Handler) dropHandle(sessionID string, handle runtime.ExecutionHandle) {
 }
 
 // dropHandleByID removes and closes whatever handle is registered under
-// sessionID. It is used by the prune loop to reclaim a handle whose session
-// record has expired. The close runs in a bounded goroutine so a wedged
-// teardown can never stall the prune loop. Because an in-flight turn refreshes
-// the record's TTL (see chat_completions.go), an expired record guarantees no
-// active turn, so closing its handle is always safe.
+// sessionID and clears the session's tool-replay ledger. It is used by the
+// prune loop to reclaim a handle whose session record has expired and been
+// physically removed — the session is gone, so its ledger is too. The close
+// runs in a bounded goroutine so a wedged teardown can never stall the prune
+// loop. Prune exempts active turns, so an evicted record guarantees no turn is
+// in flight and closing its handle is safe.
 func (h *Handler) dropHandleByID(sessionID string) {
 	h.mu.Lock()
 	handle, ok := h.handles[sessionID]
@@ -498,6 +524,7 @@ func (h *Handler) dropHandleByID(sessionID string) {
 		delete(h.handles, sessionID)
 	}
 	h.mu.Unlock()
+	h.clearServerToolIDs(sessionID)
 	if !ok || handle == nil {
 		return
 	}

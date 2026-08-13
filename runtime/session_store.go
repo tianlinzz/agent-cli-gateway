@@ -129,7 +129,10 @@ func (s *memSessionStore) Get(ctx context.Context, id, callerID string) (Session
 	if rec.CallerID != callerID {
 		return SessionRecord{}, fmt.Errorf("%w: session %q", ErrSessionForbidden, id)
 	}
-	if expired(rec, time.Now()) {
+	// An active turn is never expired: its record may be read while the turn
+	// runs even if ExpiresAt has passed (the TTL is refreshed at turn start,
+	// but a turn longer than the TTL is still in flight and must not vanish).
+	if prunable(rec, time.Now()) {
 		s.purgeExpired(id, callerID)
 		return SessionRecord{}, fmt.Errorf("%w: %q (expired)", ErrSessionNotFound, id)
 	}
@@ -243,10 +246,16 @@ func (s *memSessionStore) Prune(ctx context.Context, now time.Time) ([]string, e
 	defer s.mu.Unlock()
 	var removed []string
 	for id, rec := range s.byID {
-		if expired(rec, now) {
-			delete(s.byID, id)
-			removed = append(removed, id)
+		// An expired record is removable only if no turn is in flight on it:
+		// pruning an active turn would delete its metadata and (at the API
+		// layer) close the handle of a turn that is still executing. Active
+		// turns are exempt regardless of TTL; they are re-evaluated once the
+		// turn ends and the record becomes SessionActive again.
+		if !prunable(rec, now) {
+			continue
 		}
+		delete(s.byID, id)
+		removed = append(removed, id)
 	}
 	return removed, nil
 }
@@ -264,11 +273,12 @@ func (s *memSessionStore) lookupLocked(id, callerID string) (SessionRecord, erro
 }
 
 // purgeExpired removes an expired session under a write lock, re-checking
-// identity and expiry so a concurrent create/touch is never clobbered.
+// identity, expiry, and that no turn is in flight so a concurrent create/touch
+// or an active turn is never clobbered.
 func (s *memSessionStore) purgeExpired(id, callerID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if rec, ok := s.byID[id]; ok && rec.CallerID == callerID && expired(rec, time.Now()) {
+	if rec, ok := s.byID[id]; ok && rec.CallerID == callerID && prunable(rec, time.Now()) {
 		delete(s.byID, id)
 	}
 }
@@ -276,4 +286,10 @@ func (s *memSessionStore) purgeExpired(id, callerID string) {
 // expired reports whether rec has a non-zero ExpiresAt that has passed.
 func expired(rec SessionRecord, now time.Time) bool {
 	return !rec.ExpiresAt.IsZero() && !rec.ExpiresAt.After(now)
+}
+
+// prunable reports whether rec is safe to physically remove now: it must be
+// expired and must not have a turn in flight.
+func prunable(rec SessionRecord, now time.Time) bool {
+	return expired(rec, now) && rec.Status != SessionTurnActive
 }

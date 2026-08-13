@@ -305,6 +305,50 @@ func TestSessionStoreTouchAndExpiry(t *testing.T) {
 	}
 }
 
+// TestSessionStorePruneExemptsActiveTurn is a regression test for the U1
+// active-turn prune bug: Prune and lazy Get purge must never remove a session
+// that has a turn in flight, even if ExpiresAt has passed. A long turn that
+// exceeds the record TTL must keep running, not have its record/handle yanked.
+func TestSessionStorePruneExemptsActiveTurn(t *testing.T) {
+	store := runtime.NewMemorySessionStore()
+	ctx := context.Background()
+	rec := sessionRec("active-turn", "alice")
+	rec.ExpiresAt = time.Now().Add(-time.Minute) // already past TTL
+	if err := store.Create(ctx, rec); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Begin a turn: the record is now active AND expired.
+	if err := store.BeginTurn(ctx, "active-turn", "alice"); err != nil {
+		t.Fatalf("BeginTurn: %v", err)
+	}
+
+	// Prune must NOT remove the active-turn record.
+	removed, err := store.Prune(ctx, time.Now())
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("Prune removed active turn: %v", removed)
+	}
+	// Lazy Get must still return it (not purge/treat as expired).
+	got, err := store.Get(ctx, "active-turn", "alice")
+	if err != nil {
+		t.Fatalf("Get active turn: %v", err)
+	}
+	if got.Status != runtime.SessionTurnActive {
+		t.Fatalf("status = %q, want turn_active", got.Status)
+	}
+
+	// Once the turn ends, the (still-expired) record becomes prunable.
+	if err := store.EndTurn(ctx, "active-turn", "alice"); err != nil {
+		t.Fatalf("EndTurn: %v", err)
+	}
+	removed, _ = store.Prune(ctx, time.Now())
+	if len(removed) != 1 || removed[0] != "active-turn" {
+		t.Fatalf("Prune after EndTurn removed %v, want [active-turn]", removed)
+	}
+}
+
 func TestSessionStoreDelete(t *testing.T) {
 	store := runtime.NewMemorySessionStore()
 	ctx := context.Background()
