@@ -449,6 +449,14 @@ func (s *Session) monitor() {
 		}
 	}
 	s.close.Do(func() {
+		// Cancel first so any emitter blocked in emit's select returns, then
+		// wait for the JSON-RPC notification drain goroutine to stop calling
+		// notify before closing s.events. Otherwise a drain mid-emit would
+		// send on a closed channel.
+		s.cancel()
+		if ch := s.rpc.NotifyDone(); ch != nil {
+			<-ch
+		}
 		close(s.events)
 		close(s.done)
 	})

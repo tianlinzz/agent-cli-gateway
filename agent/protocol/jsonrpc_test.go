@@ -100,6 +100,57 @@ func TestJSONRPCDispatchesNotificationAndReverseRequest(t *testing.T) {
 	}
 }
 
+// TestJSONRPCStalledNotifyDoesNotBlockResponses is a regression test for O-A2:
+// the reader loop used to dispatch notifications inline, so a stalled consumer
+// (e.g. a full downstream events channel) blocked the reader and stalled every
+// RPC response, including the in-flight turn's own response. Notifications are
+// now drained on a separate goroutine, so a stalled notify must not block
+// response correlation.
+func TestJSONRPCStalledNotifyDoesNotBlockResponses(t *testing.T) {
+	serverRead, clientIn := io.Pipe()
+	clientOut, serverWrite := io.Pipe()
+	proceed := make(chan struct{})          // held open to stall the notify consumer
+	notifyEntered := make(chan struct{}, 1) // signaled once notify is stalled
+	client := NewJSONRPCClient(clientIn, clientOut, 1024, nil,
+		func(RPCMessage) {
+			select {
+			case notifyEntered <- struct{}{}:
+			default:
+			}
+			<-proceed // simulate a stalled consumer
+		},
+	)
+	t.Cleanup(func() {
+		close(proceed) // unblock the stalled notify so the drain goroutine exits
+		_ = client.Close()
+	})
+
+	// 1. A notification that stalls the drain goroutine inside notify.
+	writeRPCMessage(t, serverWrite, RPCMessage{JSONRPC: "2.0", Method: "turn/started"})
+	select {
+	case <-notifyEntered:
+	case <-time.After(time.Second):
+		t.Fatal("notify never entered (drain goroutine not running)")
+	}
+
+	// 2. While notify is stalled, issue a Call and deliver its response.
+	callDone := make(chan error, 1)
+	go func() { callDone <- client.Call(context.Background(), "turn/start", nil, nil) }()
+	time.Sleep(30 * time.Millisecond) // let the Call write its request
+	writeRPCMessage(t, serverWrite, RPCMessage{JSONRPC: "2.0", ID: json.RawMessage(`1`), Result: json.RawMessage(`null`)})
+	_ = readRPCMessages(t, serverRead, 1) // drain the request the Call wrote
+
+	// 3. The Call must complete despite notify being stalled.
+	select {
+	case err := <-callDone:
+		if err != nil {
+			t.Fatalf("Call returned error while notify stalled: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Call did not complete while notify was stalled — reader loop was blocked by notify")
+	}
+}
+
 func TestJSONRPCCanceledCallDoesNotPoisonLaterCalls(t *testing.T) {
 	serverRead, clientIn := io.Pipe()
 	clientOut, serverWrite := io.Pipe()

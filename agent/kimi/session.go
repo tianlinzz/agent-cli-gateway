@@ -140,6 +140,13 @@ func (s *Session) runPrompt(ctx context.Context, turn *activePrompt, prompt stri
 }
 
 func (s *Session) completePrompt(turn *activePrompt, stopReason string, promptErr error) {
+	// session/prompt's response arrives on the wire after the turn's
+	// session/update notifications. The JSON-RPC reader correlates the response
+	// immediately (so abort/cancel RPCs are never blocked by a stalled event
+	// consumer), so drain those notifications BEFORE finalizing the turn: later
+	// handlers (e.g. tool_call_update) consult s.active, which is cleared below,
+	// and the consumer reads events up to the finish we emit last.
+	s.rpc.Sync()
 	s.mu.Lock()
 	if turn.completed {
 		s.mu.Unlock()
@@ -331,7 +338,18 @@ func (s *Session) monitor() {
 			s.emit(Event{Kind: EventError, Err: protocolError("ACP exited: %s", message)})
 		}
 	}
-	s.close.Do(func() { close(s.events); close(s.done) })
+	s.close.Do(func() {
+		// Cancel first so any emitter blocked in emit's select returns, then
+		// wait for the JSON-RPC notification drain goroutine to stop calling
+		// notify before closing s.events. Otherwise a drain mid-emit would
+		// send on a closed channel.
+		s.cancel()
+		if ch := s.rpc.NotifyDone(); ch != nil {
+			<-ch
+		}
+		close(s.events)
+		close(s.done)
+	})
 }
 
 func (s *Session) cleanupFailedStart() {
