@@ -213,6 +213,10 @@ type AgentConfig struct {
 	// Env adds environment variables for the agent CLI.
 	Env    map[string]string `toml:"env"`
 	Models []string          `toml:"models"`
+	// InjectSystemPrompt forwards the caller-supplied system role messages into
+	// the native prompt at each turn. Default false: system messages are
+	// ignored so a client cannot pollute the agent's own tool/skill surface.
+	InjectSystemPrompt bool `toml:"inject_system_prompt"`
 }
 
 // DefaultGatewayConfig returns the recommended defaults. nsjail

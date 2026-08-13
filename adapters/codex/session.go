@@ -11,13 +11,14 @@ import (
 )
 
 type session struct {
-	native nativeSession
-	events chan runtime.Event
-	mu     sync.Mutex
+	native       nativeSession
+	events       chan runtime.Event
+	mu           sync.Mutex
+	injectSystem bool
 }
 
-func wrapSession(nativeSession nativeSession) *session {
-	s := &session{native: nativeSession, events: make(chan runtime.Event, 64)}
+func wrapSession(nativeSession nativeSession, injectSystem bool) *session {
+	s := &session{native: nativeSession, events: make(chan runtime.Event, 64), injectSystem: injectSystem}
 	go func() {
 		defer close(s.events)
 		for event := range nativeSession.Events() {
@@ -30,7 +31,26 @@ func wrapSession(nativeSession nativeSession) *session {
 func (s *session) Send(ctx context.Context, input runtime.Input) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.native.Send(ctx, native.Input{Prompt: lastUserMessage(input)})
+	return s.native.Send(ctx, native.Input{Prompt: promptForNative(input, s.injectSystem)})
+}
+
+// promptForNative builds the native prompt from a canonical turn. When
+// injectSystem is true the caller's system role messages are prepended to the
+// latest user message; otherwise only the latest user message is forwarded so
+// a client cannot pollute the agent's own tool/skill surface.
+func promptForNative(input runtime.Input, injectSystem bool) string {
+	var parts []string
+	if injectSystem {
+		for _, message := range input.Messages {
+			if message.Role == "system" && strings.TrimSpace(message.Content) != "" {
+				parts = append(parts, message.Content)
+			}
+		}
+	}
+	if user := lastUserMessage(input); user != "" {
+		parts = append(parts, user)
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 func lastUserMessage(input runtime.Input) string {

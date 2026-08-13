@@ -341,7 +341,7 @@ func fromProtoStartRequest(p *workerpb.StartSessionRequest) (StartSessionReq, er
 func toProtoAgentConfig(c runtime.AgentExecutionConfig) *workerpb.AgentExecutionConfig {
 	return &workerpb.AgentExecutionConfig{Command: c.Command, DefaultModel: c.DefaultModel,
 		Permission: c.Permission, TurnTimeoutNanos: c.TurnTimeout.Nanoseconds(),
-		MaxConcurrency: int32(c.MaxConcurrency), Env: c.Env}
+		MaxConcurrency: int32(c.MaxConcurrency), Env: c.Env, InjectSystemPrompt: c.InjectSystemPrompt}
 }
 
 func fromProtoAgentConfig(c *workerpb.AgentExecutionConfig) runtime.AgentExecutionConfig {
@@ -350,7 +350,7 @@ func fromProtoAgentConfig(c *workerpb.AgentExecutionConfig) runtime.AgentExecuti
 	}
 	return runtime.AgentExecutionConfig{Command: c.Command, DefaultModel: c.DefaultModel,
 		Permission: c.Permission, TurnTimeout: time.Duration(c.TurnTimeoutNanos),
-		MaxConcurrency: int(c.MaxConcurrency), Env: c.Env}
+		MaxConcurrency: int(c.MaxConcurrency), Env: c.Env, InjectSystemPrompt: c.InjectSystemPrompt}
 }
 
 func toProtoInput(in runtime.Input) (*workerpb.Input, error) {

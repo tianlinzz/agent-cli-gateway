@@ -147,6 +147,13 @@ teardown. `adapters/<name>` only converts trusted configuration, prompts,
 events, and lifecycle calls to the canonical `runtime.AgentAdapter` contract.
 There is no per-turn CLI fallback.
 
+Caller `system` role messages are **ignored by default**: they are where agent
+frameworks dump their own tool/skill libraries, and forwarding them would
+pollute the native agent's own tool/skill surface. A deployment that wants to
+let callers steer a specific agent sets `inject_system_prompt = true`, which
+prepends the caller's system messages (as plain text instructions, never tool
+or skill definitions) to each turn's prompt.
+
 Abort is turn-scoped. Codex sends `turn/interrupt`; Kimi sends
 `session/cancel`; a successful cancellation leaves the Worker and Agent
 process available for the next turn. Claude Code's current stream-json surface
@@ -202,6 +209,7 @@ See [`config.example.toml`](config.example.toml) for a full annotated example.
 | `[isolation.seccomp]` | `policy` | `kafel` | `kafel` or `off` (test only) |
 | `[agents.<id>]` | `enabled` | `true` | Whether the agent is available |
 | `[agents.<id>]` | `permission` | `auto` | `auto` / `ask` / `deny` |
+| `[agents.<id>]` | `inject_system_prompt` | `false` | Forward caller `system` role messages into the native prompt each turn |
 
 Agent settings are passed to the single-session worker over the canonical RPC
 contract; provider secrets remain worker/container environment configuration.

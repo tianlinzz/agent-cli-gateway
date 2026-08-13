@@ -63,7 +63,7 @@ func TestSessionSendsOnlyLatestUserMessageToNativeAgent(t *testing.T) {
 	}}
 
 	freshNative := newFakeSession("")
-	if err := wrapSession(freshNative).Send(context.Background(), input); err != nil {
+	if err := wrapSession(freshNative, false).Send(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
 	if freshNative.input.Prompt != "second" {
@@ -71,7 +71,7 @@ func TestSessionSendsOnlyLatestUserMessageToNativeAgent(t *testing.T) {
 	}
 
 	resumeNative := newFakeSession("native-1")
-	if err := wrapSession(resumeNative).Send(context.Background(), input); err != nil {
+	if err := wrapSession(resumeNative, false).Send(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
 	if resumeNative.input.Prompt != "second" {
@@ -79,9 +79,26 @@ func TestSessionSendsOnlyLatestUserMessageToNativeAgent(t *testing.T) {
 	}
 }
 
+func TestSessionInjectsSystemPromptWhenEnabled(t *testing.T) {
+	nativeSession := newFakeSession("native-1")
+	input := runtime.Input{Messages: []runtime.Message{
+		{Role: "system", Content: "be exact"},
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: "previous answer"},
+		{Role: "tool", Content: "tool result"},
+		{Role: "user", Content: "second"},
+	}}
+	if err := wrapSession(nativeSession, true).Send(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+	if want := "be exact\n\nsecond"; nativeSession.input.Prompt != want {
+		t.Fatalf("prompt = %q, want %q (system prepended, assistant/tool ignored)", nativeSession.input.Prompt, want)
+	}
+}
+
 func TestSessionMapsEveryNativeEventAndDelegatesLifecycle(t *testing.T) {
 	nativeSession := newFakeSession("native-1")
-	session := wrapSession(nativeSession)
+	session := wrapSession(nativeSession, false)
 	nativeSession.events <- native.Event{Kind: native.EventText, Text: "text"}
 	nativeSession.events <- native.Event{Kind: native.EventReasoning, Reasoning: &native.Reasoning{ID: "reason-1", Text: "thought"}}
 	nativeSession.events <- native.Event{Kind: native.EventToolUse, Tool: &native.ToolCall{ID: "tool-1", Name: "Shell", Arguments: map[string]any{"command": "pwd"}}}

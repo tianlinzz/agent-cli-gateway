@@ -74,6 +74,7 @@ message AgentExecutionConfig {
   int64 turn_timeout_nanos = 4;
   int32 max_concurrency = 5;
   map<string, string> env = 6;
+  bool inject_system_prompt = 7;
 }
 
 message StartSessionResponse {

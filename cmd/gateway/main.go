@@ -41,7 +41,8 @@ func agentExecutionConfigs(in map[string]config.AgentConfig) map[string]runtime.
 			env[k] = v
 		}
 		out[name] = runtime.AgentExecutionConfig{Command: c.Command, DefaultModel: c.DefaultModel,
-			Permission: c.Permission, TurnTimeout: c.Timeout, MaxConcurrency: c.MaxConcurrency, Env: env}
+			Permission: c.Permission, TurnTimeout: c.Timeout, MaxConcurrency: c.MaxConcurrency, Env: env,
+			InjectSystemPrompt: c.InjectSystemPrompt}
 	}
 	return out
 }

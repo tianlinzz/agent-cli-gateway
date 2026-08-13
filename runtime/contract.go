@@ -21,6 +21,9 @@ type AgentExecutionConfig struct {
 	TurnTimeout    time.Duration
 	MaxConcurrency int
 	Env            map[string]string
+	// InjectSystemPrompt forwards caller-supplied system role messages into the
+	// native prompt at each turn (default false).
+	InjectSystemPrompt bool
 }
 
 // Descriptor is the static description of an adapter as seen by the model

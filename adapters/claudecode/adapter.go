@@ -29,6 +29,9 @@ type Options struct {
 	AllowedTools       []string
 	DisallowedTools    []string
 	MaxContextTokens   int
+	// InjectSystemPrompt forwards caller-supplied system role messages into the
+	// native prompt at each turn.
+	InjectSystemPrompt bool
 }
 
 type nativeSession interface {
@@ -58,6 +61,7 @@ func New(_ context.Context, _ string) (runtime.AgentAdapter, error) {
 		Permission:         envOrDefault("CC_GATEWAY_CLAUDE_PERMISSION", "auto"),
 		SystemPrompt:       envOrDefault("CC_GATEWAY_CLAUDE_SYSTEM_PROMPT", ""),
 		AppendSystemPrompt: envOrDefault("CC_GATEWAY_CLAUDE_APPEND_PROMPT", ""),
+		InjectSystemPrompt: envBool("CC_GATEWAY_CLAUDE_INJECT_SYSTEM_PROMPT"),
 	}
 	if raw := envOrDefault("CC_GATEWAY_CLAUDE_ENV", ""); raw != "" {
 		opts.Env = splitEnv(raw)
@@ -123,7 +127,7 @@ func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.
 	if err != nil {
 		return nil, err
 	}
-	return wrapSession(session), nil
+	return wrapSession(session, a.opts.InjectSystemPrompt), nil
 }
 
 func splitCommand(command string) []string {
@@ -139,6 +143,15 @@ func envOrDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func envBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func splitEnv(raw string) []string {

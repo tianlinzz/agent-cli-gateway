@@ -47,7 +47,7 @@ func TestStartMapsTrustedOptionsAndNativeResumeID(t *testing.T) {
 
 func TestSessionMapsNativeEventsToRuntime(t *testing.T) {
 	nativeSession := newFakeNativeSession()
-	session := wrapSession(nativeSession)
+	session := wrapSession(nativeSession, false)
 	nativeSession.events <- native.Event{Kind: native.EventText, Text: "hello"}
 	nativeSession.events <- native.Event{Kind: native.EventReasoning, Reasoning: &native.Reasoning{ID: "reason-1", Text: "safe summary"}}
 	nativeSession.events <- native.Event{Kind: native.EventToolUse, Tool: &native.ToolCall{ID: "tool-1", Name: "Read", Arguments: map[string]any{"file_path": "a.go"}}}
@@ -76,7 +76,7 @@ func TestSessionMapsNativeEventsToRuntime(t *testing.T) {
 
 func TestSessionConvertsLastUserMessageAndDelegatesLifecycle(t *testing.T) {
 	nativeSession := newFakeNativeSession()
-	session := wrapSession(nativeSession)
+	session := wrapSession(nativeSession, false)
 	err := session.Send(context.Background(), runtime.Input{Messages: []runtime.Message{
 		{Role: "system", Content: "system"},
 		{Role: "user", Content: "first"},
@@ -97,6 +97,23 @@ func TestSessionConvertsLastUserMessageAndDelegatesLifecycle(t *testing.T) {
 	}
 	if nativeSession.abortCalls != 1 || nativeSession.closeCalls != 1 {
 		t.Fatalf("abort=%d close=%d", nativeSession.abortCalls, nativeSession.closeCalls)
+	}
+}
+
+func TestSessionInjectsSystemPromptWhenEnabled(t *testing.T) {
+	nativeSession := newFakeNativeSession()
+	session := wrapSession(nativeSession, true)
+	err := session.Send(context.Background(), runtime.Input{Messages: []runtime.Message{
+		{Role: "system", Content: "be exact"},
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: "answer"},
+		{Role: "user", Content: "second"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "be exact\n\nsecond"; nativeSession.input.Prompt != want {
+		t.Fatalf("native prompt = %q, want %q (system prepended)", nativeSession.input.Prompt, want)
 	}
 }
 

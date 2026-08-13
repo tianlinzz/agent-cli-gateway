@@ -122,6 +122,7 @@ func applyAgentConfig(model string, c runtime.AgentExecutionConfig) {
 	if c.TurnTimeout > 0 && model == "kimi" {
 		_ = os.Setenv(prefix+"_TIMEOUT_SECS", strconv.FormatInt(int64(c.TurnTimeout/time.Second), 10))
 	}
+	_ = os.Setenv(prefix+"_INJECT_SYSTEM_PROMPT", strconv.FormatBool(c.InjectSystemPrompt))
 	for k, v := range c.Env {
 		_ = os.Setenv(k, v)
 	}

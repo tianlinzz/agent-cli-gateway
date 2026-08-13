@@ -35,7 +35,7 @@ func TestStartMapsCodexHomeAndResumeMetadata(t *testing.T) {
 
 func TestSessionSendsOnlyLatestUserMessageToNativeAgent(t *testing.T) {
 	freshNative := newFakeSession("")
-	fresh := wrapSession(freshNative)
+	fresh := wrapSession(freshNative, false)
 	input := runtime.Input{Messages: []runtime.Message{
 		{Role: "system", Content: "<skills><skill>f1-web-admin</skill></skills>"},
 		{Role: "user", Content: "first"},
@@ -51,7 +51,7 @@ func TestSessionSendsOnlyLatestUserMessageToNativeAgent(t *testing.T) {
 	}
 
 	resumeNative := newFakeSession("thread-1")
-	resume := wrapSession(resumeNative)
+	resume := wrapSession(resumeNative, false)
 	if err := resume.Send(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
@@ -60,9 +60,27 @@ func TestSessionSendsOnlyLatestUserMessageToNativeAgent(t *testing.T) {
 	}
 }
 
+func TestSessionInjectsSystemPromptWhenEnabled(t *testing.T) {
+	nativeSession := newFakeSession("")
+	session := wrapSession(nativeSession, true)
+	input := runtime.Input{Messages: []runtime.Message{
+		{Role: "system", Content: "be exact"},
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: "previous answer"},
+		{Role: "tool", Content: "tool result"},
+		{Role: "user", Content: "second"},
+	}}
+	if err := session.Send(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+	if want := "be exact\n\nsecond"; nativeSession.input.Prompt != want {
+		t.Fatalf("prompt = %q, want %q (system prepended, assistant/tool ignored)", nativeSession.input.Prompt, want)
+	}
+}
+
 func TestSessionMapsEventsAndDelegatesLifecycle(t *testing.T) {
 	nativeSession := newFakeSession("thread-1")
-	session := wrapSession(nativeSession)
+	session := wrapSession(nativeSession, false)
 	nativeSession.events <- native.Event{Kind: native.EventText, Text: "text"}
 	nativeSession.events <- native.Event{Kind: native.EventReasoning, Reasoning: &native.Reasoning{ID: "reason-1", Text: "reasoning"}}
 	nativeSession.events <- native.Event{Kind: native.EventToolUse, Tool: &native.ToolCall{ID: "tool-1", Name: "Bash", Arguments: map[string]any{"command": "pwd"}}}

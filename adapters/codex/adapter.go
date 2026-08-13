@@ -23,6 +23,9 @@ type Options struct {
 	Permission      string
 	SystemPrompt    string
 	AppendPrompt    string
+	// InjectSystemPrompt forwards caller-supplied system role messages into the
+	// native prompt at each turn.
+	InjectSystemPrompt bool
 }
 
 type nativeSession interface {
@@ -42,13 +45,14 @@ type Adapter struct {
 
 func New(_ context.Context, _ string) (runtime.AgentAdapter, error) {
 	opts := Options{
-		Command:         envOrDefault("CC_GATEWAY_CODEX_COMMAND", "codex"),
-		WorkDir:         envOrDefault("GW_WORKSPACE_DIR", "/workspace"),
-		CodexHome:       envOrDefault("GW_AGENT_HOME", ""),
-		Model:           envOrDefault("CC_GATEWAY_CODEX_MODEL", ""),
-		ReasoningEffort: envOrDefault("CC_GATEWAY_CODEX_EFFORT", ""),
-		Mode:            envOrDefault("CC_GATEWAY_CODEX_MODE", "full-auto"),
-		Permission:      envOrDefault("CC_GATEWAY_CODEX_PERMISSION", "auto"),
+		Command:            envOrDefault("CC_GATEWAY_CODEX_COMMAND", "codex"),
+		WorkDir:            envOrDefault("GW_WORKSPACE_DIR", "/workspace"),
+		CodexHome:          envOrDefault("GW_AGENT_HOME", ""),
+		Model:              envOrDefault("CC_GATEWAY_CODEX_MODEL", ""),
+		ReasoningEffort:    envOrDefault("CC_GATEWAY_CODEX_EFFORT", ""),
+		Mode:               envOrDefault("CC_GATEWAY_CODEX_MODE", "full-auto"),
+		Permission:         envOrDefault("CC_GATEWAY_CODEX_PERMISSION", "auto"),
+		InjectSystemPrompt: envBool("CC_GATEWAY_CODEX_INJECT_SYSTEM_PROMPT"),
 	}
 	if raw := envOrDefault("CC_GATEWAY_CODEX_ENV", ""); raw != "" {
 		opts.Env = splitEnv(raw)
@@ -101,7 +105,7 @@ func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.
 	if err != nil {
 		return nil, err
 	}
-	return wrapSession(nativeSession), nil
+	return wrapSession(nativeSession, a.opts.InjectSystemPrompt), nil
 }
 
 func splitCommand(command string) []string {
@@ -117,6 +121,15 @@ func envOrDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func envBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func splitEnv(raw string) []string {

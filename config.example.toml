@@ -68,12 +68,17 @@ policy = "kafel"
 [agents.codex]
 enabled = true
 permission = "auto"
+# Forward the caller's system role messages into the native prompt each turn.
+# Default false: system messages are ignored so a client cannot pollute the
+# agent's own tool/skill surface. Set true to prepend them before the user turn.
+# inject_system_prompt = false
 
 [agents.claude-code]
 enabled = true
 permission = "auto"
 default_model = "sonnet"
 models = ["sonnet", "opus", "haiku"]
+# inject_system_prompt = false
 
 [agents.kimi]
 enabled = true
@@ -81,3 +86,4 @@ command = "kimi"
 permission = "auto"
 timeout = "30m"
 models = ["kimi-k3", "deepseek-v4-flash"]
+# inject_system_prompt = false

@@ -294,3 +294,29 @@ func TestLoadGateway_MissingFile(t *testing.T) {
 		t.Fatal("expected error for missing config file")
 	}
 }
+
+func TestLoadGateway_InjectSystemPrompt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.toml")
+	content := `
+mode = "dev"
+
+[workspace]
+root = "workspaces"
+
+[agents.codex]
+inject_system_prompt = true
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadGateway(path)
+	if err != nil {
+		t.Fatalf("LoadGateway: %v", err)
+	}
+	if !c.Agents["codex"].InjectSystemPrompt {
+		t.Error("codex.inject_system_prompt must parse true")
+	}
+	if c.Agents["claude-code"].InjectSystemPrompt {
+		t.Error("claude-code.inject_system_prompt must default false")
+	}
+}
