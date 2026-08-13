@@ -8,6 +8,7 @@ import (
 	"io"
 	"strconv"
 	"sync"
+	"sync/atomic"
 )
 
 // RPCMessage is one JSON-RPC 2.0 request, response, or notification frame.
@@ -45,23 +46,33 @@ type rpcResult struct {
 	err     error
 }
 
+// OverflowHandler is invoked (once per overflow episode, from the drain
+// goroutine) when notifications were dropped because the bounded queue filled.
+// dropped is the number of notifications lost since the last episode. A handler
+// typically surfaces a display marker so a consumer can tell its stream was
+// truncated. It must be cheap or done-guarded: a blocking handler stalls the
+// drain (but never the reader loop).
+type OverflowHandler func(dropped int)
+
 // JSONRPCClient owns bounded JSONL framing, request correlation, and reverse
 // message dispatch for one stdio JSON-RPC connection.
 type JSONRPCClient struct {
 	stdin  io.WriteCloser
 	stdout io.Reader
 
-	reverse ReverseHandler
-	notify  NotificationHandler
+	reverse         ReverseHandler
+	notify          NotificationHandler
+	overflow        OverflowHandler
+	dropped         atomic.Int64 // notifications dropped to queue overflow
+	overflowPending atomic.Bool  // an overflow episode awaits a flush
 
 	// notifyQueue decouples the reader loop from the notification consumer.
-	// Notifications are enqueued by readLoop and delivered serially by a
-	// single drain goroutine, so a slow or stalled consumer (e.g. a full
-	// downstream events channel) never blocks the reader from correlating
-	// RPC responses — including the in-flight turn's own response. A sync
-	// marker item lets a caller wait until all notifications enqueued before
-	// it have been delivered, preserving event ordering relative to an RPC
-	// response read afterwards.
+	// The reader enqueues NON-blocking: a full queue never stalls the reader,
+	// so RPC responses and reverse requests are always correlated/processed.
+	// Overflowing notifications are dropped and counted; once the drain catches
+	// up (the queue empties) the overflow handler fires once with the dropped
+	// count so the consumer can surface a truncation marker. A sync marker item
+	// lets a caller wait until notifications enqueued before it are delivered.
 	notifyQueue chan notifyItem
 	// notifyDone is closed when the drain goroutine exits. A session that
 	// closes a channel its notify handler sends on must wait on NotifyDone()
@@ -78,23 +89,25 @@ type JSONRPCClient struct {
 	close   sync.Once
 }
 
-// notifyQueueSize bounds the decoupled notification buffer. It absorbs bursts
-// far larger than a downstream events channel; a permanently stalled consumer
-// eventually fills it, at which point readLoop blocks until the session's turn
-// timeout tears the connection down (readLoop's enqueue is done-guarded).
+// notifyQueueSize bounds the decoupled notification buffer. The reader never
+// blocks on it: when full, notifications are dropped (and counted) until the
+// consumer catches up or the session is torn down. It is sized to absorb
+// realistic bursts well beyond a downstream events channel without loss.
 const notifyQueueSize = 256
 
-// notifyItem is one entry in the decoupled notification queue: either a
-// notification to deliver, or a sync marker a caller is waiting on.
+// notifyItem is one entry in the decoupled notification queue: a notification
+// to deliver, or a sync marker a caller is waiting on.
 type notifyItem struct {
 	msg  RPCMessage
 	sync chan struct{}
 }
 
 // NewJSONRPCClient starts a single reader loop for the supplied stdio pair.
-func NewJSONRPCClient(stdin io.WriteCloser, stdout io.Reader, maxFrame int, reverse ReverseHandler, notify NotificationHandler) *JSONRPCClient {
+// onOverflow, when non-nil, is called once per overflow episode with the number
+// of dropped notifications.
+func NewJSONRPCClient(stdin io.WriteCloser, stdout io.Reader, maxFrame int, reverse ReverseHandler, notify NotificationHandler, onOverflow OverflowHandler) *JSONRPCClient {
 	c := &JSONRPCClient{
-		stdin: stdin, stdout: stdout, reverse: reverse, notify: notify,
+		stdin: stdin, stdout: stdout, reverse: reverse, notify: notify, overflow: onOverflow,
 		pending: make(map[string]chan rpcResult), done: make(chan struct{}),
 	}
 	if notify != nil {
@@ -106,8 +119,23 @@ func NewJSONRPCClient(stdin io.WriteCloser, stdout io.Reader, maxFrame int, reve
 	return c
 }
 
+// enqueueNotify adds a notification to the drain queue without ever blocking
+// the reader. On overflow it drops the notification, counts it, and marks an
+// overflow episode; the drain flushes the episode (firing the overflow handler)
+// once it has caught up.
+func (c *JSONRPCClient) enqueueNotify(msg RPCMessage) {
+	select {
+	case c.notifyQueue <- notifyItem{msg: msg}:
+	default:
+		c.dropped.Add(1)
+		c.overflowPending.Store(true)
+	}
+}
+
 // drainNotifications delivers queued notifications to the handler serially,
-// preserving order, on a goroutine separate from the reader loop.
+// preserving order, on a goroutine separate from the reader loop. When the
+// queue empties after an overflow episode, it fires the overflow handler once
+// with the number dropped so the consumer can surface a truncation marker.
 func (c *JSONRPCClient) drainNotifications() {
 	defer close(c.notifyDone)
 	for {
@@ -118,9 +146,25 @@ func (c *JSONRPCClient) drainNotifications() {
 				continue
 			}
 			c.notify(item.msg)
+			// Once the queue has drained, flush any pending overflow episode.
+			if c.overflowPending.Load() && len(c.notifyQueue) == 0 {
+				c.flushOverflow()
+			}
 		case <-c.done:
 			return
 		}
+	}
+}
+
+// flushOverflow fires the overflow handler once for the current episode and
+// resets the dropped counter. Coalesces many drops into a single notice.
+func (c *JSONRPCClient) flushOverflow() {
+	if !c.overflowPending.CompareAndSwap(true, false) {
+		return
+	}
+	n := c.dropped.Swap(0)
+	if c.overflow != nil && n > 0 {
+		c.overflow(int(n))
 	}
 }
 
@@ -131,11 +175,18 @@ func (c *JSONRPCClient) drainNotifications() {
 // drain never sends on a closed channel.
 func (c *JSONRPCClient) NotifyDone() <-chan struct{} { return c.notifyDone }
 
+// DroppedNotifications returns the total notifications dropped to queue
+// overflow for diagnostics. It does not reset the counter.
+func (c *JSONRPCClient) DroppedNotifications() int64 { return c.dropped.Load() }
+
 // Sync blocks until every notification enqueued before this call has been
-// delivered to the handler (or the connection terminates). It lets a caller
-// whose effect is triggered by an RPC response — which on the wire follows the
-// turn's notifications — defer that effect until the notifications have been
-// processed, preserving event ordering. Returns immediately when no
+// delivered to the handler (or the connection terminates / queue is saturated).
+// It lets a caller whose effect is triggered by an RPC response — which on the
+// wire follows the turn's notifications — defer that effect until the
+// notifications have been processed, preserving event ordering when the
+// consumer is healthy. Under sustained overflow (a stalled consumer) ordering
+// is already broken by drops, so Sync returns without waiting rather than
+// block; the consumer is not reading anyway. Returns immediately when no
 // notification handler is configured.
 func (c *JSONRPCClient) Sync() {
 	if c.notifyQueue == nil {
@@ -144,7 +195,9 @@ func (c *JSONRPCClient) Sync() {
 	marker := make(chan struct{})
 	select {
 	case c.notifyQueue <- notifyItem{sync: marker}:
-	case <-c.done:
+	default:
+		// Queue saturated: notifications are being dropped, so strict ordering
+		// cannot be guaranteed — don't block the caller.
 		return
 	}
 	select {
@@ -244,11 +297,7 @@ func (c *JSONRPCClient) readLoop(maxFrame int) {
 				// delay RPC responses. The enqueue is done-guarded so
 				// teardown always unblocks the reader.
 				if c.notify != nil {
-					select {
-					case c.notifyQueue <- notifyItem{msg: msg}:
-					case <-c.done:
-						return
-					}
+					c.enqueueNotify(msg)
 				}
 				continue
 			}

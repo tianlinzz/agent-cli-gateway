@@ -61,7 +61,7 @@ func Start(ctx context.Context, options Options) (*Session, error) {
 	}
 	s := &Session{opts: opts, process: proc, events: make(chan Event, 64), ctx: sessionCtx, cancel: cancel, done: make(chan struct{})}
 	s.sessionID.Store("")
-	s.rpc = agentprotocol.NewJSONRPCClient(proc.Stdin(), proc.Stdout(), maxACPFrame, s.handleReverse, s.handleNotification)
+	s.rpc = agentprotocol.NewJSONRPCClient(proc.Stdin(), proc.Stdout(), maxACPFrame, s.handleReverse, s.handleNotification, s.onNotifyOverflow)
 	if err := s.initialize(ctx); err != nil {
 		s.cleanupFailedStart()
 		return nil, err
@@ -365,6 +365,12 @@ func (s *Session) emit(event Event) {
 	case s.events <- event:
 	case <-s.ctx.Done():
 	}
+}
+
+// onNotifyOverflow surfaces a notification-truncation marker when the JSON-RPC
+// reader dropped notifications because a stalled consumer saturated the queue.
+func (s *Session) onNotifyOverflow(dropped int) {
+	s.emit(Event{Kind: EventReasoning, Reasoning: &Reasoning{Text: fmt.Sprintf("[%d notifications truncated]", dropped)}})
 }
 
 func (s *Session) Events() <-chan Event { return s.events }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -14,7 +15,7 @@ import (
 func TestJSONRPCCorrelatesOutOfOrderResponses(t *testing.T) {
 	serverRead, clientIn := io.Pipe()
 	clientOut, serverWrite := io.Pipe()
-	client := NewJSONRPCClient(clientIn, clientOut, 1024, nil, nil)
+	client := NewJSONRPCClient(clientIn, clientOut, 1024, nil, nil, nil)
 	t.Cleanup(func() { _ = client.Close() })
 
 	type result struct {
@@ -64,6 +65,7 @@ func TestJSONRPCDispatchesNotificationAndReverseRequest(t *testing.T) {
 			return map[string]string{"decision": "accept"}, nil
 		},
 		func(msg RPCMessage) { notifications <- msg },
+		nil,
 	)
 	t.Cleanup(func() { _ = client.Close() })
 
@@ -119,6 +121,7 @@ func TestJSONRPCStalledNotifyDoesNotBlockResponses(t *testing.T) {
 			}
 			<-proceed // simulate a stalled consumer
 		},
+		nil,
 	)
 	t.Cleanup(func() {
 		close(proceed) // unblock the stalled notify so the drain goroutine exits
@@ -151,10 +154,96 @@ func TestJSONRPCStalledNotifyDoesNotBlockResponses(t *testing.T) {
 	}
 }
 
+// TestJSONRPCOverflowNeverBlocksReader is the O-A2 overflow regression: with
+// the notification consumer permanently stalled and the native CLI flooding far
+// past the 256-deep queue, the reader loop must keep correlating RPC responses
+// (and dispatching reverse requests), drop the overflow, and surface a
+// truncation marker once the consumer resumes — never blocking the reader.
+func TestJSONRPCOverflowNeverBlocksReader(t *testing.T) {
+	serverRead, clientIn := io.Pipe()
+	clientOut, serverWrite := io.Pipe()
+	proceed := make(chan struct{})
+	var proceedOnce sync.Once
+	releaseDrain := func() { proceedOnce.Do(func() { close(proceed) }) }
+	var overflowSeen atomic.Int64
+	notifyEntered := make(chan struct{}, 1)
+	reverseDone := make(chan RPCMessage, 1)
+	client := NewJSONRPCClient(clientIn, clientOut, 1024,
+		func(_ context.Context, msg RPCMessage) (any, *RPCError) {
+			select {
+			case reverseDone <- msg:
+			default:
+			}
+			return map[string]string{"ok": "1"}, nil
+		},
+		func(RPCMessage) {
+			select {
+			case notifyEntered <- struct{}{}:
+			default:
+			}
+			<-proceed // stall the drain
+		},
+		func(dropped int) { overflowSeen.Add(int64(dropped)) },
+	)
+	t.Cleanup(func() { releaseDrain(); _ = client.Close() })
+
+	// Flood notifications far past the queue while the drain is stalled on the
+	// first one. The reader decodes and drops the overflow; it never blocks.
+	const flood = 600
+	for i := 0; i < flood; i++ {
+		writeRPCMessage(t, serverWrite, RPCMessage{JSONRPC: "2.0", Method: "session/update"})
+	}
+	select {
+	case <-notifyEntered:
+	case <-time.After(time.Second):
+		t.Fatal("drain never entered notify")
+	}
+
+	// 1. While the consumer is stalled and overflow has occurred, a correlated
+	// RPC response must still be read and delivered.
+	callErr := make(chan error, 1)
+	go func() { callErr <- client.Call(context.Background(), "session/prompt", nil, nil) }()
+	time.Sleep(30 * time.Millisecond) // let the request be written
+	writeRPCMessage(t, serverWrite, RPCMessage{JSONRPC: "2.0", ID: json.RawMessage(`1`), Result: json.RawMessage(`null`)})
+	_ = readRPCMessages(t, serverRead, 1)
+	select {
+	case err := <-callErr:
+		if err != nil {
+			t.Fatalf("Call under overflow returned %v (reader was blocked)", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Call did not complete under overflow — reader blocked by stalled notify")
+	}
+
+	// 2. A reverse request is dispatched on its own goroutine and processed.
+	writeRPCMessage(t, serverWrite, RPCMessage{JSONRPC: "2.0", ID: json.RawMessage(`"r1"`), Method: "approval"})
+	select {
+	case <-reverseDone:
+	case <-time.After(time.Second):
+		t.Fatal("reverse request not processed under overflow")
+	}
+
+	// 3. Overflow was dropped and counted; it stays > 0 while stalled.
+	if got := client.DroppedNotifications(); got <= 0 {
+		t.Fatalf("DroppedNotifications = %d, want > 0 after flood", got)
+	}
+
+	// 4. Release the stalled consumer: the drain flushes and the truncation
+	// marker fires the overflow handler exactly once with the dropped count.
+	releaseDrain()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && overflowSeen.Load() == 0 {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if overflowSeen.Load() <= 0 {
+		t.Fatal("overflow handler never fired after drain resumed")
+	}
+}
+
 func TestJSONRPCCanceledCallDoesNotPoisonLaterCalls(t *testing.T) {
 	serverRead, clientIn := io.Pipe()
 	clientOut, serverWrite := io.Pipe()
-	client := NewJSONRPCClient(clientIn, clientOut, 1024, nil, nil)
+	client := NewJSONRPCClient(clientIn, clientOut, 1024, nil, nil, nil)
 	t.Cleanup(func() { _ = client.Close() })
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -178,7 +267,7 @@ func TestJSONRPCCanceledCallDoesNotPoisonLaterCalls(t *testing.T) {
 func TestJSONRPCEOFFailsAllPendingCallsAndClosesOnce(t *testing.T) {
 	serverRead, clientIn := io.Pipe()
 	clientOut, serverWrite := io.Pipe()
-	client := NewJSONRPCClient(clientIn, clientOut, 1024, nil, nil)
+	client := NewJSONRPCClient(clientIn, clientOut, 1024, nil, nil, nil)
 
 	errs := make(chan error, 2)
 	for range 2 {
@@ -208,7 +297,7 @@ func TestJSONRPCEOFFailsAllPendingCallsAndClosesOnce(t *testing.T) {
 func TestJSONRPCRejectsOversizedFrame(t *testing.T) {
 	_, clientIn := io.Pipe()
 	clientOut, serverWrite := io.Pipe()
-	client := NewJSONRPCClient(clientIn, clientOut, 32, nil, nil)
+	client := NewJSONRPCClient(clientIn, clientOut, 32, nil, nil, nil)
 	go func() {
 		_, _ = io.WriteString(serverWrite, `{"jsonrpc":"2.0","method":"`+string(make([]byte, 128))+`"}`+"\n")
 		_ = serverWrite.Close()
