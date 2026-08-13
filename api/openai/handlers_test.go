@@ -1935,11 +1935,16 @@ func TestNormalizer_NoWorkDirInjection(t *testing.T) {
 			}},
 		},
 		"metadata": map[string]any{
-			"workdir":           "/etc",
-			"cwd":               "/tmp",
-			"working_directory": "/var",
-			"workspace_id":      "ws-norm",
-			"trace_id":          "abc",
+			"workdir":            "/etc",
+			"cwd":                "/tmp",
+			"working_directory":  "/var",
+			"workspace_id":       "ws-norm",
+			"trace_id":           "abc",
+			"native_session_id":  "attacker-native",
+			"codex_thread_id":    "attacker-thread",
+			"claude_session_id":  "attacker-claude",
+			"kimi_session_id":    "attacker-kimi",
+			"Native_Session_ID":  "attacker-cased",
 		},
 	}
 	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body)
@@ -1967,6 +1972,15 @@ func TestNormalizer_NoWorkDirInjection(t *testing.T) {
 	for _, key := range []string{"workdir", "cwd", "working_directory"} {
 		if _, ok := sr.Metadata[key]; ok {
 			t.Errorf("metadata %q leaked into the start request: %v", key, sr.Metadata)
+		}
+	}
+	// Server-owned native resume ids must never be client-supplied: a caller
+	// could otherwise select or override the native session/thread the gateway
+	// resumes into. The gateway injects the sole canonical native_session_id
+	// from its own SessionRecord.
+	for _, key := range []string{"native_session_id", "codex_thread_id", "claude_session_id", "kimi_session_id"} {
+		if v, ok := sr.Metadata[key]; ok {
+			t.Errorf("resume id %q leaked into the start request: %q", key, v)
 		}
 	}
 	if sr.Metadata["trace_id"] != "abc" {

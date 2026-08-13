@@ -118,14 +118,20 @@ func normalizeToolCall(tc ChatToolCall) (runtime.ToolCall, error) {
 }
 
 // sanitizeMetadata converts arbitrary metadata into a map[string]string and
-// strips path-bearing keys so a client can never inject a workspace path
-// through metadata. Path control belongs solely to the server-side workspace
-// resolver.
+// strips keys the server must own outright:
+//   - path-bearing keys (workdir/cwd/...) so a client can never inject a
+//     workspace path; path control belongs solely to the workspace resolver;
+//   - native resume ids (native_session_id and the per-agent variants) so a
+//     client can never select or override the native session/thread the
+//     gateway resumes into. The gateway injects the sole canonical
+//     native_session_id from its own SessionRecord after this step.
 func sanitizeMetadata(m map[string]any) map[string]string {
 	out := make(map[string]string, len(m))
 	for k, v := range m {
 		switch strings.ToLower(strings.TrimSpace(k)) {
 		case "workdir", "cwd", "working_directory", "working_dir":
+			continue
+		case "native_session_id", "codex_thread_id", "claude_session_id", "kimi_session_id":
 			continue
 		}
 		switch t := v.(type) {
