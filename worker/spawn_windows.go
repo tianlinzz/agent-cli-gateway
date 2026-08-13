@@ -47,7 +47,9 @@ func startCommand(_ context.Context, argv, env []string, logPath string) (*exec.
 // of signaling a process group (it terminates the process and its children).
 // nsjail cannot run on Windows, so the direct worker is the only target.
 func (ws *workerSession) killGroup(sig syscall.Signal) {
-	for _, pid := range []int{ws.pgid, ws.workerPID} {
+	pgid := ws.pgid
+	_, workerPID := ws.snapshotClient()
+	for _, pid := range []int{pgid, workerPID} {
 		if pid <= 0 {
 			continue
 		}

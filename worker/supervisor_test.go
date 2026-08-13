@@ -186,6 +186,54 @@ exit $?
 // Lifecycle
 // ---------------------------------------------------------------------------
 
+// TestSupervisor_ConcurrentLifecycleRaceConditioning exercises handshake, Send,
+// Abort, Close, heartbeat, and terminate/killGroup interleaving concurrently.
+// It is a race-conditioning guard for the client/workerPID publication contract
+// (O-B3): all access goes through snapshotClient/clearClient under ws.mu, so
+// this must stay clean under -race -count=N.
+func TestSupervisor_ConcurrentLifecycleRaceConditioning(t *testing.T) {
+	sup := newTestSupervisor(t, func(c *Config) {
+		c.HeartbeatInterval = 20 * time.Millisecond
+		c.HeartbeatTimeout = 10 * time.Millisecond
+		c.HeartbeatFailures = 5
+	})
+
+	const n = 12
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		i := i
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			ws, err := sup.StartSession(ctx, testRequest("race-"+strconv.Itoa(i)))
+			if err != nil {
+				return // a concurrent teardown may win; that is acceptable here
+			}
+			// Drain the event stream so the bridge never blocks on a full channel.
+			drainDone := make(chan struct{})
+			go func() {
+				defer close(drainDone)
+				for range ws.Events() {
+				}
+			}()
+			// Interleave Send and Abort with the monitor/heartbeat goroutines.
+			var ops sync.WaitGroup
+			ops.Add(2)
+			go func() {
+				defer ops.Done()
+				_ = ws.Send(ctx, grt.Input{Messages: []grt.Message{{Role: "user", Content: "x"}}})
+			}()
+			go func() { defer ops.Done(); _ = ws.Abort(ctx) }()
+			_ = ws.Close(ctx)
+			ops.Wait()
+			<-drainDone
+		}()
+	}
+	wg.Wait()
+}
+
 func TestSupervisor_StartCloseDirect(t *testing.T) {
 	sup := newTestSupervisor(t, nil)
 	ws, err := sup.StartSession(context.Background(), testRequest("s1"))

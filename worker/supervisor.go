@@ -398,13 +398,14 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 		go ws.heartbeat()
 	}
 
+	_, workerPID := ws.snapshotClient()
 	slog.Info("worker: session started",
 		"session", req.SessionID,
 		"model", req.ModelID,
 		"owner", req.CallerID,
 		"workspace_id", req.WorkspaceID,
 		"pid", ws.outerPID,
-		"worker_pid", ws.workerPID,
+		"worker_pid", workerPID,
 		"isolated", isolated,
 		"lifecycle", ws.lifecycle,
 	)
@@ -570,9 +571,9 @@ type workerSession struct {
 	reaped   chan struct{} // closed when the direct child (cmd) is reaped
 
 	cmd       *exec.Cmd
-	outerPID  int // spawned process: nsjail PID when isolated, worker PID when direct
-	workerPID int // worker PID reported at handshake
-	pgid      int // process group of the spawned child (= outerPID with Setpgid)
+	outerPID  int // immutable after construction: nsjail PID when isolated, worker PID when direct
+	workerPID int // guarded by mu: worker PID reported at handshake
+	pgid      int // immutable after construction: process group of the spawned child (= outerPID with Setpgid)
 
 	sessionDir  string
 	socketDir   string
@@ -588,11 +589,23 @@ func (ws *workerSession) Events() <-chan runtime.Event {
 
 // snapshotClient returns the current gRPC client and worker PID under the lock.
 // The monitor goroutine starts before handshake assigns client/workerPID, so
-// any read that can race with handshake must go through here.
+// any read that can race with handshake must go through here. Callers must not
+// hold the lock when acting on the snapshot (RPC/Close/Wait).
 func (ws *workerSession) snapshotClient() (*client, int) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	return ws.client, ws.workerPID
+}
+
+// clearClient closes c and nils the cached client under the lock. Used by
+// handshake failure paths so the monitor/terminate never see a stale client.
+func (ws *workerSession) clearClient(c *client) {
+	if c != nil {
+		c.Close()
+	}
+	ws.mu.Lock()
+	ws.client = nil
+	ws.mu.Unlock()
 }
 
 // Send delivers a turn to the worker.
@@ -614,7 +627,15 @@ func (ws *workerSession) Send(ctx context.Context, input runtime.Input) error {
 		ws.mu.Unlock()
 		return fmt.Errorf("worker: session %q is not running (state %d)", ws.req.SessionID, state)
 	}
-	if err := ws.client.SendInput(ctx, ws.req.SessionID, input); err != nil {
+	client, _ := ws.snapshotClient()
+	if client == nil {
+		ws.mu.Lock()
+		ws.turnActive = false
+		ws.lastActivity = time.Now()
+		ws.mu.Unlock()
+		return fmt.Errorf("worker: session %q has no client (not started)", ws.req.SessionID)
+	}
+	if err := client.SendInput(ctx, ws.req.SessionID, input); err != nil {
 		ws.mu.Lock()
 		ws.turnActive = false
 		ws.lastActivity = time.Now()
@@ -649,7 +670,11 @@ func (ws *workerSession) Abort(ctx context.Context) error {
 		}
 		return nil
 	}
-	return ws.client.Abort(ctx, ws.req.SessionID)
+	client, _ := ws.snapshotClient()
+	if client == nil {
+		return nil
+	}
+	return client.Abort(ctx, ws.req.SessionID)
 }
 
 // Close tears the session down: CloseSession RPC, SIGTERM to the process
@@ -682,9 +707,9 @@ func (ws *workerSession) Close(ctx context.Context) error {
 // between selecting a session and starting asynchronous teardown.
 func (ws *workerSession) closeClaimed(ctx context.Context) error {
 	var closeErr error
-	if ws.client != nil {
+	if client, _ := ws.snapshotClient(); client != nil {
 		cctx, cancel := context.WithTimeout(ctx, ws.sup.cfg.StopGracePeriod)
-		closeErr = ws.client.CloseSession(cctx, ws.req.SessionID)
+		closeErr = client.CloseSession(cctx, ws.req.SessionID)
 		cancel()
 	}
 
@@ -817,7 +842,12 @@ func (ws *workerSession) heartbeat() {
 func (ws *workerSession) bridge() {
 	defer close(ws.events)
 
-	stream, err := ws.client.StreamEvents(ws.ctx, ws.req.SessionID)
+	client, _ := ws.snapshotClient()
+	if client == nil {
+		ws.terminate(fmt.Errorf("open event stream: no client"))
+		return
+	}
+	stream, err := client.StreamEvents(ws.ctx, ws.req.SessionID)
 	if err != nil {
 		ws.terminate(fmt.Errorf("open event stream: %w", err))
 		return
@@ -968,12 +998,10 @@ dial:
 		lastErr = herr
 		select {
 		case <-ws.reaped:
-			c.Close()
-			ws.client = nil
+			ws.clearClient(c)
 			return fmt.Errorf("session process %d exited during handshake", ws.outerPID)
 		case <-ctx.Done():
-			c.Close()
-			ws.client = nil
+			ws.clearClient(c)
 			return fmt.Errorf("health handshake failed: %v (last error: %v)", ctx.Err(), lastErr)
 		case <-time.After(50 * time.Millisecond):
 		}
@@ -985,8 +1013,7 @@ dial:
 	}
 	mode, err := c.StartSession(ctx, startReq)
 	if err != nil {
-		c.Close()
-		ws.client = nil
+		ws.clearClient(c)
 		return fmt.Errorf("start session rpc: %w", err)
 	}
 	ws.mu.Lock()

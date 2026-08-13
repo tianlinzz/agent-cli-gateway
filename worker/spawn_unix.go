@@ -42,16 +42,20 @@ func startCommand(_ context.Context, argv, env []string, logPath string) (*exec.
 
 // killGroup signals the whole process group (nsjail + worker + agent CLI).
 // The worker PID is signaled directly too as a defensive measure in case it
-// escaped the group (e.g. a wrapper that calls setsid).
+// escaped the group (e.g. a wrapper that calls setsid). pgid is immutable after
+// construction; workerPID is snapshotted under ws.mu because handshake may still
+// be assigning it when the monitor reaches teardown.
 func (ws *workerSession) killGroup(sig syscall.Signal) {
-	if ws.pgid > 0 {
-		if err := syscall.Kill(-ws.pgid, sig); err != nil && !errors.Is(err, syscall.ESRCH) {
-			slog.Warn("worker: kill process group", "pgid", ws.pgid, "signal", sig, "error", err)
+	pgid := ws.pgid
+	_, workerPID := ws.snapshotClient()
+	if pgid > 0 {
+		if err := syscall.Kill(-pgid, sig); err != nil && !errors.Is(err, syscall.ESRCH) {
+			slog.Warn("worker: kill process group", "pgid", pgid, "signal", sig, "error", err)
 		}
 	}
-	if ws.workerPID > 0 && ws.workerPID != ws.pgid {
-		if err := syscall.Kill(ws.workerPID, sig); err != nil && !errors.Is(err, syscall.ESRCH) {
-			slog.Warn("worker: signal worker pid", "pid", ws.workerPID, "signal", sig, "error", err)
+	if workerPID > 0 && workerPID != pgid {
+		if err := syscall.Kill(workerPID, sig); err != nil && !errors.Is(err, syscall.ESRCH) {
+			slog.Warn("worker: signal worker pid", "pid", workerPID, "signal", sig, "error", err)
 		}
 	}
 }
