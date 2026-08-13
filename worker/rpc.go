@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"time"
+	"unicode/utf8"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -84,10 +85,39 @@ type client struct {
 	c    workerpb.WorkerClient
 }
 
-// maxRPCMsgSize raises gRPC's default 4 MiB recv/send ceiling. Outbound
-// EventFrames (e.g. a large tool result) are otherwise unbounded and a single
-// frame over the default kills the event stream and the session.
+// maxRPCMsgSize is the defense-in-depth gRPC recv/send ceiling. Canonical
+// event-field limits (below) bound each variable-length field well under this,
+// so a single oversized field is truncated with a marker rather than aborting
+// the event stream/session at the gRPC boundary.
 const maxRPCMsgSize = 16 * 1024 * 1024
+
+// canonicalEventFieldLimit bounds each variable-length string in an outbound
+// EventFrame (text, error, tool result, reasoning). It is the contract: fields
+// at or under it pass through unchanged; larger fields are truncated with a
+// marker. Worst case (several capped fields in one frame) stays well under
+// maxRPCMsgSize.
+const canonicalEventFieldLimit = 1 << 20 // 1 MiB
+
+// eventFieldTruncated is appended to a string field truncated to the canonical
+// limit so a consumer can tell it is partial.
+const eventFieldTruncated = "[…truncated]"
+
+// truncateEventField bounds s to the canonical field limit on a UTF-8 rune
+// boundary, appending a truncation marker when it shortened s.
+func truncateEventField(s string) string {
+	const limit = canonicalEventFieldLimit
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit - len(eventFieldTruncated)
+	if cut < 0 {
+		cut = 0
+	}
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + eventFieldTruncated
+}
 
 // dial connects a gRPC client to the worker endpoint. Connection is lazy;
 // the first RPC triggers the actual connect. The caller must call Close.
@@ -465,7 +495,7 @@ func toProtoToolCall(tc runtime.ToolCall) (*workerpb.ToolCall, error) {
 		Id:        tc.ID,
 		Name:      tc.Name,
 		Arguments: args,
-		Result:    tc.Result,
+		Result:    truncateEventField(tc.Result),
 		IsError:   tc.IsError,
 	}, nil
 }
@@ -486,8 +516,8 @@ func fromProtoToolCall(ptc *workerpb.ToolCall) (runtime.ToolCall, error) {
 func toFrame(ev runtime.Event) (*workerpb.EventFrame, error) {
 	f := &workerpb.EventFrame{
 		Type:            string(ev.Type),
-		Text:            ev.Text,
-		Error:           ev.Error,
+		Text:            truncateEventField(ev.Text),
+		Error:           truncateEventField(ev.Error),
 		FinishReason:    ev.FinishReason,
 		Status:          ev.Status,
 		NativeSessionId: ev.NativeSessionID,
@@ -513,7 +543,7 @@ func toFrame(ev runtime.Event) (*workerpb.EventFrame, error) {
 		}
 	}
 	if ev.Reasoning != nil {
-		f.Reasoning = &workerpb.Reasoning{Id: ev.Reasoning.ID, Text: ev.Reasoning.Text}
+		f.Reasoning = &workerpb.Reasoning{Id: ev.Reasoning.ID, Text: truncateEventField(ev.Reasoning.Text)}
 	}
 	return f, nil
 }
