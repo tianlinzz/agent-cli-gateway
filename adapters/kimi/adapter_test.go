@@ -53,11 +53,12 @@ func TestAdapterMapsTrustedOptions(t *testing.T) {
 
 }
 
-func TestSessionBuildsFreshAndResumePrompts(t *testing.T) {
+func TestSessionSendsOnlyLatestUserMessageToNativeAgent(t *testing.T) {
 	input := runtime.Input{Messages: []runtime.Message{
-		{Role: "system", Content: "be exact"},
+		{Role: "system", Content: "<skills><skill>f1-web-admin</skill></skills>"},
 		{Role: "user", Content: "first"},
-		{Role: "assistant", Content: "answer"},
+		{Role: "assistant", Content: "previous answer"},
+		{Role: "tool", Content: "f1-web tool result"},
 		{Role: "user", Content: "second"},
 	}}
 
@@ -65,16 +66,16 @@ func TestSessionBuildsFreshAndResumePrompts(t *testing.T) {
 	if err := wrapSession(freshNative).Send(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(freshNative.input.Prompt, "System instructions:\nbe exact") || !strings.Contains(freshNative.input.Prompt, "User:\nsecond") {
-		t.Fatalf("fresh prompt = %q", freshNative.input.Prompt)
+	if freshNative.input.Prompt != "second" {
+		t.Fatalf("fresh prompt = %q, want only latest user message", freshNative.input.Prompt)
 	}
 
 	resumeNative := newFakeSession("native-1")
-	if err := wrapSessionWithResume(resumeNative, true).Send(context.Background(), input); err != nil {
+	if err := wrapSession(resumeNative).Send(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
 	if resumeNative.input.Prompt != "second" {
-		t.Fatalf("resume prompt = %q", resumeNative.input.Prompt)
+		t.Fatalf("resume prompt = %q, want only latest user message", resumeNative.input.Prompt)
 	}
 }
 

@@ -2,7 +2,6 @@ package codex
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	native "github.com/tianlinzz/agent-cli-gateway/agent/codex"
@@ -34,24 +33,30 @@ func TestStartMapsCodexHomeAndResumeMetadata(t *testing.T) {
 	}
 }
 
-func TestSessionBuildsFreshAndResumePrompts(t *testing.T) {
+func TestSessionSendsOnlyLatestUserMessageToNativeAgent(t *testing.T) {
 	freshNative := newFakeSession("")
 	fresh := wrapSession(freshNative)
-	input := runtime.Input{Messages: []runtime.Message{{Role: "system", Content: "be exact"}, {Role: "user", Content: "first"}, {Role: "assistant", Content: "answer"}, {Role: "user", Content: "second"}}}
+	input := runtime.Input{Messages: []runtime.Message{
+		{Role: "system", Content: "<skills><skill>f1-web-admin</skill></skills>"},
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: "previous answer"},
+		{Role: "tool", Content: "f1-web tool result"},
+		{Role: "user", Content: "second"},
+	}}
 	if err := fresh.Send(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(freshNative.input.Prompt, "System instructions:\nbe exact") || !strings.Contains(freshNative.input.Prompt, "User:\nsecond") {
-		t.Fatalf("fresh prompt = %q", freshNative.input.Prompt)
+	if freshNative.input.Prompt != "second" {
+		t.Fatalf("fresh prompt = %q, want only latest user message", freshNative.input.Prompt)
 	}
 
 	resumeNative := newFakeSession("thread-1")
-	resume := wrapSessionWithResume(resumeNative, true)
+	resume := wrapSession(resumeNative)
 	if err := resume.Send(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
 	if resumeNative.input.Prompt != "second" {
-		t.Fatalf("resume prompt = %q", resumeNative.input.Prompt)
+		t.Fatalf("resume prompt = %q, want only latest user message", resumeNative.input.Prompt)
 	}
 }
 

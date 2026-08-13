@@ -101,7 +101,7 @@ func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.
 	if err != nil {
 		return nil, err
 	}
-	return wrapSessionWithResume(nativeSession, resumeID != ""), nil
+	return wrapSession(nativeSession), nil
 }
 
 func splitCommand(command string) []string {

@@ -14,16 +14,10 @@ type session struct {
 	native nativeSession
 	events chan runtime.Event
 	mu     sync.Mutex
-	resume bool
-	sent   bool
 }
 
 func wrapSession(nativeSession nativeSession) *session {
-	return wrapSessionWithResume(nativeSession, false)
-}
-
-func wrapSessionWithResume(nativeSession nativeSession, resume bool) *session {
-	s := &session{native: nativeSession, events: make(chan runtime.Event, 64), resume: resume}
+	s := &session{native: nativeSession, events: make(chan runtime.Event, 64)}
 	go func() {
 		defer close(s.events)
 		for event := range nativeSession.Events() {
@@ -36,47 +30,17 @@ func wrapSessionWithResume(nativeSession nativeSession, resume bool) *session {
 func (s *session) Send(ctx context.Context, input runtime.Input) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	prompt := promptFromRuntime(input, s.resume || s.sent)
-	if err := s.native.Send(ctx, native.Input{Prompt: prompt}); err != nil {
-		return err
-	}
-	s.sent = true
-	return nil
+	return s.native.Send(ctx, native.Input{Prompt: lastUserMessage(input)})
 }
 
-func promptFromRuntime(input runtime.Input, resume bool) string {
-	var users, others []string
+func lastUserMessage(input runtime.Input) string {
+	var prompt string
 	for _, message := range input.Messages {
-		content := strings.TrimSpace(message.Content)
-		if content == "" {
-			continue
-		}
-		switch message.Role {
-		case "user":
-			users = append(users, content)
-		case "system":
-			others = append(others, "System instructions:\n"+content)
-		case "assistant":
-			others = append(others, "Assistant:\n"+content)
-		case "tool":
-			others = append(others, "Tool result:\n"+content)
-		default:
-			others = append(others, content)
+		if message.Role == "user" && strings.TrimSpace(message.Content) != "" {
+			prompt = message.Content
 		}
 	}
-	if resume {
-		if len(users) == 0 {
-			return ""
-		}
-		return users[len(users)-1]
-	}
-	if len(others) == 0 {
-		return strings.Join(users, "\n\n")
-	}
-	for _, user := range users {
-		others = append(others, "User:\n"+user)
-	}
-	return strings.Join(others, "\n\n")
+	return prompt
 }
 
 func mapEvent(event native.Event) runtime.Event {
