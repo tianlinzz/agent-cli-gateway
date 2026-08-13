@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -288,12 +289,12 @@ func TestSessionStoreTouchAndExpiry(t *testing.T) {
 	if err := store.Create(ctx, rec); err != nil {
 		t.Fatalf("Create(s-stale): %v", err)
 	}
-	n, err := store.Prune(ctx, time.Now())
+	removed, err := store.Prune(ctx, time.Now())
 	if err != nil {
 		t.Fatalf("Prune: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("Prune removed %d, want 1", n)
+	if len(removed) != 1 || removed[0] != "s-stale" {
+		t.Fatalf("Prune removed %v, want [s-stale]", removed)
 	}
 	if _, err := store.Get(ctx, "s-stale", "alice"); !errors.Is(err, runtime.ErrSessionNotFound) {
 		t.Fatalf("Get after Prune error = %v, want ErrSessionNotFound", err)
@@ -320,6 +321,52 @@ func TestSessionStoreDelete(t *testing.T) {
 	// Deleting again reports not found, not forbidden.
 	if err := store.Delete(ctx, "s1", "alice"); !errors.Is(err, runtime.ErrSessionNotFound) {
 		t.Fatalf("second Delete error = %v, want ErrSessionNotFound", err)
+	}
+}
+
+// TestSessionStorePruneEvictsExpiredAndReturnsIDs is a regression test for the
+// session-record leak: records with a TTL must be physically evicted by Prune
+// and their ids returned so the gateway can drop cached handles. Without TTL
+// wiring, byID grew by one entry per session forever.
+func TestSessionStorePruneEvictsExpiredAndReturnsIDs(t *testing.T) {
+	store := runtime.NewMemorySessionStore()
+	ctx := context.Background()
+	const ttl = time.Hour
+
+	// Create 50 sessions, each touched with a TTL so they have an ExpiresAt.
+	for i := 0; i < 50; i++ {
+		id := "sess-" + string(rune('a'+i%26)) + strconv.Itoa(i)
+		if err := store.Create(ctx, sessionRec(id, "alice")); err != nil {
+			t.Fatalf("Create(%s): %v", id, err)
+		}
+		if err := store.Touch(ctx, id, "alice", ttl); err != nil {
+			t.Fatalf("Touch(%s): %v", id, err)
+		}
+	}
+	// One fresh session touched far in the future must survive the sweep.
+	if err := store.Create(ctx, sessionRec("survivor", "alice")); err != nil {
+		t.Fatalf("Create(survivor): %v", err)
+	}
+	if err := store.Touch(ctx, "survivor", "alice", 24*time.Hour); err != nil {
+		t.Fatalf("Touch(survivor): %v", err)
+	}
+
+	// Fast-forward past the 50 sessions' TTL but not the survivor's.
+	future := time.Now().Add(2 * ttl)
+	removed, err := store.Prune(ctx, future)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if len(removed) != 50 {
+		t.Fatalf("Prune removed %d ids, want 50 (no monotonic growth)", len(removed))
+	}
+	if _, err := store.Get(ctx, "survivor", "alice"); err != nil {
+		t.Fatalf("survivor should outlive Prune: %v", err)
+	}
+	// A second sweep at the same clock finds nothing left to evict.
+	again, _ := store.Prune(ctx, future)
+	if len(again) != 0 {
+		t.Fatalf("Prune removed %d on second sweep, want 0", len(again))
 	}
 }
 

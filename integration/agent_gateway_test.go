@@ -181,6 +181,7 @@ func newHarness(t *testing.T, mutCfg func(*worker.Config)) *harness {
 
 	t.Cleanup(func() {
 		ts.Close()
+		h.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if err := sup.Close(ctx); err != nil {

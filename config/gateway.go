@@ -84,6 +84,14 @@ type SessionsConfig struct {
 	IdleTimeout time.Duration `toml:"idle_timeout"`
 	// ReapInterval controls how often idle Workers are scanned.
 	ReapInterval time.Duration `toml:"reap_interval"`
+	// RecordTTL is how long a gateway session record (and its native session
+	// ID, used to resume) is retained after the last activity. It MUST exceed
+	// IdleTimeout so a record survives worker-process reclamation and can still
+	// resume. When IdleTimeout is disabled, RecordTTL becomes the sole session
+	// lifetime bound and expired sessions' workers are torn down. Zero disables
+	// record expiry (records persist indefinitely — not recommended for
+	// long-running deployments). Default 168h.
+	RecordTTL time.Duration `toml:"record_ttl"`
 }
 
 // AuthConfig configures HTTP API authentication. A token authenticates a
@@ -239,6 +247,7 @@ func DefaultGatewayConfig() GatewayConfig {
 		Sessions: SessionsConfig{
 			IdleTimeout:  2 * time.Hour,
 			ReapInterval: time.Minute,
+			RecordTTL:    168 * time.Hour,
 		},
 		Auth: AuthConfig{Required: true},
 		Workspace: WorkspaceConfig{
@@ -366,6 +375,12 @@ func (c *GatewayConfig) Validate() error {
 	}
 	if c.Sessions.IdleTimeout > 0 && c.Sessions.ReapInterval <= 0 {
 		return fmt.Errorf("config: sessions.reap_interval must be positive when idle reclamation is enabled")
+	}
+	if c.Sessions.RecordTTL < 0 {
+		return fmt.Errorf("config: sessions.record_ttl must not be negative")
+	}
+	if c.Sessions.RecordTTL > 0 && c.Sessions.IdleTimeout > 0 && c.Sessions.RecordTTL <= c.Sessions.IdleTimeout {
+		return fmt.Errorf("config: sessions.record_ttl must exceed idle_timeout so records survive worker reclamation")
 	}
 	if c.Isolation.Required {
 		if strings.TrimSpace(c.Isolation.NsjailVersion) == "" {

@@ -73,9 +73,12 @@ type SessionStore interface {
 	// ErrSessionNotFound for already-deleted sessions.
 	Delete(ctx context.Context, id, callerID string) error
 
-	// Prune physically deletes every expired session as of now and returns how
-	// many were removed.
-	Prune(ctx context.Context, now time.Time) (int, error)
+	// Prune physically deletes every expired session as of now and returns the
+	// ids of the sessions that were removed (in arbitrary order). The ids are
+	// returned to the trusted gateway layer so it can drop any cached handles
+	// for the evicted sessions; they carry no cross-tenant information beyond
+	// what the gateway already owns.
+	Prune(ctx context.Context, now time.Time) ([]string, error)
 }
 
 // NewMemorySessionStore returns the in-memory SessionStore implementation. It
@@ -235,17 +238,17 @@ func (s *memSessionStore) Delete(ctx context.Context, id, callerID string) error
 	return nil
 }
 
-func (s *memSessionStore) Prune(ctx context.Context, now time.Time) (int, error) {
+func (s *memSessionStore) Prune(ctx context.Context, now time.Time) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	n := 0
+	var removed []string
 	for id, rec := range s.byID {
 		if expired(rec, now) {
 			delete(s.byID, id)
-			n++
+			removed = append(removed, id)
 		}
 	}
-	return n, nil
+	return removed, nil
 }
 
 // lookupLocked resolves and owner-checks a session. The caller must hold s.mu.

@@ -137,10 +137,12 @@ func main() {
 		}
 	}
 	handler := openai.NewHandler(openai.Options{
-		Registry:     reg,
-		Store:        runtime.NewMemorySessionStore(),
-		Backend:      backend,
-		CallerTokens: callerTokens,
+		Registry:         reg,
+		Store:            runtime.NewMemorySessionStore(),
+		Backend:          backend,
+		CallerTokens:     callerTokens,
+		SessionRecordTTL: cfg.Sessions.RecordTTL,
+		PruneInterval:    cfg.Sessions.ReapInterval,
 		Enabled: func(name string) bool {
 			agent, ok := cfg.Agents[name]
 			return !ok || agent.Enabled
@@ -195,6 +197,7 @@ func main() {
 		slog.Warn("gateway http shutdown", "error", err)
 	}
 	cancelDrain()
+	handler.Close()
 	workerCtx, cancelWorkers := context.WithTimeout(context.Background(), cfg.Worker.StopGracePeriod+2*time.Second)
 	defer cancelWorkers()
 	if err := backend.Supervisor().Close(workerCtx); err != nil {

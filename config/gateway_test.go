@@ -23,6 +23,34 @@ func TestDefaultGatewayConfig_LifecycleGovernance(t *testing.T) {
 	if c.Sessions.IdleTimeout != 2*time.Hour || c.Sessions.ReapInterval != time.Minute {
 		t.Errorf("Session lifecycle defaults = %v/%v, want 2h/1m", c.Sessions.IdleTimeout, c.Sessions.ReapInterval)
 	}
+	if c.Sessions.RecordTTL != 168*time.Hour {
+		t.Errorf("Session RecordTTL default = %v, want 168h", c.Sessions.RecordTTL)
+	}
+}
+
+// TestGatewayConfig_RecordTTLMustExceedIdleTimeout is a regression test for the
+// session-record leak fix: record_ttl must outlive idle_timeout so a record
+// survives worker reclamation and can still resume. A too-short TTL silently
+// reaped records while their workers still ran.
+func TestGatewayConfig_RecordTTLMustExceedIdleTimeout(t *testing.T) {
+	c := DefaultGatewayConfig()
+	c.Mode = "test"
+	// Equal is rejected; it must strictly exceed.
+	c.Sessions.IdleTimeout = 2 * time.Hour
+	c.Sessions.RecordTTL = 2 * time.Hour
+	if err := c.Validate(); err == nil {
+		t.Fatalf("Validate accepted record_ttl == idle_timeout")
+	}
+	// Longer is accepted.
+	c.Sessions.RecordTTL = 3 * time.Hour
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate rejected record_ttl > idle_timeout: %v", err)
+	}
+	// Negative is rejected.
+	c.Sessions.RecordTTL = -time.Second
+	if err := c.Validate(); err == nil {
+		t.Fatalf("Validate accepted negative record_ttl")
+	}
 }
 
 func TestLoadGateway_LifecycleGovernance(t *testing.T) {

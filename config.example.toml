@@ -22,6 +22,11 @@ heartbeat_failures = 3
 # identity and the native session ID remain available for recovery.
 idle_timeout = "2h"
 reap_interval = "1m"
+# How long a session record (and its native session ID) is retained after the
+# last activity before the background prune loop evicts it and drops its cached
+# worker handle. MUST exceed idle_timeout so a record survives worker
+# reclamation and can still resume. Default 168h.
+record_ttl = "168h"
 
 [auth]
 # Tokens authenticate callers, not end users. Health probes are always

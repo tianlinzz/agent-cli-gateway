@@ -287,6 +287,14 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		}
 		return
 	}
+	// Every turn refreshes the record's TTL so an active session is never
+	// reaped by the prune loop, while an idle session expires and is evicted
+	// (with its handle) to bound long-run memory growth.
+	if h.recordTTL > 0 {
+		if err := h.store.Touch(r.Context(), sessionID, callerID, h.recordTTL); err != nil {
+			slog.Debug("openai: refresh session ttl", "session", sessionID, "error", err)
+		}
+	}
 
 	ts := h.registerTurn(sessionID)
 	turnCtx, turnCancel := context.WithCancel(r.Context())

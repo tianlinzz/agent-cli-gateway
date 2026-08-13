@@ -72,6 +72,17 @@ type Options struct {
 	// 250ms.
 	UsageGrace time.Duration
 
+	// SessionRecordTTL bounds how long an idle session record is retained after
+	// the last activity. The Handler runs a background prune loop (at
+	// PruneInterval) that evicts expired records and drops their cached
+	// execution handles, bounding memory growth in long-running deployments.
+	// Zero disables record expiry. Default 168h; must exceed the worker idle
+	// reclamation timeout to preserve resume across worker recycling.
+	SessionRecordTTL time.Duration
+	// PruneInterval is how often expired session records are scanned and
+	// evicted. Zero disables the prune loop. Default 1m.
+	PruneInterval time.Duration
+
 	// Now returns the current time (injectable for deterministic tests).
 	Now func() time.Time
 }
@@ -94,6 +105,11 @@ type Handler struct {
 
 	newID func() string
 	now   func() time.Time
+
+	recordTTL  time.Duration
+	pruneStop  chan struct{}
+	pruneDone  chan struct{}
+	pruneClose sync.Once
 
 	mu                 sync.Mutex
 	handles            map[string]runtime.ExecutionHandle // sessionID -> live execution
@@ -264,6 +280,12 @@ func NewHandler(opts Options) *Handler {
 	if opts.UsageGrace <= 0 {
 		opts.UsageGrace = 250 * time.Millisecond
 	}
+	if opts.SessionRecordTTL == 0 {
+		opts.SessionRecordTTL = 168 * time.Hour
+	}
+	if opts.PruneInterval == 0 {
+		opts.PruneInterval = time.Minute
+	}
 	now := opts.Now
 	if now == nil {
 		now = time.Now
@@ -279,12 +301,54 @@ func NewHandler(opts Options) *Handler {
 		usageGrace:      opts.UsageGrace,
 		newID:           newRandomID,
 		now:             now,
+		recordTTL:       opts.SessionRecordTTL,
 		handles:         make(map[string]runtime.ExecutionHandle),
 		turns:           make(map[string]*turnState),
 		serverToolIDs:   make(map[string]*serverToolLedger),
 	}
 	h.catalog = &modelCatalog{reg: opts.Registry, enabled: opts.Enabled, models: opts.Models}
+	// A record TTL with a positive interval runs a background prune loop that
+	// bounds session-record and handle growth. It is stopped by Close.
+	if h.recordTTL > 0 && opts.PruneInterval > 0 {
+		h.pruneStop = make(chan struct{})
+		h.pruneDone = make(chan struct{})
+		go h.pruneLoop(opts.PruneInterval)
+	}
 	return h
+}
+
+// Close stops the background prune loop. It is safe to call concurrently and
+// more than once. The HTTP server and execution backend are owned by the
+// caller and are not closed here.
+func (h *Handler) Close() {
+	if h.pruneStop == nil {
+		return
+	}
+	h.pruneClose.Do(func() { close(h.pruneStop) })
+	<-h.pruneDone
+}
+
+// pruneLoop periodically evicts expired session records and drops their cached
+// execution handles so neither grows unbounded over the process lifetime.
+func (h *Handler) pruneLoop(interval time.Duration) {
+	defer close(h.pruneDone)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-h.pruneStop:
+			return
+		case <-ticker.C:
+			removed, err := h.store.Prune(context.Background(), h.now())
+			if err != nil {
+				slog.Warn("openai: prune session records", "error", err)
+				continue
+			}
+			for _, id := range removed {
+				h.dropHandleByID(id)
+			}
+		}
+	}
 }
 
 // Routes returns the mounted HTTP handler (auth middleware applied; health
@@ -419,6 +483,29 @@ func (h *Handler) dropHandle(sessionID string, handle runtime.ExecutionHandle) {
 	if current, ok := h.handles[sessionID]; ok && current == handle {
 		delete(h.handles, sessionID)
 	}
+}
+
+// dropHandleByID removes and closes whatever handle is registered under
+// sessionID. It is used by the prune loop to reclaim a handle whose session
+// record has expired. The close runs in a bounded goroutine so a wedged
+// teardown can never stall the prune loop. Because an in-flight turn refreshes
+// the record's TTL (see chat_completions.go), an expired record guarantees no
+// active turn, so closing its handle is always safe.
+func (h *Handler) dropHandleByID(sessionID string) {
+	h.mu.Lock()
+	handle, ok := h.handles[sessionID]
+	if ok {
+		delete(h.handles, sessionID)
+	}
+	h.mu.Unlock()
+	if !ok || handle == nil {
+		return
+	}
+	go func(handle runtime.ExecutionHandle) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = handle.Close(ctx)
+	}(handle)
 }
 
 // registerTurn marks a turn as in flight for abort coordination. Each turn

@@ -98,6 +98,7 @@ func newThreeAgentServer(t *testing.T) (*httptest.Server, *threeAgentBackend) {
 		UsageGrace:   15 * time.Millisecond,
 		Enabled:      func(name string) bool { return true },
 	})
+	t.Cleanup(h.Close)
 	ts := httptest.NewServer(h.Routes())
 	t.Cleanup(ts.Close)
 	return ts, backend

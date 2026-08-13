@@ -239,6 +239,7 @@ func newTestHandler(t *testing.T, opts *Options) (*Handler, *fakeBackend) {
 	o.Store = store
 	o.Backend = backend
 	h := NewHandler(o)
+	t.Cleanup(h.Close)
 	return h, backend
 }
 
@@ -267,6 +268,73 @@ func newTestServer(t *testing.T, mut ...func(*Options)) (*httptest.Server, *Hand
 	ts := httptest.NewServer(h.Routes())
 	t.Cleanup(ts.Close)
 	return ts, h, backend
+}
+
+// TestHandlerPruneLoopEvictsExpiredRecordAndClosesHandle is a regression test
+// for the session-record/handle leak (U1): an expired session record must be
+// evicted by the background prune loop, and its cached execution handle must be
+// dropped and closed so neither grows unbounded over the process lifetime.
+func TestHandlerPruneLoopEvictsExpiredRecordAndClosesHandle(t *testing.T) {
+	reg := runtime.NewRegistry()
+	mustRegister(t, reg, "codex", codexDesc, nil)
+	store := runtime.NewMemorySessionStore()
+	h := NewHandler(Options{
+		Registry:         reg,
+		Store:            store,
+		Backend:          newFakeBackend(),
+		SessionRecordTTL: time.Hour,
+		PruneInterval:    5 * time.Millisecond,
+	})
+	t.Cleanup(h.Close)
+
+	const sid = "sess-expiring"
+	ctx := context.Background()
+	// Seed a session record born already expired plus its cached handle.
+	rec := runtime.SessionRecord{
+		ID:        sid,
+		CallerID:  testOwner,
+		ModelID:   "codex",
+		Status:    runtime.SessionActive,
+		ExpiresAt: time.Now().Add(-time.Minute),
+	}
+	if err := store.Create(ctx, rec); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	fh := newFakeHandle(nil)
+	h.registerHandle(sid, fh)
+	if h.getHandle(sid) == nil {
+		t.Fatal("handle not registered")
+	}
+
+	// The prune loop evicts the record and dropHandleByID drops+closes the
+	// handle. Poll the handle map (not store.Get, which would lazy-purge the
+	// record and race the prune loop). dropHandleByID only runs for ids Prune
+	// actually removed, so a nil handle proves the full chain ran.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if h.getHandle(sid) == nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := h.getHandle(sid); got != nil {
+		t.Fatalf("handle still registered after prune: %v", got)
+	}
+	// The record is gone too (List omits expired records without purging).
+	recs, err := store.List(ctx, testOwner)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	for _, r := range recs {
+		if r.ID == sid {
+			t.Fatalf("expired record survived prune: %+v", r)
+		}
+	}
+	select {
+	case <-fh.closed:
+	case <-time.After(time.Second):
+		t.Fatal("expired session handle was not closed by prune loop")
+	}
 }
 
 func doAuthJSON(t *testing.T, method, url, token, owner string, body any) *http.Response {
