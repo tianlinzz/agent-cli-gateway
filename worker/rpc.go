@@ -251,9 +251,11 @@ func Serve(ctx context.Context, ep Endpoint, h Handler) error {
 			srv.GracefulStop()
 			close(stopped)
 		}()
+		drain := time.NewTimer(2 * time.Second)
+		defer drain.Stop()
 		select {
 		case <-stopped:
-		case <-time.After(2 * time.Second):
+		case <-drain.C:
 			srv.Stop()
 		}
 		return nil

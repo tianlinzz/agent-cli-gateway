@@ -504,18 +504,22 @@ func (s *Session) Close(ctx context.Context) error {
 	if err != nil {
 		slog.Warn("claudecode: close stdin", "error", err)
 	}
+	graceTimer := time.NewTimer(s.opts.CloseTimeout)
+	defer graceTimer.Stop()
 	select {
 	case <-s.done:
 		return nil
-	case <-time.After(s.opts.CloseTimeout):
+	case <-graceTimer.C:
 	}
 	if err := s.process.SignalGraceful(); err != nil {
 		slog.Warn("claudecode: graceful process signal", "error", err)
 	}
+	killTimer := time.NewTimer(5 * time.Second)
+	defer killTimer.Stop()
 	select {
 	case <-s.done:
 		return nil
-	case <-time.After(5 * time.Second):
+	case <-killTimer.C:
 	case <-ctx.Done():
 		return protocolError("close wait: %w", ctx.Err())
 	}

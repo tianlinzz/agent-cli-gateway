@@ -503,3 +503,96 @@ func TestSessionRecordContainsNoProcessPointers(t *testing.T) {
 		}
 	}
 }
+
+// TestSessionStore_PerCallerCapRejected is a regression test for the Phase 2
+// session record cap: a caller at its record cap gets ErrSessionCapacity from
+// Create (mapped to 429 by the API layer), while other callers still create.
+func TestSessionStore_PerCallerCapRejected(t *testing.T) {
+	store := runtime.NewCappedMemorySessionStore(runtime.SessionLimits{MaxPerCaller: 2})
+	ctx := context.Background()
+
+	for _, id := range []string{"s1", "s2"} {
+		if err := store.Create(ctx, sessionRec(id, "alice")); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+	}
+	err := store.Create(ctx, sessionRec("s3", "alice"))
+	if !errors.Is(err, runtime.ErrSessionCapacity) {
+		t.Fatalf("third session for alice: got %v, want ErrSessionCapacity", err)
+	}
+	// Another caller is unaffected by alice's cap.
+	if err := store.Create(ctx, sessionRec("s-bob", "bob")); err != nil {
+		t.Fatalf("bob create: %v", err)
+	}
+	// Deleting a record frees capacity.
+	if err := store.Delete(ctx, "s1", "alice"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if err := store.Create(ctx, sessionRec("s3", "alice")); err != nil {
+		t.Fatalf("create after delete: %v", err)
+	}
+}
+
+// TestSessionStore_GlobalCapRejected verifies the global session record cap
+// spans all callers.
+func TestSessionStore_GlobalCapRejected(t *testing.T) {
+	store := runtime.NewCappedMemorySessionStore(runtime.SessionLimits{MaxTotal: 2})
+	ctx := context.Background()
+
+	if err := store.Create(ctx, sessionRec("s1", "alice")); err != nil {
+		t.Fatalf("create s1: %v", err)
+	}
+	if err := store.Create(ctx, sessionRec("s2", "bob")); err != nil {
+		t.Fatalf("create s2: %v", err)
+	}
+	err := store.Create(ctx, sessionRec("s3", "carol"))
+	if !errors.Is(err, runtime.ErrSessionCapacity) {
+		t.Fatalf("third session globally: got %v, want ErrSessionCapacity", err)
+	}
+}
+
+// TestSessionStore_CapIsAtomicUnderConcurrency is a regression test for the
+// Phase 2 review finding that the per-caller cap was a non-atomic
+// list-then-create check: concurrent Create calls for the same caller must
+// never admit more than MaxPerCaller records.
+func TestSessionStore_CapIsAtomicUnderConcurrency(t *testing.T) {
+	const (
+		attempts = 64
+		cap      = 8
+	)
+	store := runtime.NewCappedMemorySessionStore(runtime.SessionLimits{MaxPerCaller: cap})
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_ = store.Create(ctx, sessionRec("s-"+strconv.Itoa(i), "alice"))
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	recs, err := store.List(ctx, "alice")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(recs) != cap {
+		t.Fatalf("concurrent creates admitted %d records, want exactly the cap %d", len(recs), cap)
+	}
+}
+
+// TestSessionStore_UncappedStoreUnlimited verifies the default store keeps
+// unlimited semantics (backwards compatibility).
+func TestSessionStore_UncappedStoreUnlimited(t *testing.T) {
+	store := runtime.NewMemorySessionStore()
+	ctx := context.Background()
+	for i := 0; i < 32; i++ {
+		if err := store.Create(ctx, sessionRec("s"+strconv.Itoa(i), "alice")); err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+	}
+}

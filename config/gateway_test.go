@@ -434,3 +434,29 @@ inject_system_prompt = true
 		t.Error("claude-code.inject_system_prompt must default false")
 	}
 }
+
+// TestGatewayConfig_RunRecordTTLDefaultAndValidation covers the O-F11 run
+// record lifecycle knobs added by the Phase 2 review: a positive default, TOML
+// override, and rejection of negative values.
+func TestGatewayConfig_RunRecordTTLDefaultAndValidation(t *testing.T) {
+	def := DefaultGatewayConfig()
+	if def.Sessions.RunRecordTTL <= 0 {
+		t.Fatalf("default run_record_ttl = %v, want positive", def.Sessions.RunRecordTTL)
+	}
+
+	cfg := DefaultGatewayConfig()
+	cfg.Sessions.RunRecordTTL = -time.Second
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("negative run_record_ttl must be rejected")
+	}
+}
+
+// TestGatewayConfig_MaxSessionsValidation covers the global session record cap
+// knob (Phase 0-deferred, Phase 2-required).
+func TestGatewayConfig_MaxSessionsValidation(t *testing.T) {
+	cfg := DefaultGatewayConfig()
+	cfg.Limits.MaxSessions = -1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("negative max_sessions must be rejected")
+	}
+}

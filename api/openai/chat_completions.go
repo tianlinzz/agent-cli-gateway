@@ -149,6 +149,11 @@ func sanitizeMetadata(m map[string]any) (map[string]string, error) {
 			continue
 		case "native_session_id", "codex_thread_id", "claude_session_id", "kimi_session_id":
 			continue
+		case "run_id", "request_id", "trace_id":
+			// Server-owned correlation identity: the gateway injects the sole
+			// canonical values after sanitization, so a client can never
+			// forge them (O-F11).
+			continue
 		}
 		if len(k) > maxMetadataKeyBytes {
 			return nil, fmt.Errorf("metadata key %q exceeds %d bytes", k, maxMetadataKeyBytes)
@@ -283,6 +288,12 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			// id. Re-read it and apply the normal ownership/model/workspace
 			// checks; never overwrite the winner.
 			rec, err = h.store.Get(r.Context(), sessionID, callerID)
+		} else if errors.Is(createErr, runtime.ErrSessionCapacity) {
+			// Session record cap (global or per-caller) exhausted: the overload
+			// contract (O-F10) requires a fast, deterministic 429 — the record
+			// was never created, so there is nothing to clean up.
+			writeRateLimited(w, rateLimited(string(ScopeSessions), "cap_reached"))
+			return
 		} else {
 			writeError(w, http.StatusInternalServerError, serverError("failed to create session: "+createErr.Error()))
 			return
@@ -320,12 +331,14 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	runID := h.newRunID()
 	w.Header().Set(h.runHeader, runID)
 
-	// Admission control: check active-run/session limits before acquiring the
-	// turn (O-F10). The release is deferred so every terminal path decrements
-	// exactly once.
-	admitted := false
+	// Admission control: check active-run limits before acquiring the turn
+	// (O-F10). The release defer is installed IMMEDIATELY after a successful
+	// acquire — before BeginTurn and every other fallible step below — so no
+	// failure path can leak the slot (leaked slots permanently inflate the
+	// counters and eventually 429 every later request).
 	if h.admit != nil {
-		if err := h.admit.Acquire(r.Context(), callerID, workspaceID, h.admitLmt, created); err != nil {
+		release, err := h.admit.Acquire(r.Context(), callerID, workspaceID)
+		if err != nil {
 			var ae *ErrAdmissionRejected
 			if errors.As(err, &ae) {
 				if created {
@@ -337,7 +350,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusInternalServerError, serverError(err.Error()))
 			return
 		}
-		admitted = true
+		defer release()
 	}
 
 	// Single active turn per session (the store's BeginTurn is the arbiter).
@@ -374,28 +387,54 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	turnCtx, turnCancel := context.WithCancel(r.Context())
 	ts.setCancel(turnCancel)
 
-	// Record the run for observability and status correlation.
-	runStartedAt := h.now()
-	_ = h.runs.Create(r.Context(), runtime.RunRecord{
-		ID:          runID,
-		SessionID:   sessionID,
-		CallerID:    callerID,
-		WorkspaceID: workspaceID,
-		ModelID:     route.AdapterID,
-		Status:      runtime.RunStarting,
-		StartedAt:   runStartedAt,
-	})
-
+	// The in-flight gauge and the turn cleanup defer are installed BEFORE the
+	// run record is created so every later path — including a record-creation
+	// failure — releases exactly what it acquired.
+	h.incActiveRuns()
 	failed := false
 	defer func() {
 		h.clearTurn(sessionID, callerID, ts)
-		if admitted {
-			h.admit.Release(callerID, workspaceID)
-		}
+		h.decActiveRuns()
 		if created && failed {
 			h.deleteSession(context.Background(), sessionID, callerID)
 		}
 	}()
+
+	// Record the run for observability and status correlation. ModelID keeps
+	// the PUBLIC model the caller asked for (it may differ from the adapter
+	// id when models are mapped); metrics stay keyed by the bounded adapter
+	// id. A run that cannot be recorded must not execute: the response would
+	// advertise a Run header with no correlatable record (O-F11).
+	runStartedAt := h.now()
+	if err := h.runs.Create(r.Context(), runtime.RunRecord{
+		ID:          runID,
+		SessionID:   sessionID,
+		CallerID:    callerID,
+		WorkspaceID: workspaceID,
+		ModelID:     req.Model,
+		Status:      runtime.RunStarting,
+		StartedAt:   runStartedAt,
+	}); err != nil {
+		failed = true
+		h.logger.Error("openai: run store create", "run_id", runID, "session", sessionID, "error", err)
+		writeError(w, http.StatusInternalServerError, serverError("failed to record run"))
+		return
+	}
+
+	// Server-owned run identity crosses the API boundary on EVERY turn —
+	// both the StartRequest and each Input — so the worker/agent side can
+	// correlate logs and events with the exact run the response headers
+	// advertise (O-F11). sanitizeMetadata strips client-supplied
+	// run_id/request_id/trace_id, so these values cannot be forged. Injected
+	// BEFORE startReq is built so both share the same metadata map.
+	if input.Metadata == nil {
+		input.Metadata = make(map[string]string, 3)
+	}
+	input.Metadata["run_id"] = runID
+	input.Metadata["request_id"] = reqID
+	if traceID != "" {
+		input.Metadata["trace_id"] = traceID
+	}
 
 	// Execution goes through the runtime.ExecutionBackend — the API never
 	// starts a CLI itself. A live session reuses its existing execution.
@@ -419,7 +458,15 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		handle, err = h.backend.Start(r.Context(), startReq)
 		if err != nil {
 			failed = true
-			h.finishRun(runID, route.AdapterID, reqID, traceID, runStartedAt, runtime.RunFailed, nil, "start_failed")
+			// A backend at a configured capacity (e.g. max_workers) must
+			// surface as 429 + Retry-After (O-F10), never a 500 after the
+			// session/turn state was already built.
+			if errors.Is(err, runtime.ErrCapacityExceeded) {
+				h.finishRun(runID, route.AdapterID, reqID, traceID, sessionID, callerID, workspaceID, workerStateOf(nil), runStartedAt, runtime.RunFailed, nil, "worker_capacity")
+				writeRateLimited(w, rateLimited(string(ScopeWorkers), "max_workers"))
+				return
+			}
+			h.finishRun(runID, route.AdapterID, reqID, traceID, sessionID, callerID, workspaceID, workerStateOf(nil), runStartedAt, runtime.RunFailed, nil, "start_failed")
 			writeError(w, http.StatusInternalServerError, serverError("failed to start agent execution: "+err.Error()))
 			return
 		}
@@ -434,27 +481,47 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	handle, err = h.deliverTurn(turnCtx, sessionID, handle, startReq, input)
 	if err != nil {
 		failed = true
+		// A per-agent concurrency slot (or worker capacity on restart) is
+		// full: the overload contract (O-F10) requires a fast 429, not a 500
+		// or an unbounded wait.
+		if errors.Is(err, runtime.ErrCapacityExceeded) {
+			h.finishRun(runID, route.AdapterID, reqID, traceID, sessionID, callerID, workspaceID, workerStateOf(handle), runStartedAt, runtime.RunFailed, nil, "agent_capacity")
+			writeRateLimited(w, rateLimited(string(ScopeAgent), "max_concurrency"))
+			return
+		}
 		status := runtime.RunFailed
 		if r.Context().Err() != nil {
-			status = runtime.RunCancelled
+			// The client is gone; the interrupt is unconfirmed, so the
+			// completion outcome is unknown — not a confirmed cancellation.
+			status = runtime.RunOutcomeUnknown
 		}
-		h.finishRun(runID, route.AdapterID, reqID, traceID, runStartedAt, status, nil, "send_failed")
+		h.finishRun(runID, route.AdapterID, reqID, traceID, sessionID, callerID, workspaceID, workerStateOf(handle), runStartedAt, status, nil, "send_failed")
 		if r.Context().Err() != nil {
 			return // the client is gone; nothing to write
 		}
 		writeError(w, http.StatusInternalServerError, serverError("failed to send turn: "+err.Error()))
 		return
 	}
+	// The turn is actually executing now (was delivered to a live worker):
+	// record the transition out of RunStarting so an in-flight run is
+	// distinguishable from one that never started (O-F11).
+	if _, err := h.runs.Update(context.Background(), runID, func(r *runtime.RunRecord) {
+		if r.Status == runtime.RunStarting {
+			r.Status = runtime.RunRunning
+		}
+	}); err != nil {
+		h.logger.Warn("openai: run status transition to running", "run_id", runID, "error", err)
+	}
 
 	if req.Stream {
 		includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
 		status := h.streamTurn(w, r, turnCtx, req.Model, sessionID, callerID, handle, includeUsage)
-		h.finishRun(runID, route.AdapterID, reqID, traceID, runStartedAt, status, nil, "")
+		h.finishRun(runID, route.AdapterID, reqID, traceID, sessionID, callerID, workspaceID, workerStateOf(handle), runStartedAt, status, nil, "")
 		return
 	}
 	res := h.aggregateTurn(turnCtx, sessionID, callerID, handle)
 	h.writeCompletion(w, r, req.Model, res)
-	h.finishRun(runID, route.AdapterID, reqID, traceID, runStartedAt, runStatusFromTurnResult(res), res.usage, "")
+	h.finishRun(runID, route.AdapterID, reqID, traceID, sessionID, callerID, workspaceID, workerStateOf(handle), runStartedAt, runStatusFromTurnResult(res), res.usage, "")
 }
 
 // closedHandle is the optional capability an ExecutionHandle implements to
@@ -601,10 +668,14 @@ func (h *Handler) handleAbort(w http.ResponseWriter, r *http.Request) {
 		// Cancel the turn context so the streaming/aggregation loop unblocks,
 		// then wait for its cleanup (EndTurn) to complete.
 		ts.cancelTurn()
+		h.incQueuedRuns()
+		settle := time.NewTimer(turnHandoffTimeout)
+		defer settle.Stop()
 		select {
 		case <-ts.done:
-		case <-time.After(turnHandoffTimeout):
+		case <-settle.C:
 		}
+		h.decQueuedRuns()
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "aborted"})
 }
@@ -622,6 +693,12 @@ type turnResult struct {
 	timedOut     bool
 	aborted      bool
 	finished     bool // true when EventFinish was received (distinguishes outcome_unknown)
+	// abortSettled/timeoutSettled record whether the cancel/timeout was
+	// CONFIRMED (abort RPC succeeded and a terminal event drained). An
+	// unconfirmed interrupt maps to RunOutcomeUnknown, never
+	// RunCancelled/RunTimedOut (final review P1).
+	abortSettled   bool
+	timeoutSettled bool
 }
 
 // aggregateTurn consumes canonical events until the turn ends (EventFinish,
@@ -649,10 +726,12 @@ func (h *Handler) aggregateTurn(ctx context.Context, sessionID, callerID string,
 		select {
 		case <-ctx.Done():
 			// Client disconnect or explicit abort: the turn must be killed at
-			// the worker so no orphaned CLI keeps running.
+			// the worker so no orphaned CLI keeps running. Only a settled
+			// interrupt (abort confirmed + terminal drained) is a confirmed
+			// cancellation.
 			res.aborted = true
 			h.markTurnSettling(sessionID)
-			h.abortAndDrain(context.Background(), sessionID, handle)
+			res.abortSettled = h.abortAndDrain(context.Background(), sessionID, handle)
 			return res
 		case ev, ok := <-handle.Events():
 			if !ok {
@@ -709,23 +788,32 @@ func (h *Handler) aggregateTurn(ctx context.Context, sessionID, callerID string,
 			res.timedOut = true
 			res.finishReason = "length"
 			h.markTurnSettling(sessionID)
-			// Settle and drain the timed-out turn before this session is reused.
-			h.abortAndDrain(context.Background(), sessionID, handle)
+			// Settle and drain the timed-out turn before this session is
+			// reused; only a settled interrupt counts as a confirmed timeout.
+			res.timeoutSettled = h.abortAndDrain(context.Background(), sessionID, handle)
 			return res
 		}
 	}
 }
 
 // runStatusFromTurnResult maps the non-streaming turn outcome to a RunStatus.
-// The events-closed-without-finish case is RunOutcomeUnknown, not RunSucceeded.
+// Cancelled/timed-out only count as confirmed when the interrupt settled;
+// otherwise the completion outcome is unknown. The
+// events-closed-without-finish case is RunOutcomeUnknown, not RunSucceeded.
 func runStatusFromTurnResult(res turnResult) runtime.RunStatus {
 	switch {
 	case res.failed:
 		return runtime.RunFailed
-	case res.timedOut:
-		return runtime.RunTimedOut
 	case res.aborted:
-		return runtime.RunCancelled
+		if res.abortSettled {
+			return runtime.RunCancelled
+		}
+		return runtime.RunOutcomeUnknown
+	case res.timedOut:
+		if res.timeoutSettled {
+			return runtime.RunTimedOut
+		}
+		return runtime.RunOutcomeUnknown
 	case !res.finished:
 		return runtime.RunOutcomeUnknown
 	default:
@@ -733,13 +821,33 @@ func runStatusFromTurnResult(res turnResult) runtime.RunStatus {
 	}
 }
 
+// workerStateOf reports the execution handle's terminal state for run
+// correlation: whether the worker/execution was still alive, had terminated,
+// or never existed when the run finished. It distinguishes worker
+// crash/reclaim terminal sources in the run-finished log (O-F11).
+func workerStateOf(handle runtime.ExecutionHandle) string {
+	if handle == nil {
+		return "none"
+	}
+	if ch, ok := handle.(closedHandle); ok {
+		if ch.Closed() {
+			return "terminated"
+		}
+		return "alive"
+	}
+	return "unknown"
+}
+
 // finishRun records the terminal run status, usage, and duration in the run
-// store and metrics. It is safe to call on any terminal path.
-func (h *Handler) finishRun(runID, adapterID, reqID, traceID string, startedAt time.Time, status runtime.RunStatus, usage *usageInfo, errorCode string) {
+// store and metrics, and emits the correlated run-finished log line. It is
+// safe to call on any terminal path. The log carries the full correlation
+// chain required by O-F11: caller, gateway session, workspace, worker state,
+// and terminal status; the metrics use only bounded-cardinality labels.
+func (h *Handler) finishRun(runID, adapterID, reqID, traceID, sessionID, callerID, workspaceID, workerState string, startedAt time.Time, status runtime.RunStatus, usage *usageInfo, errorCode string) {
 	now := h.now()
 	duration := now.Sub(startedAt).Seconds()
 
-	_, _ = h.runs.Update(context.Background(), runID, func(r *runtime.RunRecord) {
+	_, err := h.runs.Update(context.Background(), runID, func(r *runtime.RunRecord) {
 		r.Status = status
 		r.FinishedAt = now
 		r.ErrorCode = errorCode
@@ -751,12 +859,20 @@ func (h *Handler) finishRun(runID, adapterID, reqID, traceID string, startedAt t
 			}
 		}
 	})
+	if err != nil {
+		h.logger.Warn("openai: run store terminal update", "run_id", runID, "status", status, "error", err)
+	}
 
 	labels := map[string]string{"status": string(status), "adapter": adapterID}
 	h.metrics.IncCounter("gateway_runs_total", 1, labels)
 	h.metrics.ObserveHistogram("gateway_run_duration_seconds", duration, labels)
-	if status == runtime.RunOutcomeUnknown {
+	switch status {
+	case runtime.RunOutcomeUnknown:
 		h.metrics.IncCounter("gateway_unknown_outcomes_total", 1, map[string]string{"adapter": adapterID})
+	case runtime.RunCancelled:
+		h.metrics.IncCounter("gateway_run_aborts_total", 1, map[string]string{"adapter": adapterID})
+	case runtime.RunTimedOut:
+		h.metrics.IncCounter("gateway_run_timeouts_total", 1, map[string]string{"adapter": adapterID})
 	}
 	if usage != nil {
 		dirLabels := map[string]string{"adapter": adapterID}
@@ -768,7 +884,11 @@ func (h *Handler) finishRun(runID, adapterID, reqID, traceID string, startedAt t
 		"run_id", runID,
 		"request_id", reqID,
 		"trace_id", traceID,
+		"caller", callerID,
+		"session", sessionID,
+		"workspace", workspaceID,
 		"adapter", adapterID,
+		"worker", workerState,
 		"status", status,
 		"duration_ms", duration*1000,
 		"error_code", errorCode,

@@ -259,3 +259,24 @@ func rejectImport(t *testing.T, file, imported string, forbidden ...string) {
 		}
 	}
 }
+
+// TestNoTimeAfterInProduction enforces the O-B6 timer discipline: production
+// code must use stoppable timers (time.NewTimer/time.NewTicker with Stop)
+// instead of time.After, whose timer cannot be stopped and is only reclaimed
+// after it fires. Test files are exempt.
+func TestNoTimeAfterInProduction(t *testing.T) {
+	root := moduleRoot(t)
+	walkGoFiles(t, root, func(file, relative string) {
+		if strings.HasSuffix(relative, "_test.go") {
+			return
+		}
+		data, err := os.ReadFile(file)
+		if err != nil {
+			t.Errorf("read %s: %v", relative, err)
+			return
+		}
+		if strings.Contains(string(data), "time.After(") {
+			t.Errorf("production code must use a stoppable timer (time.NewTimer), found time.After: %s", relative)
+		}
+	})
+}

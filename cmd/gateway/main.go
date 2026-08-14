@@ -143,9 +143,12 @@ func main() {
 		*workerExec = envOrDefault("GW_WORKER_EXEC", "gateway-worker")
 	}
 
+	metricsReg := metrics.NewRegistry()
+
 	// The supervisor forks one nsjail-wrapped worker child per session. The
 	// API process never starts an agent CLI directly; all execution flows
-	// through this backend.
+	// through this backend. It records worker lifecycle metrics (crashes,
+	// reclaims, live gauge) into the shared registry.
 	backend, err := worker.NewLocalExecutionBackend(worker.Config{
 		Mode:                cfg.Mode,
 		Isolation:           cfg.Isolation,
@@ -162,6 +165,7 @@ func main() {
 		MaxWorkers:          cfg.Limits.MaxWorkers,
 		MaxWorkerLogBytes:   cfg.Limits.MaxWorkerLogBytes,
 		Agents:              agentExecutionConfigs(cfg.Agents),
+		Metrics:             metricsReg,
 	})
 	if err != nil {
 		slog.Error("create execution backend", "error", err)
@@ -188,22 +192,20 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	metricsReg := metrics.NewRegistry()
-
-	// Admission control (O-F10): the store is shared so session-count checks
-	// see the same records the handler manages.
-	sessionStore := runtime.NewMemorySessionStore()
-	admit := openai.NewAdmissionController(struct {
-		MaxActiveRuns             int
-		MaxActiveRunsPerCaller    int
-		MaxActiveRunsPerWorkspace int
-		MaxSessionsPerCaller      int
-	}{
+	// Admission control (O-F10): active-run limits reject at the admission
+	// gate; session record caps are enforced atomically by the capped store.
+	// The workers callback is a fast max_workers precheck backed by the
+	// supervisor's live worker count.
+	sessionStore := runtime.NewCappedMemorySessionStore(runtime.SessionLimits{
+		MaxTotal:     cfg.Limits.MaxSessions,
+		MaxPerCaller: cfg.Limits.MaxSessionsPerCaller,
+	})
+	admit := openai.NewAdmissionController(openai.AdmissionLimits{
 		MaxActiveRuns:             cfg.Limits.MaxActiveRuns,
 		MaxActiveRunsPerCaller:    cfg.Limits.MaxActiveRunsPerCaller,
 		MaxActiveRunsPerWorkspace: cfg.Limits.MaxActiveRunsPerWorkspace,
-		MaxSessionsPerCaller:      cfg.Limits.MaxSessionsPerCaller,
-	}, sessionStore, metricsReg.IncCounter)
+		MaxWorkers:                cfg.Limits.MaxWorkers,
+	}, backend.ActiveWorkers, metricsReg.IncCounter)
 
 	handler := openai.NewHandler(openai.Options{
 		Registry:         reg,
@@ -211,18 +213,12 @@ func main() {
 		Backend:          backend,
 		CallerTokens:     callerTokens,
 		SessionRecordTTL: cfg.Sessions.RecordTTL,
+		RunRecordTTL:     cfg.Sessions.RunRecordTTL,
 		PruneInterval:    cfg.Sessions.ReapInterval,
 		Runs:             runtime.NewMemoryRunStore(),
 		Logger:           logger,
 		Metrics:          metricsReg,
 		Admission:        admit,
-		AdmissionLimits: openai.AdmissionLimits{
-			MaxActiveRuns:             cfg.Limits.MaxActiveRuns,
-			MaxActiveRunsPerCaller:    cfg.Limits.MaxActiveRunsPerCaller,
-			MaxActiveRunsPerWorkspace: cfg.Limits.MaxActiveRunsPerWorkspace,
-			MaxSessionsPerCaller:      cfg.Limits.MaxSessionsPerCaller,
-			MaxWorkers:                cfg.Limits.MaxWorkers,
-		},
 		Enabled: func(name string) bool {
 			agent, ok := cfg.Agents[name]
 			return !ok || agent.Enabled

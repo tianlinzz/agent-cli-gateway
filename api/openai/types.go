@@ -90,6 +90,11 @@ type Options struct {
 	// Zero disables record expiry. Default 168h; must exceed the worker idle
 	// reclamation timeout to preserve resume across worker recycling.
 	SessionRecordTTL time.Duration
+	// RunRecordTTL bounds how long a terminal RunRecord is retained in the
+	// run store before the same prune loop deletes it. Zero defaults to 24h;
+	// negative disables run-record expiry. Without this, every turn leaks one
+	// RunRecord for the process lifetime (O-F11 lifecycle closure).
+	RunRecordTTL time.Duration
 	// PruneInterval is how often expired session records are scanned and
 	// evicted. Zero disables the prune loop. Default 1m.
 	PruneInterval time.Duration
@@ -107,11 +112,10 @@ type Options struct {
 	// Defaults to NoopMetrics.
 	Metrics runtime.Metrics
 
-	// Admission is the admission controller for active-run/session limits.
-	// When nil, no admission control is applied.
+	// Admission is the admission controller for active-run/worker limits.
+	// Limits are fixed at the controller's construction; when nil, no
+	// admission control is applied.
 	Admission *AdmissionController
-	// AdmissionLimits configures the limits the Admission controller enforces.
-	AdmissionLimits AdmissionLimits
 }
 
 // Handler serves the OpenAI-compatible HTTP routes. All state is guarded for
@@ -128,11 +132,14 @@ type Handler struct {
 	workspaceHeader string
 	runHeader       string
 
-	runs     runtime.RunStore
-	logger   *slog.Logger
-	metrics  runtime.Metrics
-	admit    *AdmissionController
-	admitLmt AdmissionLimits
+	runs    runtime.RunStore
+	logger  *slog.Logger
+	metrics runtime.Metrics
+	admit   *AdmissionController
+
+	activeRuns atomic.Int64 // in-flight turns, published as gateway_active_runs
+	queuedRuns atomic.Int64 // turns waiting for a settling predecessor, published as gateway_queued_runs
+	runTTL     time.Duration
 
 	turnTimeout time.Duration
 	usageGrace  time.Duration
@@ -267,6 +274,8 @@ func (h *Handler) awaitSettlingTurn(ctx context.Context, sessionID string) bool 
 	if !ts.settling.Load() {
 		return false
 	}
+	h.incQueuedRuns()
+	defer h.decQueuedRuns()
 	timer := time.NewTimer(turnHandoffTimeout)
 	defer timer.Stop()
 	select {
@@ -320,6 +329,9 @@ func NewHandler(opts Options) *Handler {
 	if opts.SessionRecordTTL == 0 {
 		opts.SessionRecordTTL = 168 * time.Hour
 	}
+	if opts.RunRecordTTL == 0 {
+		opts.RunRecordTTL = 24 * time.Hour
+	}
 	if opts.PruneInterval == 0 {
 		opts.PruneInterval = time.Minute
 	}
@@ -340,6 +352,7 @@ func NewHandler(opts Options) *Handler {
 		newID:           newRandomID,
 		now:             now,
 		recordTTL:       opts.SessionRecordTTL,
+		runTTL:          opts.RunRecordTTL,
 		handles:         make(map[string]runtime.ExecutionHandle),
 		turns:           make(map[string]*turnState),
 		serverToolIDs:   make(map[string]*serverToolLedger),
@@ -360,14 +373,13 @@ func NewHandler(opts Options) *Handler {
 		h.metrics = runtime.NoopMetrics{}
 	}
 	h.admit = opts.Admission
-	h.admitLmt = opts.AdmissionLimits
 	h.catalog = &modelCatalog{reg: opts.Registry, enabled: opts.Enabled, models: opts.Models, commands: opts.Commands}
 	// stop is always created so Close can signal every background goroutine
 	// (prune loop + handle-termination watchers) even when record expiry is off.
 	h.stop = make(chan struct{})
-	// A record TTL with a positive interval runs a background prune loop that
-	// bounds session-record and handle growth.
-	if h.recordTTL > 0 && opts.PruneInterval > 0 {
+	// The prune loop bounds both session records and terminal run records; it
+	// runs when either expiry is enabled.
+	if (h.recordTTL > 0 || h.runTTL > 0) && opts.PruneInterval > 0 {
 		h.pruneLoopDone = make(chan struct{})
 		go h.pruneLoop(opts.PruneInterval)
 	}
@@ -387,9 +399,10 @@ func (h *Handler) Close() {
 	}
 }
 
-// pruneLoop periodically evicts expired session records and drops their cached
-// execution handles so neither grows unbounded over the process lifetime.
-// Active turns are exempt (see SessionStore.Prune).
+// pruneLoop periodically evicts expired session records (dropping their cached
+// execution handles) and terminal run records so neither grows unbounded over
+// the process lifetime. Active turns are exempt (see SessionStore.Prune);
+// non-terminal runs are never pruned (see RunStore.Prune).
 func (h *Handler) pruneLoop(interval time.Duration) {
 	defer close(h.pruneLoopDone)
 	ticker := time.NewTicker(interval)
@@ -399,16 +412,51 @@ func (h *Handler) pruneLoop(interval time.Duration) {
 		case <-h.stop:
 			return
 		case <-ticker.C:
-			removed, err := h.store.Prune(context.Background(), h.now())
-			if err != nil {
-				slog.Warn("openai: prune session records", "error", err)
-				continue
+			if h.recordTTL > 0 {
+				removed, err := h.store.Prune(context.Background(), h.now())
+				if err != nil {
+					slog.Warn("openai: prune session records", "error", err)
+				} else {
+					for _, id := range removed {
+						h.dropHandleByID(id)
+					}
+				}
 			}
-			for _, id := range removed {
-				h.dropHandleByID(id)
+			if h.runTTL > 0 {
+				removed, err := h.runs.Prune(context.Background(), h.now(), h.runTTL)
+				if err != nil {
+					slog.Warn("openai: prune run records", "error", err)
+					continue
+				}
+				if removed > 0 {
+					slog.Debug("openai: pruned run records", "count", removed)
+				}
 			}
 		}
 	}
+}
+
+// incActiveRuns/decActiveRuns maintain the gateway_active_runs gauge: the
+// number of turns currently in flight (between BeginTurn and terminal).
+func (h *Handler) incActiveRuns() {
+	h.metrics.SetGauge("gateway_active_runs", float64(h.activeRuns.Add(1)), nil)
+}
+
+func (h *Handler) decActiveRuns() {
+	h.metrics.SetGauge("gateway_active_runs", float64(h.activeRuns.Add(-1)), nil)
+}
+
+// incQueuedRuns/decQueuedRuns maintain the gateway_queued_runs gauge: requests
+// waiting for a predecessor turn that is already settling (abort/timeout) so
+// the session can be reused promptly. The gateway never queues rejected work —
+// over-limit requests fail fast with 429 — so this measures the only real wait
+// state in the request path.
+func (h *Handler) incQueuedRuns() {
+	h.metrics.SetGauge("gateway_queued_runs", float64(h.queuedRuns.Add(1)), nil)
+}
+
+func (h *Handler) decQueuedRuns() {
+	h.metrics.SetGauge("gateway_queued_runs", float64(h.queuedRuns.Add(-1)), nil)
 }
 
 // Routes returns the mounted HTTP handler (auth middleware applied; health
@@ -661,9 +709,16 @@ func (h *Handler) abortHandle(ctx context.Context, handle runtime.ExecutionHandl
 // session is made available to another request. Persistent executions share a
 // single event stream across turns; leaving a cancelled finish event buffered
 // would make the next turn terminate immediately with an empty response.
-func (h *Handler) abortAndDrain(ctx context.Context, sessionID string, handle runtime.ExecutionHandle) {
+//
+// It reports whether the interrupt SETTLED: the abort RPC succeeded AND a
+// terminal event (or the stream's close) was observed. Callers record the
+// confirmed terminal statuses RunCancelled/RunTimedOut only when settled; a
+// lost abort RPC, a forced teardown, or an undrained terminal event is an
+// unconfirmed outcome and must be recorded as RunOutcomeUnknown (final-review
+// P1 — it must never inflate the confirmed abort/timeout metrics).
+func (h *Handler) abortAndDrain(ctx context.Context, sessionID string, handle runtime.ExecutionHandle) bool {
 	if handle == nil {
-		return
+		return false
 	}
 	abortResult := make(chan error, 1)
 	go func() { abortResult <- h.abortHandle(ctx, handle) }()
@@ -720,14 +775,17 @@ func (h *Handler) abortAndDrain(ctx context.Context, sessionID string, handle ru
 
 complete:
 	if abortErr == nil {
-		return
+		return true
 	}
+	// The interrupt could not be confirmed: tear the execution down so no
+	// orphaned turn survives, and report the outcome as unsettled.
 	cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := handle.Close(cctx); err != nil {
 		slog.Warn("openai: close failed execution after abort", "session", sessionID, "error", err)
 	}
 	h.dropHandle(sessionID, handle)
+	return false
 }
 
 // newRandomID returns a random 24-hex-char id (used for chat completion ids).

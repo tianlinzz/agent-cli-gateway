@@ -9,6 +9,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -146,8 +147,17 @@ type Session interface {
 // interface, never the adapter or API contract.
 type ExecutionBackend interface {
 	// Start launches an execution for the request and returns its handle.
+	// A backend at its configured capacity MUST return an error wrapping
+	// ErrCapacityExceeded so the API layer can answer with 429 instead of 500.
 	Start(ctx context.Context, req StartRequest) (ExecutionHandle, error)
 }
+
+// ErrCapacityExceeded reports that the execution backend is at a configured
+// resource cap (e.g. the global worker limit). Backends wrap it with %w; the
+// API layer matches it with errors.Is and maps it to the 429 overload
+// contract (O-F10). It lives in runtime so neither api/ nor worker/ needs to
+// import the other.
+var ErrCapacityExceeded = errors.New("runtime: execution backend at capacity")
 
 // ExecutionHandle is the API layer's handle to a running execution. It
 // mirrors the canonical Session method set so the API layer can drive a

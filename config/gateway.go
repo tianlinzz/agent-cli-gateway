@@ -111,6 +111,11 @@ type SessionsConfig struct {
 	// record expiry (records persist indefinitely — not recommended for
 	// long-running deployments). Default 168h.
 	RecordTTL time.Duration `toml:"record_ttl"`
+	// RunRecordTTL is how long a terminal run record (one Agent turn) is
+	// retained before the prune loop deletes it. Zero uses the default
+	// (24h). Bounded so long-running gateways do not leak one record per
+	// turn (O-F11).
+	RunRecordTTL time.Duration `toml:"run_record_ttl"`
 }
 
 // LimitsConfig configures admission control and resource caps. All fields
@@ -126,6 +131,10 @@ type LimitsConfig struct {
 	// MaxSessionsPerCaller caps the number of live sessions records a single
 	// caller may own. 0 = unlimited.
 	MaxSessionsPerCaller int `toml:"max_sessions_per_caller"`
+	// MaxSessions caps the total number of live session records across all
+	// callers. 0 = unlimited. Enforced atomically at session creation; excess
+	// requests get 429.
+	MaxSessions int `toml:"max_sessions"`
 	// MaxActiveRunsPerCaller caps the number of concurrently executing turns
 	// for a single caller. 0 = unlimited.
 	MaxActiveRunsPerCaller int `toml:"max_active_runs_per_caller"`
@@ -217,6 +226,10 @@ type MountsConfig struct {
 	AgentHomeDir string `toml:"agent_home_dir"`
 	// TmpDir is the per-session tmpfs mount point. Default "/tmp".
 	TmpDir string `toml:"tmp_dir"`
+	// TmpfsSizeMiB bounds the per-session tmpfs mounted at TmpDir. Default
+	// 256 (MiB). This is the hard per-session cap on /tmp usage — a session
+	// cannot exhaust host /tmp.
+	TmpfsSizeMiB int `toml:"tmpfs_size_mib"`
 }
 
 // RlimitsConfig configures per-process resource limits inside the jail.
@@ -231,6 +244,13 @@ type RlimitsConfig struct {
 	MaxCoreDumpBytes int64 `toml:"max_core_dump_bytes"`
 	// MaxAddressSpaceBytes caps the address space (RLIMIT_AS). 0 = unlimited.
 	MaxAddressSpaceBytes int64 `toml:"max_address_space_bytes"`
+	// MaxFileBytes caps the size of any single file a jailed process may
+	// write (RLIMIT_FSIZE) — the per-session guard against runaway files
+	// inside the writable workspace/agent-home. 0 = unlimited. TOTAL
+	// workspace usage remains an infrastructure contract (filesystem quota
+	// on the workspace root); the gateway bounds processes, logs, sessions,
+	// tmpfs, and per-file sizes.
+	MaxFileBytes int64 `toml:"max_file_bytes"`
 }
 
 // UserNamespaceConfig configures uid/gid mapping for unprivileged operation
@@ -304,6 +324,7 @@ func DefaultGatewayConfig() GatewayConfig {
 			IdleTimeout:  2 * time.Hour,
 			ReapInterval: time.Minute,
 			RecordTTL:    168 * time.Hour,
+			RunRecordTTL: 24 * time.Hour,
 		},
 		Limits: LimitsConfig{
 			MaxWorkerLogBytes: 64 << 20, // 64 MiB
@@ -321,6 +342,7 @@ func DefaultGatewayConfig() GatewayConfig {
 				WorkspaceDir: "/workspace",
 				AgentHomeDir: "/agent-home",
 				TmpDir:       "/tmp",
+				TmpfsSizeMiB: 256,
 			},
 			Rlimits: RlimitsConfig{
 				MaxOpenFiles: 1024,
@@ -459,11 +481,18 @@ func (c *GatewayConfig) Validate() error {
 	if c.Sessions.RecordTTL < 0 {
 		return fmt.Errorf("config: sessions.record_ttl must not be negative")
 	}
+	if c.Sessions.RunRecordTTL < 0 {
+		return fmt.Errorf("config: sessions.run_record_ttl must not be negative")
+	}
 	if c.Sessions.RecordTTL > 0 && c.Sessions.IdleTimeout > 0 && c.Sessions.RecordTTL <= c.Sessions.IdleTimeout {
 		return fmt.Errorf("config: sessions.record_ttl must exceed idle_timeout so records survive worker reclamation")
 	}
+	if c.Isolation.Mounts.TmpfsSizeMiB < 0 {
+		return fmt.Errorf("config: isolation.mounts.tmpfs_size_mib must not be negative")
+	}
 	if c.Limits.MaxWorkers < 0 || c.Limits.MaxActiveRuns < 0 ||
-		c.Limits.MaxSessionsPerCaller < 0 || c.Limits.MaxActiveRunsPerCaller < 0 ||
+		c.Limits.MaxSessionsPerCaller < 0 || c.Limits.MaxSessions < 0 ||
+		c.Limits.MaxActiveRunsPerCaller < 0 ||
 		c.Limits.MaxActiveRunsPerWorkspace < 0 || c.Limits.MaxWorkerLogBytes < 0 {
 		return fmt.Errorf("config: limits values must not be negative")
 	}

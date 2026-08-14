@@ -132,7 +132,12 @@ func (c streamChunk) withChoices(choices ...streamChoice) streamChunk {
 // "data: [DONE]" frame. Client disconnect and explicit abort cancel the turn
 // and terminate the stream. A closed events channel (execution terminated)
 // drops the dead handle so a later resume starts fresh.
-func (h *Handler) streamTurn(w http.ResponseWriter, r *http.Request, ctx context.Context, model, sessionID, callerID string, handle runtime.ExecutionHandle, includeUsage bool) runtime.RunStatus {
+//
+// The returned status is a CONFIRMED terminal state only: a cancelled or
+// timed-out stream whose interrupt did not settle (abort RPC failed or the
+// terminal event never drained) returns RunOutcomeUnknown instead of
+// RunCancelled/RunTimedOut (final review P1).
+func (h *Handler) streamTurn(w http.ResponseWriter, r *http.Request, ctx context.Context, model, sessionID, callerID string, handle runtime.ExecutionHandle, includeUsage bool) (runStatus runtime.RunStatus) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, serverError("streaming not supported by the response writer"))
@@ -140,12 +145,16 @@ func (h *Handler) streamTurn(w http.ResponseWriter, r *http.Request, ctx context
 	}
 	// Guard: unless the stream completes normally, the execution must be
 	// aborted so a dropped client or a mid-stream write failure never leaves
-	// an orphaned agent turn running.
+	// an orphaned agent turn running. The abort runs in this defer (after the
+	// return value is set), so an unsettled interrupt downgrades the status
+	// to RunOutcomeUnknown via the named return.
 	deferredAbort := true
 	defer func() {
 		if deferredAbort {
 			h.markTurnSettling(sessionID)
-			h.abortAndDrain(context.Background(), sessionID, handle)
+			if !h.abortAndDrain(context.Background(), sessionID, handle) {
+				runStatus = runtime.RunOutcomeUnknown
+			}
 		}
 	}()
 	hdr := w.Header()
@@ -187,7 +196,7 @@ func (h *Handler) streamTurn(w http.ResponseWriter, r *http.Request, ctx context
 		started    = make(map[string]runtime.ToolCall)
 		completed  = make(map[string]struct{})
 	)
-	runStatus := runtime.RunSucceeded
+	runStatus = runtime.RunSucceeded
 	var grace <-chan time.Time
 	var graceTimer *time.Timer
 	defer func() {
@@ -208,10 +217,15 @@ loop:
 		case <-ctx.Done():
 			// Client disconnect or explicit abort: settle this turn and discard
 			// its terminal events before another request can reuse the session.
+			// Only a settled interrupt is a confirmed cancellation.
 			h.markTurnSettling(sessionID)
-			h.abortAndDrain(context.Background(), sessionID, handle)
+			settled := h.abortAndDrain(context.Background(), sessionID, handle)
 			deferredAbort = false
-			runStatus = runtime.RunCancelled
+			if settled {
+				runStatus = runtime.RunCancelled
+			} else {
+				runStatus = runtime.RunOutcomeUnknown
+			}
 			if r.Context().Err() != nil {
 				return runStatus // the client is gone; nothing more to write
 			}
@@ -317,10 +331,14 @@ loop:
 		case <-timeout:
 			finish = "length"
 			status = "timeout"
-			runStatus = runtime.RunTimedOut
 			h.markTurnSettling(sessionID)
-			h.abortAndDrain(context.Background(), sessionID, handle)
+			settled := h.abortAndDrain(context.Background(), sessionID, handle)
 			deferredAbort = false
+			if settled {
+				runStatus = runtime.RunTimedOut
+			} else {
+				runStatus = runtime.RunOutcomeUnknown
+			}
 			break loop
 		}
 	}

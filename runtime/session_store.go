@@ -29,6 +29,11 @@ var (
 	// ErrInvalidSession means the record failed validation (empty ID/owner or
 	// unknown status).
 	ErrInvalidSession = errors.New("runtime: invalid session record")
+	// ErrSessionCapacity means the store's configured session-record capacity
+	// (global or per-caller) is exhausted. The API layer maps it to a 429
+	// overload response (O-F10). Enforcing the cap inside Create makes the
+	// check-and-insert atomic under concurrency.
+	ErrSessionCapacity = errors.New("runtime: session capacity exceeded")
 )
 
 // SessionStore is the metadata store for gateway sessions. The in-memory
@@ -39,8 +44,10 @@ var (
 // sessions.
 type SessionStore interface {
 	// Create stores a new session record. Fails with ErrSessionExists if the
-	// ID is already taken and ErrInvalidSession if the record is malformed.
-	// CreatedAt/UpdatedAt are stamped to now when zero.
+	// ID is already taken, ErrInvalidSession if the record is malformed, and
+	// ErrSessionCapacity when a configured global/per-caller record cap is
+	// exhausted (the check and the insert are atomic). CreatedAt/UpdatedAt
+	// are stamped to now when zero.
 	Create(ctx context.Context, rec SessionRecord) error
 
 	// Get returns a deep copy of the session, scoped to callerID. Fails with
@@ -88,9 +95,30 @@ func NewMemorySessionStore() SessionStore {
 	return &memSessionStore{byID: make(map[string]SessionRecord)}
 }
 
+// SessionLimits caps session-record growth (the Phase 0-deferred, Phase
+// 2-required session record cap). Zero-valued fields mean unlimited. The caps
+// are enforced atomically inside Create — the check and the insert share one
+// lock, so concurrent session creations can never oversubscribe.
+type SessionLimits struct {
+	// MaxTotal caps the number of live session records across all callers.
+	MaxTotal int
+	// MaxPerCaller caps the number of live session records one caller may own.
+	MaxPerCaller int
+}
+
+// NewCappedMemorySessionStore returns the in-memory SessionStore with
+// capacity limits enforced at Create time (see SessionLimits).
+func NewCappedMemorySessionStore(limits SessionLimits) SessionStore {
+	return &memSessionStore{
+		byID:   make(map[string]SessionRecord),
+		limits: limits,
+	}
+}
+
 type memSessionStore struct {
-	mu   sync.RWMutex
-	byID map[string]SessionRecord
+	mu     sync.RWMutex
+	byID   map[string]SessionRecord
+	limits SessionLimits // enforced in Create; zero = unlimited
 }
 
 func (s *memSessionStore) Create(ctx context.Context, rec SessionRecord) error {
@@ -113,6 +141,23 @@ func (s *memSessionStore) Create(ctx context.Context, rec SessionRecord) error {
 	defer s.mu.Unlock()
 	if _, ok := s.byID[rec.ID]; ok {
 		return fmt.Errorf("%w: %q", ErrSessionExists, rec.ID)
+	}
+	// Capacity is checked under the same lock as the insert, so the cap is an
+	// atomic reservation: concurrent Create calls each observe the committed
+	// count, never an in-flight one.
+	if s.limits.MaxTotal > 0 && len(s.byID) >= s.limits.MaxTotal {
+		return fmt.Errorf("%w: global cap %d reached", ErrSessionCapacity, s.limits.MaxTotal)
+	}
+	if s.limits.MaxPerCaller > 0 {
+		owned := 0
+		for _, existing := range s.byID {
+			if existing.CallerID == rec.CallerID {
+				owned++
+			}
+		}
+		if owned >= s.limits.MaxPerCaller {
+			return fmt.Errorf("%w: per-caller cap %d reached for owner", ErrSessionCapacity, s.limits.MaxPerCaller)
+		}
 	}
 	// rec is all value types, so the assignment is already a deep copy.
 	s.byID[rec.ID] = rec

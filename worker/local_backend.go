@@ -41,6 +41,13 @@ func (b *LocalExecutionBackend) Preflight(ctx context.Context) error {
 	return b.sup.Preflight(ctx)
 }
 
+// ActiveWorkers reports the number of live worker processes. It backs the
+// API admission layer's fast max_workers precheck; the supervisor remains the
+// authoritative cap owner (its rejection wraps runtime.ErrCapacityExceeded).
+func (b *LocalExecutionBackend) ActiveWorkers() int {
+	return b.sup.SessionCount()
+}
+
 // Supervisor exposes the underlying supervisor for shutdown coordination.
 func (b *LocalExecutionBackend) Supervisor() *Supervisor {
 	return b.sup

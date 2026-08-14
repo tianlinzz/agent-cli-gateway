@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -61,6 +62,13 @@ type Config struct {
 	MaxWorkers int
 	// MaxWorkerLogBytes caps each worker's on-disk log file. 0 = unlimited.
 	MaxWorkerLogBytes int64
+	// WorkerLogCheckInterval is how often each worker's log size is checked
+	// against MaxWorkerLogBytes. Defaults to 5s when a cap is configured.
+	WorkerLogCheckInterval time.Duration
+	// Metrics records worker lifecycle observability (crash/reclaim counters,
+	// live-worker gauge). Nil disables recording. Labels must stay bounded —
+	// only the model id is used.
+	Metrics runtime.Metrics
 }
 
 // DefaultConfig returns the recommended supervisor config.
@@ -101,6 +109,12 @@ func (c Config) defaults() Config {
 	}
 	if c.SessionIdleTimeout > 0 && c.SessionReapInterval <= 0 {
 		c.SessionReapInterval = time.Minute
+	}
+	if c.MaxWorkerLogBytes > 0 && c.WorkerLogCheckInterval <= 0 {
+		c.WorkerLogCheckInterval = 5 * time.Second
+	}
+	if c.Metrics == nil {
+		c.Metrics = runtime.NoopMetrics{}
 	}
 	return c
 }
@@ -157,9 +171,22 @@ type Supervisor struct {
 	spawn    spawnFunc
 	sessions map[string]*workerSession
 	slots    map[string]chan struct{}
-	stopOnce sync.Once
-	stop     chan struct{}
-	reapDone chan struct{}
+	// pendingWorkers counts StartSession calls that reserved worker capacity
+	// but have not registered yet (spawn + handshake in flight). The
+	// MaxWorkers cap checks len(sessions)+pendingWorkers so concurrent starts
+	// cannot oversubscribe it (final-review P1).
+	pendingWorkers int
+	// pendingReap holds sessions whose process tree was NOT reaped within the
+	// bounded terminate wait. They stay registered (capacity reserved, same-
+	// session restart fenced) until one supervisor-wide loop observes the
+	// reap and finalizes teardown — never a goroutine per unreaped child.
+	pendingReap map[string]*workerSession
+	// workersActive tracks live workers for the gateway_workers_active gauge.
+	workersActive atomic.Int64
+	stopOnce      sync.Once
+	stop          chan struct{}
+	reapDone      chan struct{}
+	pendingDone   chan struct{}
 }
 
 // Option customizes a Supervisor. Options are applied after construction and
@@ -198,13 +225,15 @@ func NewSupervisor(cfg Config, opts ...Option) (*Supervisor, error) {
 		return nil, err
 	}
 	s := &Supervisor{
-		cfg:      cfg,
-		resolver: resolver,
-		spawn:    defaultSpawner(cfg),
-		sessions: make(map[string]*workerSession),
-		slots:    make(map[string]chan struct{}),
-		stop:     make(chan struct{}),
-		reapDone: make(chan struct{}),
+		cfg:         cfg,
+		resolver:    resolver,
+		spawn:       defaultSpawner(cfg),
+		sessions:    make(map[string]*workerSession),
+		slots:       make(map[string]chan struct{}),
+		pendingReap: make(map[string]*workerSession),
+		stop:        make(chan struct{}),
+		reapDone:    make(chan struct{}),
+		pendingDone: make(chan struct{}),
 	}
 	for name, a := range cfg.Agents {
 		if a.MaxConcurrency > 0 {
@@ -219,6 +248,7 @@ func NewSupervisor(cfg Config, opts ...Option) (*Supervisor, error) {
 	} else {
 		close(s.reapDone)
 	}
+	go s.finalizePendingReapLoop()
 	return s, nil
 }
 
@@ -236,31 +266,37 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 		return nil, err
 	}
 
+	// Reserve worker capacity atomically with the cap check: the reservation
+	// is released on every failure path and converted into a registered
+	// session on success, so concurrent StartSession calls can never
+	// oversubscribe MaxWorkers (final-review P1: checking only registered
+	// sessions left a spawn+handshake window the cap did not cover).
+	registered := false
 	s.mu.Lock()
 	if _, ok := s.sessions[req.SessionID]; ok {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("worker: session %q already running", req.SessionID)
 	}
-	// Global worker cap (O-F10): reject before consuming a slot.
-	if s.cfg.MaxWorkers > 0 && len(s.sessions) >= s.cfg.MaxWorkers {
+	// A fenced session (process not yet reaped) still occupies its slot and
+	// rejects a same-id restart: the old process may still hold the socket.
+	if _, fenced := s.pendingReap[req.SessionID]; fenced {
 		s.mu.Unlock()
-		return nil, fmt.Errorf("worker: max_workers limit reached (%d)", s.cfg.MaxWorkers)
+		return nil, fmt.Errorf("worker: session %q previous worker not yet reaped", req.SessionID)
 	}
+	// Global worker cap (O-F10): reject before consuming anything. The error
+	// wraps runtime.ErrCapacityExceeded so the API layer answers 429 instead
+	// of 500 — the supervisor is the authoritative owner of this cap.
+	if s.cfg.MaxWorkers > 0 && len(s.sessions)+s.pendingWorkers >= s.cfg.MaxWorkers {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("worker: max_workers limit reached (%d): %w", s.cfg.MaxWorkers, runtime.ErrCapacityExceeded)
+	}
+	s.pendingWorkers++
 	s.mu.Unlock()
-	slotHeld := false
-	if slot := s.slots[req.ModelID]; slot != nil {
-		select {
-		case slot <- struct{}{}:
-			slotHeld = true
-		case <-ctx.Done():
-			return nil, fmt.Errorf("worker: acquire %s concurrency slot: %w", req.ModelID, ctx.Err())
-		}
-	}
 	defer func() {
-		if slotHeld {
-			if slot := s.slots[req.ModelID]; slot != nil {
-				<-slot
-			}
+		if !registered {
+			s.mu.Lock()
+			s.pendingWorkers--
+			s.mu.Unlock()
 		}
 	}()
 
@@ -376,21 +412,14 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 		turnActive:   req.FirstInput != nil,
 		lastActivity: time.Now(),
 	}
-	if slot := s.slots[req.ModelID]; slot != nil {
-		ws.releaseSlot = func() { <-slot }
-		slotHeld = false
-	}
 	ws.ctx, ws.cancel = context.WithCancel(context.Background())
 	go ws.monitor()
 
 	// Handshake (socket + Health + StartSession) bounded by StartTimeout.
+	// terminate() itself waits for the process tree to be reaped (deferring
+	// directory cleanup if it never is), so no extra wait is needed here.
 	if err := ws.handshake(startCtx); err != nil {
 		ws.terminate(fmt.Errorf("handshake: %w", err))
-		select {
-		case <-ws.reaped:
-		case <-time.After(2 * time.Second):
-			slog.Error("worker: session process not reaped after failed handshake", "session", req.SessionID, "pid", ws.outerPID)
-		}
 		ws.mu.Lock()
 		herr := ws.err
 		ws.mu.Unlock()
@@ -398,10 +427,17 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 	}
 
 	// Register and start the event bridge. Registration happens only after a
-	// successful handshake so a crashed worker never lingers in the map.
+	// successful handshake so a crashed worker never lingers in the map. It
+	// atomically converts the worker-capacity reservation into a registered
+	// session (len(sessions)+pending stays invariant); the live-worker gauge
+	// is updated inside the same lock so it can never drift from the set.
 	s.mu.Lock()
 	s.sessions[req.SessionID] = ws
+	s.pendingWorkers--
+	active := s.workersActive.Add(1)
 	s.mu.Unlock()
+	registered = true
+	s.setWorkersActive(active)
 
 	// A worker that died between the handshake and registration (terminate
 	// already consumed its sync.Once) must be removed, not left as a zombie.
@@ -412,7 +448,9 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 	}
 	ws.mu.Unlock()
 	if dead {
-		s.removeSession(req.SessionID)
+		if s.removeSession(req.SessionID) {
+			s.setWorkersActive(s.workersActive.Add(-1))
+		}
 		ws.mu.Lock()
 		derr := ws.err
 		ws.mu.Unlock()
@@ -511,11 +549,74 @@ func (s *Supervisor) reapIdle(now time.Time) {
 	s.mu.Unlock()
 	for _, ws := range sessions {
 		slog.Info("worker: reclaiming idle session process", "session", ws.req.SessionID, "idle_timeout", s.cfg.SessionIdleTimeout)
+		s.cfg.Metrics.IncCounter("gateway_worker_reclaims_total", 1, map[string]string{"model": ws.req.ModelID})
 		go func() {
 			if err := ws.closeClaimed(context.Background()); err != nil {
 				slog.Warn("worker: reclaim idle session process", "session", ws.req.SessionID, "error", err)
 			}
 		}()
+	}
+}
+
+// setWorkersActive publishes the live-worker count as a gauge. Nil-safe for
+// Supervisors constructed without NewSupervisor (unit tests build raw ones).
+func (s *Supervisor) setWorkersActive(n int64) {
+	if s.cfg.Metrics == nil {
+		return
+	}
+	s.cfg.Metrics.SetGauge("gateway_workers_active", float64(n), nil)
+}
+
+// enqueuePendingReap fences a session whose process was not reaped in the
+// bounded terminate wait: it stays registered (capacity reserved) and blocks
+// same-session restarts until the reap completes. Nil-map-safe for raw
+// Supervisors in unit tests.
+func (s *Supervisor) enqueuePendingReap(ws *workerSession) {
+	s.mu.Lock()
+	if s.pendingReap == nil {
+		s.pendingReap = make(map[string]*workerSession)
+	}
+	s.pendingReap[ws.req.SessionID] = ws
+	s.mu.Unlock()
+}
+
+func (s *Supervisor) dequeuePendingReap(id string) {
+	s.mu.Lock()
+	delete(s.pendingReap, id)
+	s.mu.Unlock()
+}
+
+// finalizeReapedPending completes teardown for every fenced session whose
+// process has finally been reaped. Called from one supervisor-wide loop so an
+// unkillable child cannot accumulate a goroutine per session.
+func (s *Supervisor) finalizeReapedPending() {
+	s.mu.Lock()
+	var ready []*workerSession
+	for _, ws := range s.pendingReap {
+		select {
+		case <-ws.reaped:
+			ready = append(ready, ws)
+		default:
+		}
+	}
+	s.mu.Unlock()
+	for _, ws := range ready {
+		ws.finalizeTeardown() // dequeues itself
+		slog.Info("worker: fenced session finalized after delayed reap", "session", ws.req.SessionID)
+	}
+}
+
+func (s *Supervisor) finalizePendingReapLoop() {
+	defer close(s.pendingDone)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stop:
+			return
+		case <-ticker.C:
+			s.finalizeReapedPending()
+		}
 	}
 }
 
@@ -526,10 +627,14 @@ func (s *Supervisor) SessionCount() int {
 	return len(s.sessions)
 }
 
-func (s *Supervisor) removeSession(id string) {
+func (s *Supervisor) removeSession(id string) bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.sessions[id]; !ok {
+		return false
+	}
 	delete(s.sessions, id)
-	s.mu.Unlock()
+	return true
 }
 
 func validateStartRequest(req runtime.StartRequest) error {
@@ -579,8 +684,7 @@ const (
 // wraps the gRPC client, the process-group lifecycle, and the canonical event
 // bridge. All state is guarded by mu; termination is idempotent via once.
 type workerSession struct {
-	once        sync.Once
-	releaseSlot func()
+	once sync.Once
 
 	sup    *Supervisor
 	req    runtime.StartRequest
@@ -593,6 +697,7 @@ type workerSession struct {
 	lifecycle    string
 	err          error
 	turnActive   bool
+	turnSlotHeld bool // a per-agent run slot is reserved for the active turn
 	idleReaping  bool
 	lastActivity time.Time
 
@@ -640,6 +745,43 @@ func (ws *workerSession) clearClient(c *client) {
 	ws.mu.Unlock()
 }
 
+// acquireTurnSlot reserves one per-agent run slot for the active turn. Slots
+// cover ACTIVE RUNS, not session lifetime (final-review P1): holding them
+// from worker creation to teardown let one caller park idle sessions on every
+// slot of an agent and starve all other callers. Reservation is fail-fast —
+// a full slot returns a typed capacity error the API maps to 429, instead of
+// blocking until the request context dies.
+func (ws *workerSession) acquireTurnSlot() error {
+	slot := ws.sup.slots[ws.req.ModelID]
+	if slot == nil {
+		return nil
+	}
+	select {
+	case slot <- struct{}{}:
+		ws.mu.Lock()
+		ws.turnSlotHeld = true
+		ws.mu.Unlock()
+		return nil
+	default:
+		return fmt.Errorf("worker: agent %q max_concurrency reached: %w", ws.req.ModelID, runtime.ErrCapacityExceeded)
+	}
+}
+
+// releaseTurnSlot returns the per-agent run slot iff this session holds one.
+func (ws *workerSession) releaseTurnSlot() {
+	slot := ws.sup.slots[ws.req.ModelID]
+	if slot == nil {
+		return
+	}
+	ws.mu.Lock()
+	held := ws.turnSlotHeld
+	ws.turnSlotHeld = false
+	ws.mu.Unlock()
+	if held {
+		<-slot
+	}
+}
+
 // Send delivers a turn to the worker.
 func (ws *workerSession) Send(ctx context.Context, input runtime.Input) error {
 	ws.mu.Lock()
@@ -652,15 +794,21 @@ func (ws *workerSession) Send(ctx context.Context, input runtime.Input) error {
 		}
 		return fmt.Errorf("worker: session %q is closed", ws.req.SessionID)
 	case stateRunning:
-		ws.turnActive = true
-		ws.lastActivity = time.Now()
 		ws.mu.Unlock()
 	default:
 		ws.mu.Unlock()
 		return fmt.Errorf("worker: session %q is not running (state %d)", ws.req.SessionID, state)
 	}
+	if err := ws.acquireTurnSlot(); err != nil {
+		return err
+	}
+	ws.mu.Lock()
+	ws.turnActive = true
+	ws.lastActivity = time.Now()
+	ws.mu.Unlock()
 	client, _ := ws.snapshotClient()
 	if client == nil {
+		ws.releaseTurnSlot()
 		ws.mu.Lock()
 		ws.turnActive = false
 		ws.lastActivity = time.Now()
@@ -668,6 +816,7 @@ func (ws *workerSession) Send(ctx context.Context, input runtime.Input) error {
 		return fmt.Errorf("worker: session %q has no client (not started)", ws.req.SessionID)
 	}
 	if err := client.SendInput(ctx, ws.req.SessionID, input); err != nil {
+		ws.releaseTurnSlot()
 		ws.mu.Lock()
 		ws.turnActive = false
 		ws.lastActivity = time.Now()
@@ -747,23 +896,35 @@ func (ws *workerSession) closeClaimed(ctx context.Context) error {
 
 	// Graceful: SIGTERM to the whole group (nsjail + worker + agent CLI).
 	ws.killGroup(syscall.SIGTERM)
-
+	reapFailed := false
+	termWait := time.NewTimer(ws.sup.cfg.StopGracePeriod)
 	select {
 	case <-ws.reaped:
-	case <-time.After(ws.sup.cfg.StopGracePeriod):
+		termWait.Stop()
+	case <-termWait.C:
 		slog.Warn("worker: process group did not exit after SIGTERM, sending SIGKILL",
 			"session", ws.req.SessionID, "pgid", ws.pgid)
 		ws.killGroup(syscall.SIGKILL)
+		killWait := time.NewTimer(2 * time.Second)
 		select {
 		case <-ws.reaped:
-		case <-time.After(2 * time.Second):
+			killWait.Stop()
+		case <-killWait.C:
 			slog.Error("worker: process group did not reap after SIGKILL",
 				"session", ws.req.SessionID, "pgid", ws.pgid)
-			return fmt.Errorf("worker: session %q process group %d did not reap after SIGKILL", ws.req.SessionID, ws.pgid)
+			reapFailed = true
 		}
 	}
 
+	// terminate MUST run even when the group never reaped: it deregisters the
+	// session, releases the concurrency slot, and defers directory cleanup.
+	// Returning without it would leak the slot and the supervisor's session
+	// entry forever (the process is unkillable, e.g. stuck in uninterruptible
+	// sleep — the gateway must still recover everything else).
 	ws.terminate(closeErr)
+	if reapFailed {
+		return fmt.Errorf("worker: session %q process group %d did not reap after SIGKILL", ws.req.SessionID, ws.pgid)
+	}
 
 	ws.mu.Lock()
 	err := ws.err
@@ -818,6 +979,7 @@ func (ws *workerSession) monitor() {
 		ws.mu.Lock()
 		ws.err = fmt.Errorf("worker: process %d exited unexpectedly: %w", ws.outerPID, err)
 		ws.mu.Unlock()
+		ws.sup.cfg.Metrics.IncCounter("gateway_worker_crashes_total", 1, map[string]string{"model": ws.req.ModelID})
 		slog.Warn("worker: session process exited", "session", ws.req.SessionID, "pid", ws.outerPID, "error", err)
 	}
 
@@ -868,11 +1030,12 @@ func (ws *workerSession) heartbeat() {
 }
 
 // logCapLoop periodically checks the on-disk worker.log size and truncates it
-// (keeping the tail) when it exceeds MaxWorkerLogBytes (O-F10). Best-effort:
-// the worker child writes with O_APPEND, so truncation is safe but a few
-// in-flight bytes may be lost — acceptable for a debug log.
+// (keeping the tail) when it exceeds MaxWorkerLogBytes (O-F10). Contract: the
+// child writes with O_APPEND, so between checks the file may overshoot the cap
+// by at most one check interval of writes; after every check the file is at or
+// below the cap — including for caps smaller than the truncation marker.
 func (ws *workerSession) logCapLoop() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(ws.sup.cfg.WorkerLogCheckInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -893,27 +1056,38 @@ func (ws *workerSession) capLogFile() {
 		return
 	}
 	cap := ws.sup.cfg.MaxWorkerLogBytes
+	// The truncated file is marker + kept tail and MUST end up at or below the
+	// cap. The kept tail is the smaller of half the cap and the remaining
+	// budget after the marker; for caps too small to hold the full marker even
+	// the marker is clipped (a pathological cap still holds as a hard bound).
+	marker := fmt.Sprintf("[log truncated: was %d bytes, cap %d]\n", info.Size(), cap)
+	if int64(len(marker)) > cap {
+		marker = marker[:cap]
+	}
 	tailSize := cap / 2
-	if tailSize < 1024 {
-		tailSize = 1024
+	if tailSize > cap-int64(len(marker)) {
+		tailSize = cap - int64(len(marker))
 	}
-	tail := make([]byte, tailSize)
-	f, err := os.Open(logPath)
-	if err != nil {
-		return
-	}
-	if _, err := f.Seek(-int64(len(tail)), io.SeekEnd); err != nil {
+	var tail []byte
+	if tailSize > 0 {
+		tail = make([]byte, tailSize)
+		f, err := os.Open(logPath)
+		if err != nil {
+			return
+		}
+		if _, err := f.Seek(-tailSize, io.SeekEnd); err != nil {
+			f.Close()
+			return
+		}
+		_, _ = f.Read(tail)
 		f.Close()
-		return
 	}
-	_, _ = f.Read(tail)
-	f.Close()
-	f, err = os.OpenFile(logPath, os.O_TRUNC|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(logPath, os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	fmt.Fprintf(f, "[log truncated: was %d bytes, keeping tail %d]\n", info.Size(), tailSize)
+	_, _ = f.WriteString(marker)
 	_, _ = f.Write(tail)
 }
 
@@ -965,6 +1139,10 @@ func (ws *workerSession) bridge() {
 		}
 		ev := fromFrame(frame)
 		if ev.Type == runtime.EventFinish || ev.Type == runtime.EventError {
+			// The turn ended: return the per-agent run slot before the event
+			// is forwarded, so the next turn (single active turn per session)
+			// can reserve it.
+			ws.releaseTurnSlot()
 			ws.mu.Lock()
 			ws.turnActive = false
 			ws.lastActivity = time.Now()
@@ -978,10 +1156,15 @@ func (ws *workerSession) bridge() {
 	}
 }
 
-// terminate is the idempotent teardown path. The internal stopping signal is
-// published first so the event bridge exits; the external Done/Closed state is
-// published only after deregistration and runtime-path cleanup, making an
-// immediate same-session restart safe.
+// terminate is the idempotent teardown entrypoint. The internal stopping
+// signal is published first so the event bridge exits. When the process tree
+// is reaped within the bounded wait, teardown finalizes inline. When it is
+// NOT, the session is FENCED (final-review P1): registration, live-worker
+// gauge, and the agent run slot stay reserved — a still-alive worker must not
+// be treated as released capacity, and a same-session restart must not race
+// the old process for the socket/directories. One supervisor-wide loop (never
+// a goroutine per unreaped child) finalizes teardown once monitor() closes
+// reaped.
 func (ws *workerSession) terminate(err error) {
 	ws.once.Do(func() {
 		ws.cancel()
@@ -996,50 +1179,71 @@ func (ws *workerSession) terminate(err error) {
 		if ws.stopping != nil {
 			close(ws.stopping)
 		}
-		// Wait for the process tree to be reaped before removing runtime
-		// directories. A still-dying worker may hold the unix socket or
-		// worker.log, racing RemoveAll and leaving stale files that cause
-		// EADDRINUSE on the next StartSession (O-B5). monitor() and
-		// closeClaimed already close reaped before reaching here, so this
-		// wait is instant on those paths; heartbeat/bridge benefit from it.
+		// A session without a reaped signal (raw unit-test construction) has
+		// nothing to wait for: finalize inline.
+		reapedInTime := true
 		if ws.reaped != nil {
+			reapWait := time.NewTimer(2 * time.Second)
 			select {
 			case <-ws.reaped:
-			case <-time.After(2 * time.Second):
-				slog.Warn("worker: process not reaped before cleanup", "session", ws.req.SessionID, "pid", ws.outerPID)
+				reapWait.Stop()
+			case <-reapWait.C:
+				reapedInTime = false
 			}
 		}
-		// Snapshot client under the lock: the monitor goroutine (started before
-		// handshake) can reach here while handshake is still assigning it.
-		ws.mu.Lock()
-		client := ws.client
-		ws.mu.Unlock()
-		if client != nil {
-			client.Close()
+		if reapedInTime {
+			ws.finalizeTeardown()
+			return
 		}
-		ws.sup.removeSession(ws.req.SessionID)
-		if ws.releaseSlot != nil {
-			ws.releaseSlot()
-		}
-		if ws.sessionDir != "" {
-			if err := os.RemoveAll(ws.sessionDir); err != nil {
-				slog.Warn("worker: cleanup session dir", "session", ws.req.SessionID, "error", err)
-			}
-		}
-		// The per-session socket dir holds w.sock, the worker's listen path.
-		// net.Listen("unix", ...) fails with EADDRINUSE on a stale socket file,
-		// so it MUST be removed on every terminal path or a later StartSession
-		// with the same SessionID dies at bind time.
-		if ws.socketDir != "" {
-			if err := os.RemoveAll(ws.socketDir); err != nil {
-				slog.Warn("worker: cleanup socket dir", "session", ws.req.SessionID, "error", err)
-			}
-		}
-		ws.mu.Lock()
-		ws.state = stateClosed
-		ws.mu.Unlock()
-		close(ws.done)
+		slog.Error("worker: process not reaped; fencing session, capacity reserved until reap",
+			"session", ws.req.SessionID, "pid", ws.outerPID)
+		ws.sup.enqueuePendingReap(ws)
 	})
+}
+
+// finalizeTeardown completes terminal teardown exactly once per session:
+// client teardown, capacity release (registration, live-worker gauge, agent
+// run slot), runtime directory removal, and the external done signal. Called
+// inline from terminate (reaped in time) or from the supervisor's
+// pending-reap loop (fenced session finally reaped).
+func (ws *workerSession) finalizeTeardown() {
+	// Snapshot client under the lock: the monitor goroutine (started before
+	// handshake) can reach here while handshake is still assigning it.
+	ws.mu.Lock()
+	client := ws.client
+	ws.mu.Unlock()
+	if client != nil {
+		client.Close()
+	}
+	if ws.sup.removeSession(ws.req.SessionID) {
+		ws.sup.setWorkersActive(ws.sup.workersActive.Add(-1))
+	}
+	ws.sup.dequeuePendingReap(ws.req.SessionID)
+	ws.releaseTurnSlot()
+	ws.removeRuntimeDirs()
+	ws.mu.Lock()
+	ws.state = stateClosed
+	ws.mu.Unlock()
+	close(ws.done)
+}
+
+// removeRuntimeDirs removes the per-session runtime directories. Idempotent;
+// used only on the confirmed-reaped path (inline or via the pending-reap
+// loop). The per-session socket dir holds w.sock, the worker's listen path:
+// net.Listen("unix", ...) fails with EADDRINUSE on a stale socket file, so it
+// MUST be removed on every terminal path or a later StartSession with the
+// same SessionID dies at bind time.
+func (ws *workerSession) removeRuntimeDirs() {
+	if ws.sessionDir != "" {
+		if err := os.RemoveAll(ws.sessionDir); err != nil {
+			slog.Warn("worker: cleanup session dir", "session", ws.req.SessionID, "error", err)
+		}
+	}
+	if ws.socketDir != "" {
+		if err := os.RemoveAll(ws.socketDir); err != nil {
+			slog.Warn("worker: cleanup socket dir", "session", ws.req.SessionID, "error", err)
+		}
+	}
 }
 
 // killGroup is defined in the platform files:

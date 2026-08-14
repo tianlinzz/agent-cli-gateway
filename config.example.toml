@@ -32,6 +32,9 @@ reap_interval = "1m"
 # worker handle. MUST exceed idle_timeout so a record survives worker
 # reclamation and can still resume. Default 168h.
 record_ttl = "168h"
+# How long a terminal run record (one Agent turn) is retained before the same
+# prune loop deletes it, bounding in-memory run growth. Default 24h.
+# run_record_ttl = "24h"
 
 [limits]
 # Admission control and resource caps (O-F10). All default to 0 (unlimited).
@@ -46,9 +49,16 @@ record_ttl = "168h"
 # max_active_runs_per_caller = 10
 # Per-workspace cap on concurrently executing turns.
 # max_active_runs_per_workspace = 4
+# Global cap on live session records across all callers (enforced atomically
+# at session creation; excess requests get 429).
+# max_sessions = 1000
 # Per-worker on-disk log file cap. When exceeded the log is truncated with a
-# marker (best-effort, checked every 30s). Default 64 MiB.
+# marker; the file never exceeds the cap after a check, but may overshoot by
+# up to one check interval of writes in between. Default 64 MiB.
 max_worker_log_bytes = 67108864
+# How often each worker's log size is checked against max_worker_log_bytes.
+# Default 5s.
+# worker_log_check_interval = "5s"
 
 [auth]
 # Tokens authenticate callers, not end users. Health probes are always
@@ -56,6 +66,13 @@ max_worker_log_bytes = 67108864
 callers = [{ id = "example-client", tokens = ["change-me"] }]
 
 [workspace]
+# INFRASTRUCTURE CONTRACT (O-F10): the gateway bounds processes (max_workers),
+# logs (max_worker_log_bytes), sessions (max_sessions*), /tmp per session
+# (isolation.mounts.tmpfs_size_mib), and per-file write sizes
+# (isolation.rlimits.max_file_bytes). TOTAL workspace-filesystem usage is
+# enforced OUTSIDE the gateway: mount the workspace root on a quota-capable
+# filesystem (project quotas, XFS/ZFS refquota, or per-volume size limits) —
+# the writable bind mount alone cannot bound aggregate disk usage.
 # Directory all opaque workspace_ids resolve under. Only the server owns this
 # path; clients reference workspaces by opaque ID and can never inject a path.
 root = "/srv/workspaces"
@@ -75,6 +92,9 @@ binary_path = "/usr/local/bin/nsjail"
 clone_newpid = true
 
 [isolation.mounts]
+# Per-session tmpfs size for the jail's /tmp (MiB). Default 256; bounds each
+# session's /tmp usage independently.
+# tmpfs_size_mib = 256
 workspace_dir = "/workspace"
 agent_home_dir = "/agent-home"
 tmp_dir = "/tmp"
@@ -82,6 +102,9 @@ tmp_dir = "/tmp"
 [isolation.rlimits]
 max_open_files = 1024
 max_processes = 256
+# Cap on any single file a jailed agent may write (RLIMIT_FSIZE) — bounds
+# runaway files inside the writable workspace/agent-home. 0 = unlimited.
+# max_file_bytes = 1073741824
 
 [isolation.user_namespace]
 enabled = true

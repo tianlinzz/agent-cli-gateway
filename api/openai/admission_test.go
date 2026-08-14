@@ -3,33 +3,30 @@ package openai
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
-
-	"github.com/tianlinzz/agent-cli-gateway/runtime"
 )
 
 func newTestAdmission(limits AdmissionLimits) *AdmissionController {
-	return NewAdmissionController(struct {
-		MaxActiveRuns             int
-		MaxActiveRunsPerCaller    int
-		MaxActiveRunsPerWorkspace int
-		MaxSessionsPerCaller      int
-	}{
-		MaxActiveRuns:             limits.MaxActiveRuns,
-		MaxActiveRunsPerCaller:    limits.MaxActiveRunsPerCaller,
-		MaxActiveRunsPerWorkspace: limits.MaxActiveRunsPerWorkspace,
-		MaxSessionsPerCaller:      limits.MaxSessionsPerCaller,
-	}, runtime.NewMemorySessionStore(), nil)
+	return NewAdmissionController(limits, nil, nil)
+}
+
+func mustAcquire(t *testing.T, ac *AdmissionController, callerID, workspaceID string) func() {
+	t.Helper()
+	release, err := ac.Acquire(context.Background(), callerID, workspaceID)
+	if err != nil {
+		t.Fatalf("acquire %s/%s: %v", callerID, workspaceID, err)
+	}
+	return release
 }
 
 func TestAdmission_PerCallerRunLimit(t *testing.T) {
 	ac := newTestAdmission(AdmissionLimits{MaxActiveRunsPerCaller: 1})
 	ctx := context.Background()
 
-	if err := ac.Acquire(ctx, "caller-a", "ws-1", AdmissionLimits{MaxActiveRunsPerCaller: 1}, false); err != nil {
-		t.Fatalf("first acquire: %v", err)
-	}
-	err := ac.Acquire(ctx, "caller-a", "ws-1", AdmissionLimits{MaxActiveRunsPerCaller: 1}, false)
+	r1 := mustAcquire(t, ac, "caller-a", "ws-1")
+	_, err := ac.Acquire(ctx, "caller-a", "ws-1")
 	if err == nil {
 		t.Fatal("second acquire from same caller should fail")
 	}
@@ -39,116 +36,175 @@ func TestAdmission_PerCallerRunLimit(t *testing.T) {
 	}
 
 	// Different caller succeeds.
-	if err := ac.Acquire(ctx, "caller-b", "ws-1", AdmissionLimits{MaxActiveRunsPerCaller: 1}, false); err != nil {
-		t.Fatalf("different caller: %v", err)
-	}
+	r2 := mustAcquire(t, ac, "caller-b", "ws-1")
 
 	// Release and re-acquire.
-	ac.Release("caller-a", "ws-1")
-	if err := ac.Acquire(ctx, "caller-a", "ws-1", AdmissionLimits{MaxActiveRunsPerCaller: 1}, false); err != nil {
+	r1()
+	if _, err := ac.Acquire(ctx, "caller-a", "ws-1"); err != nil {
 		t.Fatalf("after release: %v", err)
 	}
+	r2()
 }
 
 func TestAdmission_GlobalRunLimit(t *testing.T) {
-	ac := newTestAdmission(AdmissionLimits{})
+	ac := newTestAdmission(AdmissionLimits{MaxActiveRuns: 2})
 	ctx := context.Background()
-	limits := AdmissionLimits{MaxActiveRuns: 2}
 
-	ac.Acquire(ctx, "a", "w", limits, false)
-	ac.Acquire(ctx, "b", "w", limits, false)
-	err := ac.Acquire(ctx, "c", "w", limits, false)
+	ra := mustAcquire(t, ac, "a", "w")
+	rb := mustAcquire(t, ac, "b", "w")
+	_, err := ac.Acquire(ctx, "c", "w")
 	if err == nil {
 		t.Fatal("third acquire should fail (global limit)")
 	}
 	var ae *ErrAdmissionRejected
 	if !errors.As(err, &ae) || ae.Scope != ScopeGlobal {
-		t.Fatalf("expected ScopeGlobal, got %v", err)
+		t.Fatalf("expected ScopeGlobal rejection, got %v", err)
 	}
 
-	ac.Release("a", "w")
-	if err := ac.Acquire(ctx, "c", "w", limits, false); err != nil {
+	ra()
+	if _, err := ac.Acquire(ctx, "c", "w"); err != nil {
 		t.Fatalf("after release: %v", err)
+	}
+	rb()
+}
+
+// TestAdmission_GlobalRunLimit_ConcurrentNoOversubscription is a regression
+// test for the Phase 2 code review: the global active-run check used to run
+// outside the commit lock, so concurrent callers could all read the same
+// below-cap value and then each commit, exceeding MaxActiveRuns. Many
+// concurrent acquirers must never hold more than the cap at once.
+func TestAdmission_GlobalRunLimit_ConcurrentNoOversubscription(t *testing.T) {
+	const (
+		callers    = 16
+		goroutines = 8
+		maxRuns    = 4
+	)
+	ac := newTestAdmission(AdmissionLimits{MaxActiveRuns: maxRuns})
+
+	var inFlight atomic.Int64
+	var maxSeen atomic.Int64
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for c := 0; c < callers; c++ {
+		for g := 0; g < goroutines; g++ {
+			wg.Add(1)
+			go func(c int) {
+				defer wg.Done()
+				<-start
+				callerID := string(rune('a'+c%26)) + "caller"
+				ws := callerID + "-ws"
+				release, err := ac.Acquire(context.Background(), callerID, ws)
+				if err != nil {
+					return
+				}
+				cur := inFlight.Add(1)
+				for {
+					old := maxSeen.Load()
+					if cur <= old || maxSeen.CompareAndSwap(old, cur) {
+						break
+					}
+				}
+				inFlight.Add(-1)
+				release()
+			}(c)
+		}
+	}
+	close(start)
+	wg.Wait()
+
+	if got := maxSeen.Load(); got > maxRuns {
+		t.Fatalf("concurrent holders oversubscribed the global cap: max %d > cap %d", got, maxRuns)
+	}
+	if got := ac.ActiveRuns(); got != 0 {
+		t.Fatalf("active runs after all releases = %d, want 0", got)
 	}
 }
 
 func TestAdmission_PerWorkspaceRunLimit(t *testing.T) {
-	ac := newTestAdmission(AdmissionLimits{})
+	ac := newTestAdmission(AdmissionLimits{MaxActiveRunsPerWorkspace: 1})
 	ctx := context.Background()
-	limits := AdmissionLimits{MaxActiveRunsPerWorkspace: 1}
 
-	if err := ac.Acquire(ctx, "a", "ws-1", limits, false); err != nil {
-		t.Fatalf("first: %v", err)
-	}
-	err := ac.Acquire(ctx, "b", "ws-1", limits, false)
-	if err == nil {
+	r1 := mustAcquire(t, ac, "a", "ws-1")
+	if _, err := ac.Acquire(ctx, "b", "ws-1"); err == nil {
 		t.Fatal("second in same workspace should fail")
 	}
 	// Different workspace is fine.
-	if err := ac.Acquire(ctx, "c", "ws-2", limits, false); err != nil {
-		t.Fatalf("different workspace: %v", err)
-	}
+	r2 := mustAcquire(t, ac, "c", "ws-2")
+	r1()
+	r2()
 }
 
 func TestAdmission_ZeroLimitsMeansUnlimited(t *testing.T) {
 	ac := newTestAdmission(AdmissionLimits{})
-	ctx := context.Background()
-	limits := AdmissionLimits{} // all zero = unlimited
 
 	for i := 0; i < 100; i++ {
-		if err := ac.Acquire(ctx, "caller", "ws", limits, false); err != nil {
+		if _, err := ac.Acquire(context.Background(), "caller", "ws"); err != nil {
 			t.Fatalf("acquire %d: %v", i, err)
 		}
 	}
 }
 
-func TestAdmission_ReleaseIsIdempotent(t *testing.T) {
-	ac := newTestAdmission(AdmissionLimits{})
+// TestAdmission_ReleaseClosureExactOnce is a regression test for the final
+// review (P2): the old named Release was not actually idempotent — with two
+// holders on the same caller/workspace, a double release stole the other
+// holder's count. The per-reservation closure must release exactly once even
+// when called repeatedly while another holder is active.
+func TestAdmission_ReleaseClosureExactOnce(t *testing.T) {
+	ac := newTestAdmission(AdmissionLimits{MaxActiveRuns: 4})
 	ctx := context.Background()
-	limits := AdmissionLimits{MaxActiveRuns: 1}
 
-	ac.Acquire(ctx, "a", "w", limits, false)
-	ac.Release("a", "w")
-	// Double release should not panic or go negative.
-	ac.Release("a", "w")
-	// Counter should be 0, so a new acquire works.
-	if err := ac.Acquire(ctx, "a", "w", limits, false); err != nil {
-		t.Fatalf("acquire after double release: %v", err)
+	r1 := mustAcquire(t, ac, "a", "w")
+	r2 := mustAcquire(t, ac, "a", "w")
+	if got := ac.ActiveRuns(); got != 2 {
+		t.Fatalf("active runs = %d, want 2", got)
+	}
+
+	// Double-calling r1 must not touch r2's reservation.
+	r1()
+	r1()
+	if got := ac.ActiveRuns(); got != 1 {
+		t.Fatalf("active runs after double release = %d, want 1 (stole another holder)", got)
+	}
+	// The remaining holder's release still works exactly once.
+	r2()
+	r2()
+	if got := ac.ActiveRuns(); got != 0 {
+		t.Fatalf("active runs = %d, want 0", got)
+	}
+	// Capacity is fully returned.
+	if _, err := ac.Acquire(ctx, "a", "w"); err != nil {
+		t.Fatalf("acquire after releases: %v", err)
 	}
 }
 
-func TestAdmission_PerCallerSessionLimit(t *testing.T) {
-	store := runtime.NewMemorySessionStore()
-	ac := NewAdmissionController(struct {
-		MaxActiveRuns             int
-		MaxActiveRunsPerCaller    int
-		MaxActiveRunsPerWorkspace int
-		MaxSessionsPerCaller      int
-	}{MaxSessionsPerCaller: 2}, store, nil)
+// TestAdmission_WorkersPrecheck verifies the max_workers fast precheck
+// (O-F10): when the live worker count is at the cap, admission rejects with
+// ScopeWorkers before any session/turn state is created.
+func TestAdmission_WorkersPrecheck(t *testing.T) {
+	var live atomic.Int64
+	live.Store(2)
+	ac := NewAdmissionController(AdmissionLimits{MaxWorkers: 2}, func() int { return int(live.Load()) }, nil)
 	ctx := context.Background()
-	limits := AdmissionLimits{MaxSessionsPerCaller: 2}
 
-	// Create 2 sessions for caller-a.
-	store.Create(ctx, runtime.SessionRecord{ID: "s1", CallerID: "caller-a", Status: runtime.SessionActive})
-	store.Create(ctx, runtime.SessionRecord{ID: "s2", CallerID: "caller-a", Status: runtime.SessionActive})
-
-	// A third new session should be rejected.
-	err := ac.Acquire(ctx, "caller-a", "ws", limits, true)
+	_, err := ac.Acquire(ctx, "a", "w")
 	if err == nil {
-		t.Fatal("third session should be rejected")
+		t.Fatal("acquire at worker cap should fail")
 	}
 	var ae *ErrAdmissionRejected
-	if !errors.As(err, &ae) || ae.Scope != ScopeSessions {
-		t.Fatalf("expected ScopeSessions, got %v", err)
+	if !errors.As(err, &ae) || ae.Scope != ScopeWorkers || ae.Reason != "max_workers" {
+		t.Fatalf("expected ScopeWorkers/max_workers rejection, got %v", err)
 	}
+
+	live.Store(1)
+	release := mustAcquire(t, ac, "a", "w")
+	release()
 }
 
-func TestRateLimitedError_OF10(t *testing.T) {
-	ae := rateLimited("caller", "active_runs")
-	if ae.Type != errorTypeRateLimit {
-		t.Errorf("type = %q, want %q", ae.Type, errorTypeRateLimit)
-	}
-	if ae.Code != "caller_active_runs" {
-		t.Errorf("code = %q", ae.Code)
+// TestAdmission_WorkersPrecheckSkippedWithoutProbe verifies a nil worker
+// probe disables the precheck (the backend capacity error stays the authority).
+func TestAdmission_WorkersPrecheckSkippedWithoutProbe(t *testing.T) {
+	ac := newTestAdmission(AdmissionLimits{MaxWorkers: 1})
+	if _, err := ac.Acquire(context.Background(), "a", "w"); err != nil {
+		t.Fatalf("nil workers probe must disable the precheck: %v", err)
 	}
 }

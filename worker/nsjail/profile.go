@@ -126,6 +126,7 @@ func Build(iso config.IsolationConfig, layout SessionLayout, sessionID string) (
 	writeRlimit(&b, "rlimit_nproc", int64(iso.Rlimits.MaxProcesses), 0)
 	writeRlimit(&b, "rlimit_core", iso.Rlimits.MaxCoreDumpBytes, -1)
 	writeRlimit(&b, "rlimit_as", iso.Rlimits.MaxAddressSpaceBytes, -1)
+	writeRlimit(&b, "rlimit_fsize", iso.Rlimits.MaxFileBytes, -1)
 	b.WriteString("\n")
 
 	writeMount(&b, layout.WorkspaceDir, mounts.WorkspaceDir)
@@ -156,7 +157,13 @@ func Build(iso config.IsolationConfig, layout SessionLayout, sessionID string) (
 	if iso.CloneNewPID {
 		fmt.Fprintf(&b, "mount: { dst: %q; fstype: \"proc\"; rw: false; mandatory: true; } ;\n", "/proc")
 	}
-	fmt.Fprintf(&b, "mount: { dst: %q; fstype: \"tmpfs\"; options: \"size=256m\"; rw: true; mandatory: true; };\n", mounts.TmpDir)
+	// The per-session tmpfs at TmpDir is size-bounded so one session cannot
+	// exhaust host /tmp (default 256 MiB, configurable).
+	tmpfsSize := iso.Mounts.TmpfsSizeMiB
+	if tmpfsSize <= 0 {
+		tmpfsSize = 256
+	}
+	fmt.Fprintf(&b, "mount: { dst: %q; fstype: \"tmpfs\"; options: \"size=%dm\"; rw: true; mandatory: true; };\n", mounts.TmpDir, tmpfsSize)
 	b.WriteString("\n")
 
 	switch iso.Seccomp.Policy {

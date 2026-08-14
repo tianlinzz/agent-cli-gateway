@@ -404,10 +404,12 @@ func (s *Session) Close(ctx context.Context) error {
 		return protocolError("close wait: %w", ctx.Err())
 	case <-timer.C:
 		_ = s.process.ForceKill()
+		reapTimer := time.NewTimer(s.opts.Timeout)
+		defer reapTimer.Stop()
 		select {
 		case <-s.done:
 			return nil
-		case <-time.After(s.opts.Timeout):
+		case <-reapTimer.C:
 			return protocolError("close timed out after %s", 2*s.opts.Timeout)
 		}
 	}

@@ -357,3 +357,45 @@ func TestValidateBinary(t *testing.T) {
 		})
 	}
 }
+
+// TestBuild_TmpfsSizeAndFsizeConfigurable verifies the final-review resource
+// knobs: the per-session tmpfs size is configurable (bounded /tmp per
+// session) and RLIMIT_FSIZE bounds any single file written inside the jail.
+func TestBuild_TmpfsSizeAndFsizeConfigurable(t *testing.T) {
+	iso := config.IsolationConfig{
+		Required:      true,
+		CloneNewPID:   true,
+		UserNamespace: config.UserNamespaceConfig{Enabled: true, UID: 1000, GID: 1000},
+		Rlimits: config.RlimitsConfig{
+			MaxOpenFiles: 1024,
+			MaxProcesses: 256,
+			MaxFileBytes: 64 << 20,
+		},
+		Mounts: config.MountsConfig{
+			WorkspaceDir: "/workspace",
+			AgentHomeDir: "/agent-home",
+			TmpDir:       "/tmp",
+			TmpfsSizeMiB: 64,
+		},
+	}
+	root := t.TempDir()
+	for _, d := range []string{"ws", "home", "sock"} {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prof, err := Build(iso, SessionLayout{
+		WorkspaceDir: filepath.Join(root, "ws"),
+		AgentHomeDir: filepath.Join(root, "home"),
+		SocketDir:    filepath.Join(root, "sock"),
+	}, "sess-tmpfs")
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(prof.Config, `options: "size=64m"`) {
+		t.Errorf("tmpfs size not configurable:\n%s", prof.Config)
+	}
+	if !strings.Contains(prof.Config, "rlimit_fsize: 67108864;") {
+		t.Errorf("rlimit_fsize missing:\n%s", prof.Config)
+	}
+}

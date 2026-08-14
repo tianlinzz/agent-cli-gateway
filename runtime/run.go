@@ -56,7 +56,9 @@ type RunRecord struct {
 	CallerID string
 	// WorkspaceID is the opaque workspace identifier for this run.
 	WorkspaceID string
-	// ModelID is the public model/agent identifier.
+	// ModelID is the PUBLIC model/agent identifier exactly as the caller
+	// requested it (it may differ from the adapter id when models are
+	// mapped); observability metrics key by the bounded adapter id instead.
 	ModelID string
 
 	// Status is the run lifecycle state.

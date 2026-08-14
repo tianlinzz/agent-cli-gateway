@@ -2178,13 +2178,19 @@ func TestNormalizer_NoWorkDirInjection(t *testing.T) {
 			"Native_Session_ID": "attacker-cased",
 		},
 	}
-	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body)
+	traceparent := "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+	resp := doAuthJSONH(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body,
+		map[string]string{"traceparent": traceparent})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d (body %s)", resp.StatusCode, readBody(t, resp))
 	}
 	sid := resp.Header.Get("X-Gateway-Session-Id")
 	if sid == "" {
 		t.Fatal("no X-Gateway-Session-Id in response")
+	}
+	runID := resp.Header.Get("X-Gateway-Run-Id")
+	if runID == "" {
+		t.Fatal("no X-Gateway-Run-Id in response")
 	}
 
 	reqs := backend.StartRequests()
@@ -2214,8 +2220,20 @@ func TestNormalizer_NoWorkDirInjection(t *testing.T) {
 			t.Errorf("resume id %q leaked into the start request: %q", key, v)
 		}
 	}
-	if sr.Metadata["trace_id"] != "abc" {
-		t.Errorf("trace_id metadata lost: %v", sr.Metadata)
+	// Server-owned run identity must cross the API boundary (final review):
+	// the client-forged trace_id "abc" is stripped and replaced by the value
+	// parsed from the W3C traceparent header; run_id/request_id are
+	// server-generated and match the response headers.
+	if v := sr.Metadata["trace_id"]; v == "abc" {
+		t.Errorf("client-forged trace_id leaked into the start request: %q", v)
+	} else if v != "0af7651916cd43dd8448eb211c80319c" {
+		t.Errorf("trace_id = %q, want the traceparent-parsed value", v)
+	}
+	if v := sr.Metadata["run_id"]; v != runID {
+		t.Errorf("run_id = %q, want response run id %q", v, runID)
+	}
+	if v := sr.Metadata["request_id"]; v == "" {
+		t.Error("request_id missing from the start request")
 	}
 	if sr.ModelID != "codex" || sr.CallerID != testOwner {
 		t.Errorf("start request = %+v, want model codex owner %s", sr, testOwner)
@@ -2453,8 +2471,10 @@ func TestRunStatusFromTurnResult_OF11(t *testing.T) {
 	}{
 		{"succeeded", turnResult{finished: true}, runtime.RunSucceeded},
 		{"failed", turnResult{failed: true}, runtime.RunFailed},
-		{"timed out", turnResult{timedOut: true}, runtime.RunTimedOut},
-		{"aborted", turnResult{aborted: true}, runtime.RunCancelled},
+		{"timed out settled", turnResult{timedOut: true, timeoutSettled: true}, runtime.RunTimedOut},
+		{"timed out unsettled", turnResult{timedOut: true}, runtime.RunOutcomeUnknown},
+		{"aborted settled", turnResult{aborted: true, abortSettled: true}, runtime.RunCancelled},
+		{"aborted unsettled", turnResult{aborted: true}, runtime.RunOutcomeUnknown},
 		{"outcome unknown", turnResult{}, runtime.RunOutcomeUnknown},
 	}
 	for _, tc := range tests {

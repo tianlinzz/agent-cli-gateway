@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/tianlinzz/agent-cli-gateway/config"
+	"github.com/tianlinzz/agent-cli-gateway/metrics"
 	grt "github.com/tianlinzz/agent-cli-gateway/runtime"
 )
 
@@ -936,28 +938,18 @@ func TestWorkerDonePublishesAfterDeregisterAndRuntimeCleanup(t *testing.T) {
 	socketDir := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
 	sup := &Supervisor{sessions: make(map[string]*workerSession)}
-	releaseStarted := make(chan struct{})
-	allowRelease := make(chan struct{})
 	ws := &workerSession{
 		sup: sup, req: testRequest("publish-after-cleanup"), ctx: ctx, cancel: cancel,
 		state: stateRunning, done: make(chan struct{}), sessionDir: sessionDir, socketDir: socketDir,
-		releaseSlot: func() {
-			close(releaseStarted)
-			<-allowRelease
-		},
 	}
 	sup.sessions[ws.req.SessionID] = ws
-	go ws.terminate(errors.New("worker exited"))
-	<-releaseStarted
+	ws.terminate(errors.New("worker exited"))
+
+	// Done is the LAST step of finalizeTeardown: by the time it closes, the
+	// session is deregistered and the runtime directories are gone.
 	select {
 	case <-ws.Done():
-		t.Fatal("Done published before terminal cleanup completed")
-	default:
-	}
-	close(allowRelease)
-	select {
-	case <-ws.Done():
-	case <-time.After(time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("Done was not published after cleanup")
 	}
 	if sup.SessionCount() != 0 {
@@ -1170,4 +1162,350 @@ func TestLocalExecutionBackend_PreflightFailClosed(t *testing.T) {
 	if err := backend.Preflight(context.Background()); err == nil {
 		t.Fatal("Preflight must fail closed when the nsjail binary is missing")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 code-review regressions: capacity error, worker metrics, deferred
+// directory cleanup, log cap.
+// ---------------------------------------------------------------------------
+
+// TestSupervisor_MaxWorkersWrapsCapacityError verifies the authoritative
+// max_workers rejection wraps runtime.ErrCapacityExceeded so the API layer
+// answers 429 instead of 500 (O-F10).
+func TestSupervisor_MaxWorkersWrapsCapacityError(t *testing.T) {
+	sup := newTestSupervisor(t, func(c *Config) { c.MaxWorkers = 1 })
+
+	ws, err := sup.StartSession(context.Background(), testRequest("cap-1"))
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	defer ws.Close(context.Background())
+	waitEvent(t, ws, grt.EventStatus, 5*time.Second)
+
+	_, err = sup.StartSession(context.Background(), testRequest("cap-2"))
+	if err == nil {
+		t.Fatal("second session must exceed max_workers=1")
+	}
+	if !errors.Is(err, grt.ErrCapacityExceeded) {
+		t.Fatalf("max_workers error must wrap runtime.ErrCapacityExceeded, got %v", err)
+	}
+}
+
+// TestSupervisor_WorkerLifecycleMetrics verifies the O-F11 worker metrics:
+// the live-worker gauge rises on start and falls on teardown, and a crash
+// increments the crash counter.
+func TestSupervisor_WorkerLifecycleMetrics(t *testing.T) {
+	reg := metrics.NewRegistry()
+	sup := newTestSupervisor(t, func(c *Config) { c.Metrics = reg })
+
+	ws, err := sup.StartSession(context.Background(), testRequest("metric-1"))
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	waitEvent(t, ws, grt.EventStatus, 5*time.Second)
+	if text := exportMetrics(t, reg); !strings.Contains(text, "gateway_workers_active 1\n") {
+		t.Errorf("live worker gauge missing 1 after start:\n%s", text)
+	}
+
+	if err := ws.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	waitEventsClosed(t, ws, 5*time.Second)
+	if text := exportMetrics(t, reg); !strings.Contains(text, "gateway_workers_active 0\n") {
+		t.Errorf("live worker gauge missing 0 after close:\n%s", text)
+	}
+}
+
+// TestSupervisor_CrashIncrementsCrashCounter verifies a worker crash is
+// observable as gateway_worker_crashes_total (O-F11).
+func TestSupervisor_CrashIncrementsCrashCounter(t *testing.T) {
+	t.Setenv("GW_TESTWORKER_BEHAVIOR", "crash-after-start")
+	reg := metrics.NewRegistry()
+	sup := newTestSupervisor(t, func(c *Config) { c.Metrics = reg })
+
+	ws, err := sup.StartSession(context.Background(), testRequest("crash-metric"))
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	waitEvent(t, ws, grt.EventStatus, 5*time.Second)
+	waitEventsClosed(t, ws, 10*time.Second)
+
+	if text := exportMetrics(t, reg); !strings.Contains(text, `gateway_worker_crashes_total{model="test-model"} 1`) {
+		t.Errorf("crash counter missing after worker crash:\n%s", text)
+	}
+}
+
+// TestSupervisor_ReclaimIncrementsReclaimCounter verifies idle reclamation is
+// observable as gateway_worker_reclaims_total (O-F11).
+func TestSupervisor_ReclaimIncrementsReclaimCounter(t *testing.T) {
+	reg := metrics.NewRegistry()
+	sup := newTestSupervisor(t, func(c *Config) {
+		c.Metrics = reg
+		c.SessionIdleTimeout = time.Hour
+	})
+
+	ws, err := sup.StartSession(context.Background(), testRequest("reclaim-metric"))
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	waitEvent(t, ws, grt.EventStatus, 5*time.Second)
+
+	// Force the idle reaper: the session is older than the idle timeout.
+	sup.reapIdle(time.Now().Add(2 * time.Hour))
+	if text := exportMetrics(t, reg); !strings.Contains(text, `gateway_worker_reclaims_total{model="test-model"} 1`) {
+		t.Errorf("reclaim counter missing after idle reclaim:\n%s", text)
+	}
+	waitEventsClosed(t, ws, 5*time.Second)
+}
+
+// TestTerminateFencesUnreapedSession_OB5 is a regression test for the final
+// review (P1): when the process tree is NOT reaped within the bounded wait,
+// terminate must not release the session's capacity — a still-alive worker
+// must keep the registration (max_workers + live gauge) reserved, fence a
+// same-session restart, and leave the runtime directories in place. One
+// supervisor-wide pass (finalizeReapedPending, driven by the loop in
+// production) completes teardown only after the reap.
+func TestTerminateFencesUnreapedSession_OB5(t *testing.T) {
+	sessionDir := t.TempDir()
+	socketDir := t.TempDir()
+	sentinel := filepath.Join(sessionDir, "alive")
+	if err := os.WriteFile(sentinel, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	sup := &Supervisor{sessions: make(map[string]*workerSession)}
+	ws := &workerSession{
+		sup: sup, req: testRequest("ob5-fence"), ctx: ctx, cancel: cancel,
+		state: stateRunning, done: make(chan struct{}),
+		reaped:     make(chan struct{}),
+		sessionDir: sessionDir, socketDir: socketDir,
+	}
+	sup.sessions[ws.req.SessionID] = ws
+
+	terminateDone := make(chan struct{})
+	go func() {
+		ws.terminate(errors.New("test"))
+		close(terminateDone)
+	}()
+
+	// terminate must return (not block forever) even though reaped never
+	// closes within the 2s bound.
+	select {
+	case <-terminateDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminate blocked forever on unreaped process")
+	}
+
+	// Capacity stays reserved: still registered, done NOT published (an
+	// immediate same-session restart must be impossible), dirs untouched.
+	if n := sup.SessionCount(); n != 1 {
+		t.Fatalf("unreaped session deregistered: count = %d, want 1", n)
+	}
+	select {
+	case <-ws.Done():
+		t.Fatal("done published while process still unreaped")
+	default:
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("session dir removed despite unreaped process: %v", err)
+	}
+	if _, err := os.Stat(socketDir); err != nil {
+		t.Fatalf("socket dir removed despite unreaped process: %v", err)
+	}
+	if _, err := sup.StartSession(context.Background(), testRequest("ob5-fence")); err == nil {
+		t.Fatal("same-session restart must be rejected while fenced")
+	}
+
+	// Once the process finally exits (monitor closes reaped), the centralized
+	// pass releases everything: registration, dirs, done.
+	close(ws.reaped)
+	sup.finalizeReapedPending()
+	select {
+	case <-ws.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("done not published after delayed reap finalization")
+	}
+	if n := sup.SessionCount(); n != 0 {
+		t.Fatalf("session still registered after finalization: %d", n)
+	}
+	if _, err := os.Stat(sessionDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("session dir still exists after finalization")
+	}
+	if _, err := os.Stat(socketDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("socket dir still exists after finalization")
+	}
+}
+
+// TestWorkerLogCapNeverExceedsConfiguredCap is a regression test for the
+// Phase 2 code review: caps below 2048 bytes forced a 1 KiB tail plus a
+// marker, so the truncated file was LARGER than the configured cap. After
+// truncation the file must be at or below the cap for every cap value.
+func TestWorkerLogCapNeverExceedsConfiguredCap(t *testing.T) {
+	for _, cap := range []int64{64, 300, 2048, 100 * 1024} {
+		dir := t.TempDir()
+		logPath := filepath.Join(dir, "worker.log")
+		if err := os.WriteFile(logPath, bytes.Repeat([]byte("x"), int(10*cap)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ws := &workerSession{
+			sup:        &Supervisor{cfg: Config{MaxWorkerLogBytes: cap}},
+			sessionDir: dir,
+		}
+		ws.capLogFile()
+
+		info, err := os.Stat(logPath)
+		if err != nil {
+			t.Fatalf("cap %d: stat: %v", cap, err)
+		}
+		if info.Size() > cap {
+			t.Fatalf("cap %d: truncated log is %d bytes, exceeding the cap", cap, info.Size())
+		}
+		if cap >= 300 && info.Size() == 0 {
+			t.Fatalf("cap %d: truncation discarded everything (marker expected)", cap)
+		}
+	}
+}
+
+// TestWorkerLogCapKeepsMarkerAndTail verifies a normal-sized cap keeps the
+// truncation marker and the newest tail bytes.
+func TestWorkerLogCapKeepsMarkerAndTail(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "worker.log")
+	payload := make([]byte, 8*1024)
+	for i := range payload {
+		payload[i] = byte('a' + i%26)
+	}
+	if err := os.WriteFile(logPath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const cap = 4 * 1024
+	ws := &workerSession{sup: &Supervisor{cfg: Config{MaxWorkerLogBytes: cap}}, sessionDir: dir}
+	ws.capLogFile()
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "[log truncated:") {
+		t.Fatalf("truncated log missing marker:\n%s", data)
+	}
+	// The tail (last cap/2 bytes of the original) must be preserved.
+	tail := payload[len(payload)-cap/2:]
+	if !strings.HasSuffix(string(data), string(tail)) {
+		t.Error("truncated log does not end with the preserved tail")
+	}
+}
+
+// exportMetrics renders a registry in Prometheus text format for assertions.
+func exportMetrics(t *testing.T, reg *metrics.Registry) string {
+	t.Helper()
+	var sb strings.Builder
+	if err := reg.WritePrometheus(&sb); err != nil {
+		t.Fatalf("export metrics: %v", err)
+	}
+	return sb.String()
+}
+
+// TestSupervisor_MaxWorkers_ConcurrentStartsNoOversubscription is a
+// regression test for the final review (P1): the cap used to check only
+// registered sessions and unlock before spawn+handshake, so concurrent
+// StartSession calls could all pass the check and register MaxWorkers+1
+// workers. The pending-capacity reservation must make concurrent starts
+// fail deterministically with a typed capacity error.
+func TestSupervisor_MaxWorkers_ConcurrentStartsNoOversubscription(t *testing.T) {
+	sup := newTestSupervisor(t, func(c *Config) { c.MaxWorkers = 1 })
+
+	const attempts = 8
+	var wg sync.WaitGroup
+	type result struct {
+		ws  *workerSession
+		err error
+	}
+	results := make(chan result, attempts)
+	start := make(chan struct{})
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			ws, err := sup.StartSession(context.Background(), testRequest(fmt.Sprintf("conc-cap-%d", i)))
+			results <- result{ws, err}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	succeeded := 0
+	for r := range results {
+		if r.err == nil {
+			succeeded++
+			defer r.ws.Close(context.Background())
+			continue
+		}
+		if !errors.Is(r.err, grt.ErrCapacityExceeded) {
+			t.Errorf("loser error = %v, want runtime.ErrCapacityExceeded", r.err)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("concurrent starts with max_workers=1 produced %d successes, want exactly 1", succeeded)
+	}
+}
+
+// TestSupervisor_AgentConcurrencySlotIsPerRun_FailsFast is a regression test
+// for the final review (P1): the per-agent slot used to be held for the whole
+// session lifetime and acquired with an unbounded blocking wait. It must
+// cover only the ACTIVE turn and a full slot must fail fast with a typed
+// capacity error (API-mappable to 429) instead of hanging until context
+// cancellation. Idle sessions must not occupy slots.
+func TestSupervisor_AgentConcurrencySlotIsPerRun_FailsFast(t *testing.T) {
+	t.Setenv("GW_TESTWORKER_BEHAVIOR", "slow-echo")
+	sup := newTestSupervisor(t, func(c *Config) {
+		c.Agents = map[string]grt.AgentExecutionConfig{
+			"test-model": {MaxConcurrency: 1},
+		}
+	})
+
+	// Two idle sessions of the same agent: neither holds a slot.
+	wsA, err := sup.StartSession(context.Background(), testRequest("slot-a"))
+	if err != nil {
+		t.Fatalf("StartSession A: %v", err)
+	}
+	defer wsA.Close(context.Background())
+	wsB, err := sup.StartSession(context.Background(), testRequest("slot-b"))
+	if err != nil {
+		t.Fatalf("StartSession B (idle session must not consume a slot): %v", err)
+	}
+	defer wsB.Close(context.Background())
+	waitEvent(t, wsA, grt.EventStatus, 5*time.Second)
+	waitEvent(t, wsB, grt.EventStatus, 5*time.Second)
+
+	// Turn on A holds the only slot for ~1.5s (slow-echo).
+	if err := wsA.Send(context.Background(), grt.Input{Messages: []grt.Message{{Role: "user", Content: "hold"}}}); err != nil {
+		t.Fatalf("Send A: %v", err)
+	}
+
+	// A concurrent turn on B must fail FAST with the typed capacity error,
+	// not block until the request context dies.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- wsB.Send(ctx, grt.Input{Messages: []grt.Message{{Role: "user", Content: "blocked"}}})
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, grt.ErrCapacityExceeded) {
+			t.Fatalf("Send B during full slot: err = %v, want runtime.ErrCapacityExceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Send B blocked on a full slot instead of failing fast")
+	}
+
+	// After A's turn finishes, the slot frees and B's turn is admitted.
+	waitEvent(t, wsA, grt.EventFinish, 5*time.Second)
+	if err := wsB.Send(context.Background(), grt.Input{Messages: []grt.Message{{Role: "user", Content: "after"}}}); err != nil {
+		t.Fatalf("Send B after slot release: %v", err)
+	}
+	waitEvent(t, wsB, grt.EventFinish, 5*time.Second)
 }
