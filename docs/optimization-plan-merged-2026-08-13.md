@@ -145,6 +145,8 @@ Phase 1 — 发布与沙箱声明可证明（对应 ROADMAP Phase 1 + AUDIT A3/C
   6. O-C3  uidmap 默认值对齐（1000→65532，O-A3 smoke 的前置）
   7. O-F04 Agent 可用性探针 + /v1/models 只广告可用项 + 镜像 CLI 契约
          （基础镜像不含 CLI、agent 默认禁用；产品镜像 docker/Dockerfile.agents）
+         —— **口径已降级（2026-08-14 批准）**：Phase1 可用性 = 命令存在且可执行
+         （`exec.LookPath` + 超时），版本/健康/readiness 探针推迟到 Phase5 §5.1。
   8. O-F07 HTTP 加固（ReadHeaderTimeout/IdleTimeout/MaxHeaderBytes +
          MaxBytesReader→413 + 拒绝多 JSON/尾随字节 + metadata 键/长/值上限）
   9. O-C2  seccomp-off 分层 fail-closed（supervisor 层 + nsjail.Build）
@@ -187,6 +189,7 @@ Phase 5 — 远程执行与横向扩展（ROADMAP Phase 5 原样保留）
 4. **D2 时机**：L 级、触及 codex/kimi 核心，回报是收敛已漂移行为。Phase 3 立即做 vs 推迟到新 Agent 接入时。
 5. **执行粒度**：按 Phase 顺序逐 PR 推进 vs 先挑低风险高回报子集（U1 + O-A2 + O-B1/B2/B3 + O-F09a）。
 6. **（ROADMAP 原有，仍有效）** Phase 4 选型 PostgreSQL vs Redis、Phase 5 workspace 策略，届时单独设计评审。
+7. **（已决 2026-08-14）O-F04 探针口径**：Phase 1 验收口径降级为「命令存在且可执行（`exec.LookPath`，带超时）」。版本/健康/readiness 探针正式推迟到 Phase 5 §5.1（worker 广告 native CLI 版本）。依据：不变量 #2「API 进程永不启动 Agent CLI」——版本探针需真实 `exec` CLI，必须放 worker 侧。
 
 ---
 

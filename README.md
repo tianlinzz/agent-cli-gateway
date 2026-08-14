@@ -235,7 +235,10 @@ so `/v1/models` advertises nothing out of the box. To make an agent available:
 
 Model discovery probes that `command` (`exec.LookPath`) and only advertises an
 agent whose CLI is actually installed, so the image can never claim an agent it
-cannot run. The three CLIs are Node packages:
+cannot run. This is a **presence check**, not a version/health probe: it does
+not execute the CLI or validate its version (the API process never launches an
+Agent CLI; version/readiness probing is deferred to Phase 5, where Workers
+advertise their native CLI versions). The three CLIs are Node packages:
 
 | Agent | npm package | default binary |
 |---|---|---|
