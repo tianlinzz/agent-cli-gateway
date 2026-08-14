@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tianlinzz/agent-cli-gateway/adapters/internal/bridge"
 	native "github.com/tianlinzz/agent-cli-gateway/agent/kimi"
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
 )
@@ -105,7 +106,7 @@ func TestSessionSendsOnlyLatestUserMessageToNativeAgent(t *testing.T) {
 	}}
 
 	freshNative := newFakeSession("")
-	if err := wrapSession(freshNative, false).Send(context.Background(), input); err != nil {
+	if err := bridge.Wrap(freshNative, bridge.WrapOptions{Adapter: "kimi", InjectSystemPrompt: false}).Send(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
 	if freshNative.input.Prompt != "second" {
@@ -113,7 +114,7 @@ func TestSessionSendsOnlyLatestUserMessageToNativeAgent(t *testing.T) {
 	}
 
 	resumeNative := newFakeSession("native-1")
-	if err := wrapSession(resumeNative, false).Send(context.Background(), input); err != nil {
+	if err := bridge.Wrap(resumeNative, bridge.WrapOptions{Adapter: "kimi", InjectSystemPrompt: false}).Send(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
 	if resumeNative.input.Prompt != "second" {
@@ -130,7 +131,7 @@ func TestSessionInjectsSystemPromptWhenEnabled(t *testing.T) {
 		{Role: "tool", Content: "tool result"},
 		{Role: "user", Content: "second"},
 	}}
-	if err := wrapSession(nativeSession, true).Send(context.Background(), input); err != nil {
+	if err := bridge.Wrap(nativeSession, bridge.WrapOptions{Adapter: "kimi", InjectSystemPrompt: true}).Send(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
 	if want := "be exact\n\nsecond"; nativeSession.input.Prompt != want {
@@ -140,7 +141,7 @@ func TestSessionInjectsSystemPromptWhenEnabled(t *testing.T) {
 
 func TestSessionMapsEveryNativeEventAndDelegatesLifecycle(t *testing.T) {
 	nativeSession := newFakeSession("native-1")
-	session := wrapSession(nativeSession, false)
+	session := bridge.Wrap(nativeSession, bridge.WrapOptions{Adapter: "kimi", InjectSystemPrompt: false})
 	nativeSession.events <- native.Event{Kind: native.EventText, Text: "text"}
 	nativeSession.events <- native.Event{Kind: native.EventReasoning, Reasoning: &native.Reasoning{ID: "reason-1", Text: "thought"}}
 	nativeSession.events <- native.Event{Kind: native.EventToolUse, Tool: &native.ToolCall{ID: "tool-1", Name: "Shell", Arguments: map[string]any{"command": "pwd"}}}
@@ -195,10 +196,10 @@ func TestRegistryContainsKimi(t *testing.T) {
 
 type captureStarter struct {
 	options native.Options
-	session nativeSession
+	session bridge.NativeSession
 }
 
-func (s *captureStarter) Start(_ context.Context, options native.Options) (nativeSession, error) {
+func (s *captureStarter) Start(_ context.Context, options native.Options) (bridge.NativeSession, error) {
 	s.options = options
 	return s.session, nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/tianlinzz/agent-cli-gateway/adapters/internal/bridge"
 	native "github.com/tianlinzz/agent-cli-gateway/agent/codex"
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
 )
@@ -78,7 +79,7 @@ func TestStartMapsCodexHomeAndResumeMetadata(t *testing.T) {
 
 func TestSessionSendsOnlyLatestUserMessageToNativeAgent(t *testing.T) {
 	freshNative := newFakeSession("")
-	fresh := wrapSession(freshNative, false)
+	fresh := bridge.Wrap(freshNative, bridge.WrapOptions{Adapter: "codex", InjectSystemPrompt: false})
 	input := runtime.Input{Messages: []runtime.Message{
 		{Role: "system", Content: "<skills><skill>f1-web-admin</skill></skills>"},
 		{Role: "user", Content: "first"},
@@ -94,7 +95,7 @@ func TestSessionSendsOnlyLatestUserMessageToNativeAgent(t *testing.T) {
 	}
 
 	resumeNative := newFakeSession("thread-1")
-	resume := wrapSession(resumeNative, false)
+	resume := bridge.Wrap(resumeNative, bridge.WrapOptions{Adapter: "codex", InjectSystemPrompt: false})
 	if err := resume.Send(context.Background(), input); err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +106,7 @@ func TestSessionSendsOnlyLatestUserMessageToNativeAgent(t *testing.T) {
 
 func TestSessionInjectsSystemPromptWhenEnabled(t *testing.T) {
 	nativeSession := newFakeSession("")
-	session := wrapSession(nativeSession, true)
+	session := bridge.Wrap(nativeSession, bridge.WrapOptions{Adapter: "codex", InjectSystemPrompt: true})
 	input := runtime.Input{Messages: []runtime.Message{
 		{Role: "system", Content: "be exact"},
 		{Role: "user", Content: "first"},
@@ -123,7 +124,7 @@ func TestSessionInjectsSystemPromptWhenEnabled(t *testing.T) {
 
 func TestSessionMapsEventsAndDelegatesLifecycle(t *testing.T) {
 	nativeSession := newFakeSession("thread-1")
-	session := wrapSession(nativeSession, false)
+	session := bridge.Wrap(nativeSession, bridge.WrapOptions{Adapter: "codex", InjectSystemPrompt: false})
 	nativeSession.events <- native.Event{Kind: native.EventText, Text: "text"}
 	nativeSession.events <- native.Event{Kind: native.EventReasoning, Reasoning: &native.Reasoning{ID: "reason-1", Text: "reasoning"}}
 	nativeSession.events <- native.Event{Kind: native.EventToolUse, Tool: &native.ToolCall{ID: "tool-1", Name: "Bash", Arguments: map[string]any{"command": "pwd"}}}
@@ -149,10 +150,10 @@ func TestSessionMapsEventsAndDelegatesLifecycle(t *testing.T) {
 
 type captureStarter struct {
 	options native.Options
-	session nativeSession
+	session bridge.NativeSession
 }
 
-func (s *captureStarter) Start(_ context.Context, options native.Options) (nativeSession, error) {
+func (s *captureStarter) Start(_ context.Context, options native.Options) (bridge.NativeSession, error) {
 	s.options = options
 	return s.session, nil
 }

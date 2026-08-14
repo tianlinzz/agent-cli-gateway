@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/tianlinzz/agent-cli-gateway/adapters/internal/bridge"
 	native "github.com/tianlinzz/agent-cli-gateway/agent/codex"
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
 )
@@ -30,15 +31,7 @@ type Options struct {
 	InjectSystemPrompt bool
 }
 
-type nativeSession interface {
-	Send(context.Context, native.Input) error
-	Events() <-chan native.Event
-	Abort(context.Context) error
-	Close(context.Context) error
-	NativeSessionID() string
-}
-
-type starter func(context.Context, native.Options) (nativeSession, error)
+type starter func(context.Context, native.Options) (bridge.NativeSession, error)
 
 type Adapter struct {
 	opts  Options
@@ -67,11 +60,12 @@ func optionsFromConfig(cfg runtime.AdapterConfig) Options {
 	}
 }
 
+// NewAdapter constructs an adapter from explicit trusted options.
 func NewAdapter(opts Options) (*Adapter, error) {
 	return newAdapter(opts, startNative), nil
 }
 
-func startNative(ctx context.Context, options native.Options) (nativeSession, error) {
+func startNative(ctx context.Context, options native.Options) (bridge.NativeSession, error) {
 	return native.Start(ctx, options)
 }
 
@@ -98,10 +92,7 @@ func (a *Adapter) Describe(context.Context) (runtime.Descriptor, error) {
 }
 
 func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.Session, error) {
-	resumeID := strings.TrimSpace(req.Metadata["codex_thread_id"])
-	if resumeID == "" {
-		resumeID = strings.TrimSpace(req.Metadata["native_session_id"])
-	}
+	resumeID := bridge.ResumeID(req.Metadata)
 	env := append([]string(nil), a.opts.Env...)
 	if a.opts.CodexHome != "" {
 		env = append(env, "CODEX_HOME="+a.opts.CodexHome)
@@ -118,7 +109,7 @@ func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.
 	if err != nil {
 		return nil, err
 	}
-	return wrapSession(nativeSession, a.opts.InjectSystemPrompt), nil
+	return bridge.Wrap(nativeSession, bridge.WrapOptions{Adapter: "codex", InjectSystemPrompt: a.opts.InjectSystemPrompt}), nil
 }
 
 // envSlice renders a config env map as the K=V slice the native process spec

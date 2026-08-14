@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/tianlinzz/agent-cli-gateway/adapters/internal/bridge"
 	native "github.com/tianlinzz/agent-cli-gateway/agent/claudecode"
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
 )
@@ -88,7 +89,7 @@ func TestStartMapsTrustedOptionsAndNativeResumeID(t *testing.T) {
 
 func TestSessionMapsNativeEventsToRuntime(t *testing.T) {
 	nativeSession := newFakeNativeSession()
-	session := wrapSession(nativeSession, false)
+	session := bridge.Wrap(nativeSession, bridge.WrapOptions{Adapter: "claudecode", InjectSystemPrompt: false})
 	nativeSession.events <- native.Event{Kind: native.EventText, Text: "hello"}
 	nativeSession.events <- native.Event{Kind: native.EventReasoning, Reasoning: &native.Reasoning{ID: "reason-1", Text: "safe summary"}}
 	nativeSession.events <- native.Event{Kind: native.EventToolUse, Tool: &native.ToolCall{ID: "tool-1", Name: "Read", Arguments: map[string]any{"file_path": "a.go"}}}
@@ -117,7 +118,7 @@ func TestSessionMapsNativeEventsToRuntime(t *testing.T) {
 
 func TestSessionConvertsLastUserMessageAndDelegatesLifecycle(t *testing.T) {
 	nativeSession := newFakeNativeSession()
-	session := wrapSession(nativeSession, false)
+	session := bridge.Wrap(nativeSession, bridge.WrapOptions{Adapter: "claudecode", InjectSystemPrompt: false})
 	err := session.Send(context.Background(), runtime.Input{Messages: []runtime.Message{
 		{Role: "system", Content: "system"},
 		{Role: "user", Content: "first"},
@@ -143,7 +144,7 @@ func TestSessionConvertsLastUserMessageAndDelegatesLifecycle(t *testing.T) {
 
 func TestSessionInjectsSystemPromptWhenEnabled(t *testing.T) {
 	nativeSession := newFakeNativeSession()
-	session := wrapSession(nativeSession, true)
+	session := bridge.Wrap(nativeSession, bridge.WrapOptions{Adapter: "claudecode", InjectSystemPrompt: true})
 	err := session.Send(context.Background(), runtime.Input{Messages: []runtime.Message{
 		{Role: "system", Content: "be exact"},
 		{Role: "user", Content: "first"},
@@ -169,10 +170,10 @@ func TestRegistryContainsClaudeCode(t *testing.T) {
 
 type captureStarter struct {
 	options native.Options
-	session nativeSession
+	session bridge.NativeSession
 }
 
-func (s *captureStarter) Start(_ context.Context, options native.Options) (nativeSession, error) {
+func (s *captureStarter) Start(_ context.Context, options native.Options) (bridge.NativeSession, error) {
 	s.options = options
 	return s.session, nil
 }

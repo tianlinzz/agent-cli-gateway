@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tianlinzz/agent-cli-gateway/adapters/internal/bridge"
 	native "github.com/tianlinzz/agent-cli-gateway/agent/kimi"
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
 )
@@ -29,15 +30,7 @@ type Options struct {
 	InjectSystemPrompt bool
 }
 
-type nativeSession interface {
-	Send(context.Context, native.Input) error
-	Events() <-chan native.Event
-	Abort(context.Context) error
-	Close(context.Context) error
-	NativeSessionID() string
-}
-
-type starter func(context.Context, native.Options) (nativeSession, error)
+type starter func(context.Context, native.Options) (bridge.NativeSession, error)
 
 // Adapter implements runtime.AgentAdapter as a thin native bridge.
 type Adapter struct {
@@ -72,7 +65,7 @@ func NewAdapter(opts Options) (*Adapter, error) {
 	return newAdapter(opts, startNative), nil
 }
 
-func startNative(ctx context.Context, options native.Options) (nativeSession, error) {
+func startNative(ctx context.Context, options native.Options) (bridge.NativeSession, error) {
 	return native.Start(ctx, options)
 }
 
@@ -105,10 +98,7 @@ func (a *Adapter) Describe(context.Context) (runtime.Descriptor, error) {
 
 // Start converts runtime metadata and trusted config into native options.
 func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.Session, error) {
-	resumeID := strings.TrimSpace(req.Metadata["kimi_session_id"])
-	if resumeID == "" {
-		resumeID = strings.TrimSpace(req.Metadata["native_session_id"])
-	}
+	resumeID := bridge.ResumeID(req.Metadata)
 	start := a.start
 	if start == nil {
 		start = startNative
@@ -122,7 +112,7 @@ func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.
 	if err != nil {
 		return nil, err
 	}
-	return wrapSession(session, a.opts.InjectSystemPrompt), nil
+	return bridge.Wrap(session, bridge.WrapOptions{Adapter: "kimi", InjectSystemPrompt: a.opts.InjectSystemPrompt}), nil
 }
 
 // envSlice renders a config env map as the K=V slice the native process spec
