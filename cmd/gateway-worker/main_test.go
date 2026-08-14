@@ -34,7 +34,9 @@ func (s *contextProbeSession) Close(context.Context) error  { close(s.events); r
 
 func TestAdapterHandlerStartSession_DoesNotBindSessionToRPCContext(t *testing.T) {
 	reg := runtime.NewRegistry()
-	if err := reg.Register("probe", func(context.Context, string) (runtime.AgentAdapter, error) { return contextProbeAdapter{}, nil }); err != nil {
+	if err := reg.Register("probe", func(context.Context, string, runtime.AdapterConfig) (runtime.AgentAdapter, error) {
+		return contextProbeAdapter{}, nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 	h := &adapterHandler{reg: reg}
@@ -45,5 +47,47 @@ func TestAdapterHandlerStartSession_DoesNotBindSessionToRPCContext(t *testing.T)
 	cancel()
 	if err := h.SendInput(context.Background(), runtime.Input{}); err != nil {
 		t.Fatalf("session inherited canceled RPC context: %v", err)
+	}
+}
+
+// TestStartSessionPassesTypedConfigToFactory_OF08 pins the O-F08 contract:
+// the worker hands the deployment config straight to the adapter factory via
+// runtime.AdapterConfig — the old typed-config -> os.Setenv -> re-parse
+// roundtrip is gone. The provider model must override the agent's
+// configured default model.
+func TestStartSessionPassesTypedConfigToFactory_OF08(t *testing.T) {
+	var got runtime.AdapterConfig
+	reg := runtime.NewRegistry()
+	if err := reg.Register("probe", func(_ context.Context, _ string, cfg runtime.AdapterConfig) (runtime.AgentAdapter, error) {
+		got = cfg
+		return contextProbeAdapter{}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := &adapterHandler{reg: reg}
+	req := worker.StartSessionReq{
+		ModelID:     "probe",
+		SessionID:   "s",
+		CallerID:    "c",
+		WorkspaceID: "w",
+		AgentConfig: runtime.AgentExecutionConfig{
+			Command:      "/opt/tools/probe",
+			DefaultModel: "base-model",
+			Permission:   "deny",
+			Env:          map[string]string{"PROBE_FLAG": "1"},
+		},
+		ProviderModel: "provider-model",
+	}
+	if _, err := h.StartSession(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if got.Execution.Command != "/opt/tools/probe" || got.Execution.Permission != "deny" {
+		t.Fatalf("execution config not delivered: %#v", got.Execution)
+	}
+	if got.Execution.DefaultModel != "provider-model" {
+		t.Fatalf("default model = %q, want provider model override", got.Execution.DefaultModel)
+	}
+	if got.Execution.Env["PROBE_FLAG"] != "1" {
+		t.Fatalf("env map not delivered: %#v", got.Execution.Env)
 	}
 }

@@ -68,7 +68,7 @@ func TestNoResumePerTurnCompatibility(t *testing.T) {
 	forbidden := []string{
 		"Lifecycle" + "ResumePerTurn",
 		"resume" + "_per_turn",
-		"CC_GATEWAY_CODEX_" + "BACKEND",
+		"CC_GATEWAY" + "_CODEX_" + "BACKEND",
 		"Probe" + "Flags(",
 		"Flag" + "Support",
 	}
@@ -95,6 +95,43 @@ func TestNoResumePerTurnCompatibility(t *testing.T) {
 			if strings.Contains(string(data), needle) {
 				t.Errorf("obsolete lifecycle compatibility remains: %s contains %q", filepath.ToSlash(relative), needle)
 			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestNoEnvVarConfigRoundtrip enforces the O-F08 contract: agent deployment
+// config reaches adapter factories through runtime.AdapterConfig. The old
+// CC_GATEWAY-prefixed environment-variable bridge (typed config -> os.Setenv
+// -> adapter env re-parse) must not come back. Scanned sources exclude docs,
+// where the removed names survive as historical references.
+func TestNoEnvVarConfigRoundtrip(t *testing.T) {
+	root := moduleRoot(t)
+	forbidden := "CC_GATEWAY" + "_"
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" || entry.Name() == "vendor" || entry.Name() == ".superpowers" || filepath.ToSlash(path) == filepath.ToSlash(filepath.Join(root, "docs")) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		ext := filepath.Ext(path)
+		if ext != ".go" && ext != ".toml" && ext != ".sh" {
+			return nil
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		if strings.Contains(string(data), forbidden) {
+			relative, _ := filepath.Rel(root, path)
+			t.Errorf("env-var config roundtrip remains: %s contains %q", filepath.ToSlash(relative), forbidden)
 		}
 		return nil
 	})

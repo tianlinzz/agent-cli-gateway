@@ -9,8 +9,12 @@ import (
 )
 
 // AdapterFactory creates a new AgentAdapter instance for the given
-// registration name. A single factory may serve multiple registrations.
-type AdapterFactory func(ctx context.Context, name string) (AgentAdapter, error)
+// registration name. A single factory may serve multiple registrations. The
+// cfg argument carries the typed per-agent execution config; the API process
+// resolves adapters for discovery with a zero config (Describe only), while
+// the worker resolves with the deployment-owned config so it reaches the
+// adapter directly, with no environment-variable roundtrip (O-F08).
+type AdapterFactory func(ctx context.Context, name string, cfg AdapterConfig) (AgentAdapter, error)
 
 // Registry is a thread-safe registry of adapter factories keyed by string
 // name. It is deliberately name-agnostic: the first-generation agent names are
@@ -57,9 +61,17 @@ func (r *Registry) List() []string {
 	return names
 }
 
-// Resolve creates an adapter for the requested name. Unknown names return an
-// error that lists the available adapters so callers can self-correct.
+// Resolve creates an adapter for the requested name using a zero adapter
+// config (discovery/Describe use). Unknown names return an error that lists
+// the available adapters so callers can self-correct.
 func (r *Registry) Resolve(ctx context.Context, name string) (AgentAdapter, error) {
+	return r.ResolveConfigured(ctx, name, AdapterConfig{})
+}
+
+// ResolveConfigured creates an adapter for the requested name with the typed
+// per-agent execution config. The gateway worker uses this so deployment
+// config flows directly into the adapter factory (O-F08).
+func (r *Registry) ResolveConfigured(ctx context.Context, name string, cfg AdapterConfig) (AgentAdapter, error) {
 	r.mu.RLock()
 	factory, ok := r.factories[name]
 	r.mu.RUnlock()
@@ -70,7 +82,7 @@ func (r *Registry) Resolve(ctx context.Context, name string) (AgentAdapter, erro
 		}
 		return nil, fmt.Errorf("runtime: adapter %q: unknown (available: %s)", name, strings.Join(available, ", "))
 	}
-	return factory(ctx, name)
+	return factory(ctx, name, cfg)
 }
 
 // defaultRegistry is the process-wide registry that adapter packages populate

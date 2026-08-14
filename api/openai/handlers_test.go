@@ -252,7 +252,7 @@ func newTestHandler(t *testing.T, opts *Options) (*Handler, *fakeBackend) {
 
 func mustRegister(t *testing.T, reg *runtime.Registry, name string, desc runtime.Descriptor, descErr error) {
 	t.Helper()
-	reg.Register(name, func(ctx context.Context, n string) (runtime.AgentAdapter, error) {
+	reg.Register(name, func(ctx context.Context, n string, cfg runtime.AdapterConfig) (runtime.AgentAdapter, error) {
 		return &fakeAdapter{desc: desc, descErr: descErr}, nil
 	})
 }

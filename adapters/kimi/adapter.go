@@ -3,8 +3,7 @@ package kimi
 
 import (
 	"context"
-	"os"
-	"strconv"
+	"sort"
 	"strings"
 	"time"
 
@@ -44,27 +43,26 @@ type Adapter struct {
 	start starter
 }
 
-// New constructs the registered adapter from worker-owned environment.
-func New(ctx context.Context, _ string) (runtime.AgentAdapter, error) {
-	opts := Options{
-		Command:            envOrDefault("CC_GATEWAY_KIMI_COMMAND", "kimi"),
-		WorkDir:            envOrDefault("GW_WORKSPACE_DIR", "/workspace"),
-		Model:              envOrDefault("CC_GATEWAY_KIMI_MODEL", ""),
-		Mode:               envOrDefault("CC_GATEWAY_KIMI_MODE", "default"),
-		Permission:         envOrDefault("CC_GATEWAY_KIMI_PERMISSION", "auto"),
-		InjectSystemPrompt: envBool("CC_GATEWAY_KIMI_INJECT_SYSTEM_PROMPT"),
+// New constructs the registered adapter from the typed deployment config
+// handed down by the worker boundary (O-F08: no environment-variable
+// roundtrip).
+func New(_ context.Context, _ string, cfg runtime.AdapterConfig) (runtime.AgentAdapter, error) {
+	return NewAdapter(optionsFromConfig(cfg))
+}
+
+// optionsFromConfig maps the typed worker boundary config onto adapter
+// options. Deployment values win; unset fields keep adapter defaults.
+func optionsFromConfig(cfg runtime.AdapterConfig) Options {
+	return Options{
+		Command:            cfg.Execution.Command,
+		Env:                envSlice(cfg.Execution.Env),
+		WorkDir:            cfg.WorkspaceDir,
+		Model:              cfg.Execution.DefaultModel,
+		Mode:               "default",
+		Timeout:            cfg.Execution.TurnTimeout,
+		Permission:         cfg.Execution.Permission,
+		InjectSystemPrompt: cfg.Execution.InjectSystemPrompt,
 	}
-	if raw := envOrDefault("CC_GATEWAY_KIMI_ENV", ""); raw != "" {
-		opts.Env = splitEnv(raw)
-	}
-	if raw := envOrDefault("CC_GATEWAY_KIMI_TIMEOUT_SECS", ""); raw != "" {
-		if duration, err := time.ParseDuration(raw); err == nil {
-			opts.Timeout = duration
-		} else if seconds, err := strconv.Atoi(raw); err == nil {
-			opts.Timeout = time.Duration(seconds) * time.Second
-		}
-	}
-	return newAdapter(opts, startNative), nil
 }
 
 // NewAdapter constructs an adapter from explicit trusted options.
@@ -79,6 +77,12 @@ func startNative(ctx context.Context, options native.Options) (nativeSession, er
 func newAdapter(opts Options, start starter) *Adapter {
 	if strings.TrimSpace(opts.Command) == "" {
 		opts.Command = "kimi"
+	}
+	if strings.TrimSpace(opts.WorkDir) == "" {
+		opts.WorkDir = "/workspace"
+	}
+	if strings.TrimSpace(opts.Permission) == "" {
+		opts.Permission = "auto"
 	}
 	return &Adapter{opts: opts, start: start}
 }
@@ -127,30 +131,20 @@ func splitCommand(command string) []string {
 	return parts
 }
 
-func envOrDefault(key, fallback string) string {
-	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
-		return value
+// envSlice renders a config env map as the K=V slice the native process spec
+// consumes. Keys are sorted so the rendered environment is deterministic.
+func envSlice(env map[string]string) []string {
+	if len(env) == 0 {
+		return nil
 	}
-	return fallback
-}
-
-func envBool(key string) bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
 	}
-}
-
-func splitEnv(raw string) []string {
-	var result []string
-	for _, value := range strings.FieldsFunc(raw, func(r rune) bool {
-		return r == ',' || r == ' ' || r == '\n'
-	}) {
-		if value = strings.TrimSpace(value); strings.Contains(value, "=") {
-			result = append(result, value)
-		}
+	sort.Strings(keys)
+	out := make([]string, 0, len(env))
+	for _, key := range keys {
+		out = append(out, key+"="+env[key])
 	}
-	return result
+	return out
 }

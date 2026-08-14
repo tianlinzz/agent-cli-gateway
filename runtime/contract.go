@@ -27,6 +27,22 @@ type AgentExecutionConfig struct {
 	InjectSystemPrompt bool
 }
 
+// AdapterConfig is the typed configuration handed to an adapter factory: the
+// deployment-owned execution config plus the worker-process placement
+// directories resolved by the supervisor. Factories consume this struct
+// directly — there is deliberately no typed-config → environment-variable →
+// re-parse roundtrip between the worker boundary and the adapters (O-F08).
+type AdapterConfig struct {
+	// Execution is the trusted per-agent deployment configuration.
+	Execution AgentExecutionConfig
+	// WorkspaceDir is the directory the agent CLI runs in (the sandbox
+	// workspace mount). Empty means the adapter default.
+	WorkspaceDir string
+	// AgentHome is the per-session writable agent home inside the sandbox
+	// (e.g. CODEX_HOME). Empty in non-isolated test mode.
+	AgentHome string
+}
+
 // Descriptor is the static description of an adapter as seen by the model
 // registry and the public /v1/models discovery endpoint.
 type Descriptor struct {

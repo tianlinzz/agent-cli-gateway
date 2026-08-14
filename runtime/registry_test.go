@@ -28,7 +28,7 @@ func (f fakeAdapter) Start(ctx context.Context, req runtime.StartRequest) (runti
 }
 
 func fakeFactory(name string) runtime.AdapterFactory {
-	return func(ctx context.Context, registeredAs string) (runtime.AgentAdapter, error) {
+	return func(ctx context.Context, registeredAs string, cfg runtime.AdapterConfig) (runtime.AgentAdapter, error) {
 		return fakeAdapter{name: registeredAs}, nil
 	}
 }

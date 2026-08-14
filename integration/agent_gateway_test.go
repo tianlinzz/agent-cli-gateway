@@ -108,7 +108,7 @@ func (a *fakeAdapter) Start(context.Context, runtime.StartRequest) (runtime.Sess
 
 func registerFake(t *testing.T, reg *runtime.Registry, name, display string) {
 	t.Helper()
-	if err := reg.Register(name, func(ctx context.Context, n string) (runtime.AgentAdapter, error) {
+	if err := reg.Register(name, func(ctx context.Context, n string, cfg runtime.AdapterConfig) (runtime.AgentAdapter, error) {
 		return &fakeAdapter{desc: runtime.Descriptor{
 			ModelID:       name,
 			DisplayName:   display,

@@ -4,7 +4,7 @@ package claudecode
 
 import (
 	"context"
-	"os"
+	"sort"
 	"strings"
 
 	native "github.com/tianlinzz/agent-cli-gateway/agent/claudecode"
@@ -50,23 +50,25 @@ type Adapter struct {
 	start starter
 }
 
-// New constructs the registered adapter from worker-owned environment.
-func New(_ context.Context, _ string) (runtime.AgentAdapter, error) {
-	opts := Options{
-		Command:            envOrDefault("CC_GATEWAY_CLAUDE_COMMAND", "claude"),
-		WorkDir:            envOrDefault("GW_WORKSPACE_DIR", "/workspace"),
-		Model:              envOrDefault("CC_GATEWAY_CLAUDE_MODEL", ""),
-		ReasoningEffort:    envOrDefault("CC_GATEWAY_CLAUDE_EFFORT", ""),
-		Mode:               envOrDefault("CC_GATEWAY_CLAUDE_MODE", "default"),
-		Permission:         envOrDefault("CC_GATEWAY_CLAUDE_PERMISSION", "auto"),
-		SystemPrompt:       envOrDefault("CC_GATEWAY_CLAUDE_SYSTEM_PROMPT", ""),
-		AppendSystemPrompt: envOrDefault("CC_GATEWAY_CLAUDE_APPEND_PROMPT", ""),
-		InjectSystemPrompt: envBool("CC_GATEWAY_CLAUDE_INJECT_SYSTEM_PROMPT"),
+// New constructs the registered adapter from the typed deployment config
+// handed down by the worker boundary (O-F08: no environment-variable
+// roundtrip).
+func New(_ context.Context, _ string, cfg runtime.AdapterConfig) (runtime.AgentAdapter, error) {
+	return NewAdapter(optionsFromConfig(cfg))
+}
+
+// optionsFromConfig maps the typed worker boundary config onto adapter
+// options. Deployment values win; unset fields keep adapter defaults.
+func optionsFromConfig(cfg runtime.AdapterConfig) Options {
+	return Options{
+		Command:            cfg.Execution.Command,
+		Env:                envSlice(cfg.Execution.Env),
+		WorkDir:            cfg.WorkspaceDir,
+		Model:              cfg.Execution.DefaultModel,
+		Mode:               "default",
+		Permission:         cfg.Execution.Permission,
+		InjectSystemPrompt: cfg.Execution.InjectSystemPrompt,
 	}
-	if raw := envOrDefault("CC_GATEWAY_CLAUDE_ENV", ""); raw != "" {
-		opts.Env = splitEnv(raw)
-	}
-	return NewAdapter(opts)
 }
 
 // NewAdapter constructs an adapter from explicit trusted options.
@@ -79,6 +81,12 @@ func NewAdapter(opts Options) (*Adapter, error) {
 func newAdapter(opts Options, start starter) *Adapter {
 	if strings.TrimSpace(opts.Command) == "" {
 		opts.Command = "claude"
+	}
+	if strings.TrimSpace(opts.WorkDir) == "" {
+		opts.WorkDir = "/workspace"
+	}
+	if strings.TrimSpace(opts.Permission) == "" {
+		opts.Permission = "auto"
 	}
 	return &Adapter{opts: opts, start: start}
 }
@@ -138,31 +146,20 @@ func splitCommand(command string) []string {
 	return parts
 }
 
-func envOrDefault(key, fallback string) string {
-	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
-		return value
+// envSlice renders a config env map as the K=V slice the native process spec
+// consumes. Keys are sorted so the rendered environment is deterministic.
+func envSlice(env map[string]string) []string {
+	if len(env) == 0 {
+		return nil
 	}
-	return fallback
-}
-
-func envBool(key string) bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
 	}
-}
-
-func splitEnv(raw string) []string {
-	var values []string
-	for _, value := range strings.FieldsFunc(raw, func(r rune) bool {
-		return r == ',' || r == ' ' || r == '\n'
-	}) {
-		value = strings.TrimSpace(value)
-		if strings.Contains(value, "=") {
-			values = append(values, value)
-		}
+	sort.Strings(keys)
+	out := make([]string, 0, len(env))
+	for _, key := range keys {
+		out = append(out, key+"="+env[key])
 	}
-	return values
+	return out
 }

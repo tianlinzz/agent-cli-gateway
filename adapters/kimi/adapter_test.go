@@ -23,6 +23,33 @@ func TestDescribeDeclaresPersistentProcess(t *testing.T) {
 	}
 }
 
+// TestNewConsumesTypedConfigDirectly_OF08 guards the typed-config contract:
+// the worker hands runtime.AdapterConfig straight to the factory — no
+// environment-variable roundtrip. This test fails if optionsFromConfig goes
+// back to reading env-var roundtrip variables.
+func TestNewConsumesTypedConfigDirectly_OF08(t *testing.T) {
+	opts := optionsFromConfig(runtime.AdapterConfig{
+		Execution: runtime.AgentExecutionConfig{
+			Command:            "/opt/tools/kimi",
+			DefaultModel:       "kimi-k3",
+			Permission:         "deny",
+			TurnTimeout:        90 * time.Second,
+			Env:                map[string]string{"B": "2", "A": "1"},
+			InjectSystemPrompt: true,
+		},
+		WorkspaceDir: "/ws",
+	})
+	if opts.Command != "/opt/tools/kimi" || opts.Model != "kimi-k3" || opts.Permission != "deny" || opts.Timeout != 90*time.Second || !opts.InjectSystemPrompt {
+		t.Fatalf("options = %#v", opts)
+	}
+	if opts.WorkDir != "/ws" {
+		t.Fatalf("placement not mapped: %#v", opts)
+	}
+	if len(opts.Env) != 2 || opts.Env[0] != "A=1" || opts.Env[1] != "B=2" {
+		t.Fatalf("env = %#v, want sorted [A=1 B=2]", opts.Env)
+	}
+}
+
 func TestAdapterMapsTrustedOptions(t *testing.T) {
 	capture := &captureStarter{session: newFakeSession("native-1")}
 	adapter := newAdapter(Options{

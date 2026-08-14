@@ -15,11 +15,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
 	"github.com/tianlinzz/agent-cli-gateway/worker"
@@ -70,8 +67,15 @@ func (h *adapterHandler) StartSession(ctx context.Context, req worker.StartSessi
 	if req.ProviderModel != "" {
 		agentConfig.DefaultModel = req.ProviderModel
 	}
-	applyAgentConfig(req.ModelID, agentConfig)
-	adapter, err := h.reg.Resolve(ctx, req.ModelID)
+	// The typed deployment config reaches the adapter factory directly — no
+	// environment-variable roundtrip (O-F08). Only the worker-process
+	// placement (workspace/agent-home mounts, set by the supervisor) is read
+	// from the environment; it is process placement, not agent configuration.
+	adapter, err := h.reg.ResolveConfigured(ctx, req.ModelID, runtime.AdapterConfig{
+		Execution:    agentConfig,
+		WorkspaceDir: os.Getenv("GW_WORKSPACE_DIR"),
+		AgentHome:    os.Getenv("GW_AGENT_HOME"),
+	})
 	if err != nil {
 		return "", fmt.Errorf("gateway-worker: resolve %q: %w", req.ModelID, err)
 	}
@@ -99,33 +103,6 @@ func (h *adapterHandler) StartSession(ctx context.Context, req worker.StartSessi
 	h.sessionCancel = sessionCancel
 	h.mu.Unlock()
 	return desc.LifecycleMode, nil
-}
-
-// applyAgentConfig bridges the transport-neutral deployment config to the
-// adapter factories. A worker is single-session, so setting these variables
-// here is isolated to this worker process and cannot leak across sessions.
-func applyAgentConfig(model string, c runtime.AgentExecutionConfig) {
-	key := strings.ToLower(model)
-	if key == "claude-code" {
-		key = "claude"
-	}
-	prefix := "CC_GATEWAY_" + strings.ToUpper(strings.ReplaceAll(key, "-", "_"))
-	if c.Command != "" {
-		_ = os.Setenv(prefix+"_COMMAND", c.Command)
-	}
-	if c.DefaultModel != "" {
-		_ = os.Setenv(prefix+"_MODEL", c.DefaultModel)
-	}
-	if c.Permission != "" {
-		_ = os.Setenv(prefix+"_PERMISSION", c.Permission)
-	}
-	if c.TurnTimeout > 0 && model == "kimi" {
-		_ = os.Setenv(prefix+"_TIMEOUT_SECS", strconv.FormatInt(int64(c.TurnTimeout/time.Second), 10))
-	}
-	_ = os.Setenv(prefix+"_INJECT_SYSTEM_PROMPT", strconv.FormatBool(c.InjectSystemPrompt))
-	for k, v := range c.Env {
-		_ = os.Setenv(k, v)
-	}
 }
 
 func (h *adapterHandler) SendInput(ctx context.Context, input runtime.Input) error {

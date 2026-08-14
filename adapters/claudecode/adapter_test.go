@@ -22,6 +22,32 @@ func TestDescribeDeclaresClaudeCapabilities(t *testing.T) {
 	}
 }
 
+// TestNewConsumesTypedConfigDirectly_OF08 guards the typed-config contract:
+// the worker hands runtime.AdapterConfig straight to the factory — no
+// environment-variable roundtrip. This test fails if optionsFromConfig goes
+// back to reading env-var roundtrip variables.
+func TestNewConsumesTypedConfigDirectly_OF08(t *testing.T) {
+	opts := optionsFromConfig(runtime.AdapterConfig{
+		Execution: runtime.AgentExecutionConfig{
+			Command:            "/opt/tools/claude",
+			DefaultModel:       "sonnet",
+			Permission:         "deny",
+			Env:                map[string]string{"B": "2", "A": "1"},
+			InjectSystemPrompt: true,
+		},
+		WorkspaceDir: "/ws",
+	})
+	if opts.Command != "/opt/tools/claude" || opts.Model != "sonnet" || opts.Permission != "deny" || !opts.InjectSystemPrompt {
+		t.Fatalf("options = %#v", opts)
+	}
+	if opts.WorkDir != "/ws" {
+		t.Fatalf("placement not mapped: %#v", opts)
+	}
+	if len(opts.Env) != 2 || opts.Env[0] != "A=1" || opts.Env[1] != "B=2" {
+		t.Fatalf("env = %#v, want sorted [A=1 B=2]", opts.Env)
+	}
+}
+
 func TestStartMapsTrustedOptionsAndNativeResumeID(t *testing.T) {
 	capture := &captureStarter{session: newFakeNativeSession()}
 	adapter := newAdapter(Options{
