@@ -2,9 +2,13 @@ package openai
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
+	"os/exec"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
 )
@@ -27,10 +31,33 @@ type modelList struct {
 // deliberately name-agnostic: every registered adapter that is both enabled by
 // configuration and discoverable (Describe succeeds) is exposed as a model,
 // sorted by model id for a stable response.
+// modelCacheTTL is how long the derived catalog (availability probes + static
+// descriptors) is reused before it is recomputed. Probing on every chat
+// request would call Describe/LookPath per request (the U3 finding); a short
+// TTL keeps discovery cheap while still reacting to a CLI being installed or
+// removed within seconds.
+const modelCacheTTL = 30 * time.Second
+
+// catalogSnapshot is one computed view of the public catalog: the descriptors
+// advertised on /v1/models plus the set of adapter names considered available.
+type catalogSnapshot struct {
+	descs    []runtime.Descriptor
+	adapters map[string]bool // adapter id -> available (enabled + probe + describable)
+}
+
 type modelCatalog struct {
 	reg     *runtime.Registry
 	enabled func(name string) bool
 	models  map[string][]string
+	// commands maps adapter id -> configured CLI command. A nil map disables
+	// availability probing (tests and defaults advertise on Describe success
+	// alone); a non-nil map probes each enabled adapter via exec.LookPath so
+	// /v1/models never advertises a CLI that is not installed.
+	commands map[string]string
+
+	mu     sync.Mutex
+	snap   catalogSnapshot
+	snapAt time.Time
 }
 
 type modelRoute struct{ PublicID, AdapterID, ProviderModel string }
@@ -59,9 +86,9 @@ func (c *modelCatalog) route(id string) (modelRoute, bool) {
 	return r, true
 }
 
-// has reports whether name is a known and enabled model. This is the cheap
-// chat-request validation; discovery (Describe) is the heavier /v1/models
-// path.
+// has reports whether name is a known, enabled, and available model. It uses
+// the cached catalog snapshot so the chat-request validation path does not
+// resolve/describe/probe an adapter on every request.
 func (c *modelCatalog) has(name string) bool {
 	if c == nil || c.reg == nil {
 		return false
@@ -70,60 +97,100 @@ func (c *modelCatalog) has(name string) bool {
 	if !ok {
 		return false
 	}
-	found := false
-	for _, n := range c.reg.List() {
-		if n == route.AdapterID {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return false
-	}
-	if c.enabled != nil && !c.enabled(route.AdapterID) {
-		return false
-	}
-	adapter, err := c.reg.Resolve(context.Background(), route.AdapterID)
-	if err != nil {
-		return false
-	}
-	_, err = adapter.Describe(context.Background())
-	return err == nil
+	return c.snapshot().adapters[route.AdapterID]
 }
 
-// discover resolves every enabled adapter and returns the descriptors whose
-// discovery succeeded, sorted by ModelID. Adapters that fail to resolve or
-// describe (e.g. a CLI binary not installed) are skipped: the public catalog
-// only advertises models that actually work.
+// discover returns every available adapter's public descriptors, sorted by
+// model id, backing GET /v1/models.
 func (c *modelCatalog) discover(ctx context.Context) []runtime.Descriptor {
-	var out []runtime.Descriptor
 	if c == nil || c.reg == nil {
-		return out
+		return nil
 	}
-	for _, name := range c.reg.List() {
+	return c.snapshot().descs
+}
+
+// snapshot returns the cached catalog, recomputing it once per modelCacheTTL.
+// Concurrent callers may compute the same snapshot redundantly; that is
+// idempotent (last writer wins) and bounded by the TTL.
+func (c *modelCatalog) snapshot() catalogSnapshot {
+	c.mu.Lock()
+	if c.snap.adapters != nil && time.Since(c.snapAt) < modelCacheTTL {
+		s := c.snap
+		c.mu.Unlock()
+		return s
+	}
+	c.mu.Unlock()
+
+	s := c.compute()
+
+	c.mu.Lock()
+	c.snap = s
+	c.snapAt = time.Now()
+	c.mu.Unlock()
+	return s
+}
+
+// compute derives the fresh catalog: every enabled adapter that is available
+// (command probe passes when wired, Describe succeeds) is advertised, sorted by
+// public model id.
+func (c *modelCatalog) compute() catalogSnapshot {
+	snap := catalogSnapshot{adapters: make(map[string]bool)}
+	names := c.reg.List()
+	sort.Strings(names)
+	for _, name := range names {
 		if c.enabled != nil && !c.enabled(name) {
 			continue
 		}
-		adapter, err := c.reg.Resolve(ctx, name)
+		if !c.commandAvailable(name) {
+			continue
+		}
+		adapter, err := c.reg.Resolve(context.Background(), name)
 		if err != nil {
 			continue
 		}
-		desc, err := adapter.Describe(ctx)
+		desc, err := adapter.Describe(context.Background())
 		if err != nil {
 			continue
 		}
-		if configured := c.models[name]; len(configured) > 0 {
-			for _, model := range configured {
+		snap.adapters[name] = true
+		if models := c.models[name]; len(models) > 0 {
+			for _, model := range models {
 				d := desc
 				d.ModelID = name + "/" + model
-				out = append(out, d)
+				snap.descs = append(snap.descs, d)
 			}
 		} else {
-			out = append(out, desc)
+			snap.descs = append(snap.descs, desc)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ModelID < out[j].ModelID })
-	return out
+	sort.Slice(snap.descs, func(i, j int) bool { return snap.descs[i].ModelID < snap.descs[j].ModelID })
+	return snap
+}
+
+// commandAvailable reports whether an enabled adapter may be advertised.
+// Probing only happens when the catalog was wired with command knowledge
+// (commands != nil — the production gateway always wires it); without it
+// (tests, un-wired defaults) an adapter is available on Describe success alone.
+// When wired, an enabled adapter whose command is empty or does not resolve on
+// PATH is hidden so /v1/models never advertises a CLI that is not installed.
+func (c *modelCatalog) commandAvailable(name string) bool {
+	if c.commands == nil {
+		return true
+	}
+	cmd := strings.TrimSpace(c.commands[name])
+	if cmd == "" {
+		slog.Warn("openai: hiding enabled agent without a configured command", "adapter", name)
+		return false
+	}
+	// The configured command may carry argv (see the splitCommand adapters);
+	// probe only the executable's first token. Absolute paths and bare names
+	// are both handled by LookPath.
+	exe := strings.Fields(cmd)[0]
+	if _, err := exec.LookPath(exe); err != nil {
+		slog.Warn("openai: hiding agent whose CLI is not installed", "adapter", name, "command", exe, "error", err)
+		return false
+	}
+	return true
 }
 
 // handleModels serves GET /v1/models with the stable, sorted, dynamic catalog.

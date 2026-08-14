@@ -1,8 +1,10 @@
 package nsjail
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -44,17 +46,17 @@ func TestBuildProfile_KafelDefaults(t *testing.T) {
 		"time_limit: 0;",
 		"clone_newns: true;",
 		"clone_newroot: true;",
-		"clone_newpid: false;",
+		"clone_newpid: true;",
 		"clone_newnet: false;",
-		`uidmap: { inside_id: "1000"; outside_id: "1000"; count: 1; };`,
-		`gidmap: { inside_id: "1000"; outside_id: "1000"; count: 1; };`,
+		`uidmap: { inside_id: "65532"; outside_id: "65532"; count: 1; };`,
+		`gidmap: { inside_id: "65532"; outside_id: "65532"; count: 1; };`,
 		"rlimit_nofile: 1024;",
 		"rlimit_nproc: 256;",
 		`mount: { src: "` + layout.WorkspaceDir + `"; dst: "/workspace"; is_bind: true; rw: true; mandatory: true; };`,
 		`mount: { src: "` + layout.AgentHomeDir + `"; dst: "/agent-home"; is_bind: true; rw: true; mandatory: true; };`,
 		`mount: { src: "` + layout.SocketDir + `"; dst: "` + layout.SocketDir + `"; is_bind: true; rw: true; mandatory: true; };`,
 		`mount: { dst: "/tmp"; fstype: "tmpfs"; options: "size=256m"; rw: true; mandatory: true; };`,
-		"seccomp_string: \"POLICY x86_64 {",
+		`mount: { dst: "/proc"; fstype: "proc"; rw: false; mandatory: true; } ;`,
 		`keep_env: "GW_WORKER_SOCKET";`,
 		`env: { key: "HOME"; value: "/agent-home"; };`,
 		`cwd: "/workspace";`,
@@ -62,6 +64,15 @@ func TestBuildProfile_KafelDefaults(t *testing.T) {
 		if !strings.Contains(c, want) {
 			t.Errorf("profile missing %q", want)
 		}
+	}
+
+	// The seccomp policy must match the compiled binary's architecture (O-F06).
+	seccompArch := "x86_64"
+	if runtime.GOARCH == "arm64" {
+		seccompArch = "aarch64"
+	}
+	if !strings.Contains(c, "seccomp_string: \"POLICY "+seccompArch+" {") {
+		t.Errorf("profile seccomp policy must match host arch %s:\n%s", seccompArch, c)
 	}
 
 	if !strings.Contains(c, "execve") || !strings.Contains(c, "socket") || !strings.Contains(c, "connect") {
@@ -174,6 +185,53 @@ func TestBuildProfile_NetworkNamespaceOptIn(t *testing.T) {
 	}
 }
 
+// TestBuildProfile_CloneNewPIDOptOut verifies the fallback switch: with
+// CloneNewPID=false the PID namespace stays shared and no /proc pseudo-fs is
+// mounted.
+func TestBuildProfile_CloneNewPIDOptOut(t *testing.T) {
+	iso := config.DefaultGatewayConfig().Isolation
+	iso.CloneNewPID = false
+	layout := testLayout(t)
+	p, err := Build(iso, layout, "sess-nopid")
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(p.Config, "clone_newpid: false;") {
+		t.Errorf("CloneNewPID=false must emit clone_newpid: false:\n%s", p.Config)
+	}
+	if strings.Contains(p.Config, `dst: "/proc"; fstype: "proc"`) {
+		t.Errorf("no /proc proc mount should be emitted when the PID namespace is shared:\n%s", p.Config)
+	}
+}
+
+// TestBuildProfile_EtcMountNarrowed is a regression test for the /etc
+// exposure-surface finding (O-C4): the profile used to bind-mount the whole
+// /etc directory, exposing host world-readable files. It must now mount only
+// the minimal per-file read-only set the CLIs need.
+func TestBuildProfile_EtcMountNarrowed(t *testing.T) {
+	iso := config.DefaultGatewayConfig().Isolation
+	layout := testLayout(t)
+	p, err := Build(iso, layout, "sess-etc")
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	c := p.Config
+	if strings.Contains(c, `src: "/etc";`) {
+		t.Errorf("profile must not bind-mount the whole /etc directory:\n%s", c)
+	}
+	// Each surviving minimal file must be mounted individually, mirroring the
+	// Build os.Stat guard (a file absent on this host is skipped).
+	for _, f := range []string{"/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/etc/passwd", "/etc/group", "/etc/ssl/certs"} {
+		if _, err := os.Stat(f); err != nil {
+			continue
+		}
+		want := fmt.Sprintf(`src: %q; dst: %q;`, f, f)
+		if !strings.Contains(c, want) {
+			t.Errorf("profile must bind-mount existing narrow file %q", f)
+		}
+	}
+}
+
 func TestBuildProfile_SeccompOffOmitted(t *testing.T) {
 	iso := config.DefaultGatewayConfig().Isolation
 	iso.Seccomp.Policy = config.SeccompOff
@@ -193,6 +251,44 @@ func TestBuildProfile_InvalidSeccompPolicyFailsClosed(t *testing.T) {
 	layout := testLayout(t)
 	if _, err := Build(iso, layout, "sess-5"); err == nil {
 		t.Fatal("Build must reject an unknown seccomp policy")
+	}
+}
+
+// TestKafelPolicyForArch verifies the arch-aware seccomp policy (O-F06):
+// amd64 -> x86_64, arm64 -> aarch64 (x86-only syscalls dropped), and any other
+// architecture fails closed.
+func TestKafelPolicyForArch(t *testing.T) {
+	x86, err := kafelPolicyForArch("amd64")
+	if err != nil {
+		t.Fatalf("amd64 policy: %v", err)
+	}
+	if !strings.Contains(x86, "POLICY x86_64 {") {
+		t.Errorf("amd64 policy must declare x86_64")
+	}
+	if !strings.Contains(x86, "arch_prctl") || !strings.Contains(x86, "mmap2") {
+		t.Error("x86_64 policy must keep x86-only syscalls")
+	}
+
+	arm, err := kafelPolicyForArch("arm64")
+	if err != nil {
+		t.Fatalf("arm64 policy: %v", err)
+	}
+	if !strings.Contains(arm, "POLICY aarch64 {") {
+		t.Errorf("arm64 policy must declare aarch64")
+	}
+	for _, dropped := range []string{"arch_prctl", "mmap2", "stat64", "ugetrlimit", "getuid32"} {
+		if strings.Contains(arm, dropped) {
+			t.Errorf("aarch64 policy must not allow x86-only syscall %q", dropped)
+		}
+	}
+	for _, kept := range []string{"openat", "execve", "clone3", "socket", "connect"} {
+		if !strings.Contains(arm, kept) {
+			t.Errorf("aarch64 policy must keep common syscall %q", kept)
+		}
+	}
+
+	if _, err := kafelPolicyForArch("riscv64"); err == nil {
+		t.Fatal("unsupported architecture must fail closed")
 	}
 }
 

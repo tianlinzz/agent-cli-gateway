@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -657,6 +658,59 @@ func TestModels_DisabledExcluded(t *testing.T) {
 	}
 }
 
+// TestModels_CommandProbeHidesUnavailable is a regression test for the
+// model-discovery/availability mismatch (O-F04): with command knowledge wired,
+// /v1/models must advertise only enabled adapters whose CLI command resolves on
+// PATH. A missing command, an empty command, and an adapter whose Describe
+// fails are all hidden.
+func TestModels_CommandProbeHidesUnavailable(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, _, _ := newTestServer(t, func(o *Options) {
+		o.Commands = map[string]string{
+			"codex":  exe,                         // resolves -> advertised
+			"zeta":   "/definitely/not/installed", // missing -> hidden
+			"broken": exe,                         // resolves but Describe fails -> hidden
+		}
+	})
+	resp := doAuthJSON(t, "GET", ts.URL+"/v1/models", testToken, testOwner, nil)
+	var ml struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(readBody(t, resp), &ml); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	if len(ml.Data) != 1 || ml.Data[0].ID != "codex" {
+		t.Fatalf("data = %+v, want only codex (missing/undescribable CLIs hidden)", ml.Data)
+	}
+}
+
+// TestModels_EnabledWithoutCommandHidden verifies the probe-mode fail-safe:
+// when command knowledge is wired (production), an enabled adapter with no
+// command is ambiguous (the gateway cannot verify a CLI) and must be hidden
+// rather than advertised as usable.
+func TestModels_EnabledWithoutCommandHidden(t *testing.T) {
+	ts, _, _ := newTestServer(t, func(o *Options) {
+		o.Commands = map[string]string{"codex": ""}
+	})
+	resp := doAuthJSON(t, "GET", ts.URL+"/v1/models", testToken, testOwner, nil)
+	var ml struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(readBody(t, resp), &ml); err != nil {
+		t.Fatalf("decode models: %v", err)
+	}
+	if len(ml.Data) != 0 {
+		t.Fatalf("data = %+v, want empty catalog (no command resolves)", ml.Data)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Chat completions (non-stream)
 // ---------------------------------------------------------------------------
@@ -741,6 +795,64 @@ func TestChatCompletions_AgentError(t *testing.T) {
 	}
 	if !strings.Contains(ae.Message, "boom") {
 		t.Errorf("error message = %q, want to mention agent error", ae.Message)
+	}
+}
+
+// TestChatCompletions_BodyTooLargeRejected is a regression test for HTTP input
+// hardening (O-F07): a body over the limit must yield an explicit 413 via
+// http.MaxBytesReader, not a 400 or a silently truncated read.
+func TestChatCompletions_BodyTooLargeRejected(t *testing.T) {
+	ts, _, _ := newTestServer(t)
+	body := map[string]any{
+		"model":    "codex",
+		"messages": []map[string]any{{"role": "user", "content": strings.Repeat("x", 2*1024*1024)}},
+		"metadata": map[string]any{"workspace_id": testWorkspace},
+	}
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413 (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+}
+
+// TestChatCompletions_TrailingJSONRejected is a regression test for O-F07: a
+// valid object followed by a second top-level JSON value must be rejected, not
+// silently accepted on the first value's prefix.
+func TestChatCompletions_TrailingJSONRejected(t *testing.T) {
+	ts, _, _ := newTestServer(t)
+	payload := `{"model":"codex","messages":[{"role":"user","content":"hi"}],"metadata":{"workspace_id":"` + testWorkspace + `"}} {"ignored":true}`
+	req, err := http.NewRequest("POST", ts.URL+"/v1/chat/completions", strings.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+}
+
+// TestChatCompletions_MetadataTooManyKeysRejected is a regression test for the
+// metadata bound (O-F07): an oversized metadata map must be rejected before it
+// reaches the native prompt.
+func TestChatCompletions_MetadataTooManyKeysRejected(t *testing.T) {
+	ts, _, _ := newTestServer(t)
+	meta := map[string]any{"workspace_id": testWorkspace}
+	for i := 0; i < maxMetadataKeys; i++ {
+		meta[fmt.Sprintf("k%d", i)] = "v"
+	}
+	body := map[string]any{
+		"model":    "codex",
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		"metadata": meta,
+	}
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body %s)", resp.StatusCode, readBody(t, resp))
 	}
 }
 

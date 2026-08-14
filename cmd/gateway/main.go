@@ -55,6 +55,18 @@ func agentModels(in map[string]config.AgentConfig) map[string][]string {
 	return out
 }
 
+// agentCommands extracts each agent's configured CLI command so model
+// discovery can probe availability (exec.LookPath) before advertising it.
+// A non-nil map puts the catalog in probe mode: enabled agents with an empty
+// or unresolvable command are hidden from /v1/models.
+func agentCommands(in map[string]config.AgentConfig) map[string]string {
+	out := make(map[string]string, len(in))
+	for name, c := range in {
+		out[name] = c.Command
+	}
+	return out
+}
+
 func main() {
 	// -config defaults to $GATEWAY_CONFIG (set by the container entrypoint to
 	// the runtime config path) so a mounted/entrypoint-written config is loaded
@@ -147,12 +159,20 @@ func main() {
 			agent, ok := cfg.Agents[name]
 			return !ok || agent.Enabled
 		},
-		Models: agentModels(cfg.Agents),
+		Models:   agentModels(cfg.Agents),
+		Commands: agentCommands(cfg.Agents),
 	})
 
+	// Harden the listener without breaking long-lived SSE turns: set header and
+	// idle bounds but deliberately NOT WriteTimeout/ReadTimeout, which would cut
+	// off a streaming completion. Turn duration remains governed by the run
+	// deadline and client cancellation.
 	srv := &http.Server{
-		Addr:    cfg.Server.ListenAddr,
-		Handler: handler.Routes(),
+		Addr:              cfg.Server.ListenAddr,
+		Handler:           handler.Routes(),
+		ReadHeaderTimeout: cfg.Server.ReadHeaderTimeout,
+		IdleTimeout:       cfg.Server.IdleTimeout,
+		MaxHeaderBytes:    cfg.Server.MaxHeaderBytes,
 	}
 
 	slog.Info("gateway starting",

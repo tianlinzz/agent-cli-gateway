@@ -120,6 +120,20 @@ func (c Config) validate() error {
 	if c.Isolation.Required && strings.TrimSpace(c.Isolation.BinaryPath) == "" {
 		return fmt.Errorf("worker: config: isolation.binary_path must not be empty while isolation is required")
 	}
+	// Layered fail-closed for seccomp (O-C2): the config layer already rejects
+	// seccomp off outside the test profile, but a directly-constructed
+	// Supervisor must enforce the same constraint so prod/dev can never silently
+	// run without a seccomp filter. Unset policy is treated as kafel (Build
+	// emits the whitelist for an empty policy).
+	switch c.Isolation.Seccomp.Policy {
+	case config.SeccompKafel, "":
+	case config.SeccompOff:
+		if c.Mode != config.ModeTest {
+			return fmt.Errorf("worker: config: isolation.seccomp.policy %q is only allowed in mode %q", config.SeccompOff, config.ModeTest)
+		}
+	default:
+		return fmt.Errorf("worker: config: isolation.seccomp.policy %q invalid (want %q or %q)", c.Isolation.Seccomp.Policy, config.SeccompKafel, config.SeccompOff)
+	}
 	return nil
 }
 
@@ -952,6 +966,13 @@ func (ws *workerSession) terminate(err error) {
 //     agent CLI) via syscall.Kill.
 //   - spawn_windows.go (windows): taskkill /T /F process-tree kill (no POSIX
 //     process groups; nsjail is Linux-only so Windows is dev-only).
+//
+// With per-jail PID namespaces (config.CloneNewPID, default on), killing the
+// nsjail wrapper (PID 1 inside the namespace) makes the kernel SIGKILL every
+// process in that namespace, so an Agent CLI that escaped into its own process
+// group still dies with the wrapper. killGroup remains defense-in-depth for the
+// shared-PID-namespace fallback and direct (test) mode, where the CLI's
+// separate process group is invisible to the wrapper's group kill.
 
 // handshake waits for the worker socket to appear, dials, performs the
 // Health handshake, and starts the session. It is bounded by ctx.

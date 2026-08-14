@@ -69,6 +69,15 @@ type ServerConfig struct {
 	ListenAddr string `toml:"listen_addr"`
 	// DrainTimeout bounds HTTP request draining during Gateway shutdown.
 	DrainTimeout time.Duration `toml:"drain_timeout"`
+	// ReadHeaderTimeout bounds how long a request may take to send headers
+	// (slow-header/slowloris defense). Must be positive.
+	ReadHeaderTimeout time.Duration `toml:"read_header_timeout"`
+	// IdleTimeout bounds how long a keep-alive connection may sit idle between
+	// requests. Must be positive.
+	IdleTimeout time.Duration `toml:"idle_timeout"`
+	// MaxHeaderBytes caps the total size of all request headers. 0 means the
+	// net/http default (1 MiB).
+	MaxHeaderBytes int `toml:"max_header_bytes"`
 }
 
 // WorkerConfig controls disposable Worker process lifecycle. These settings
@@ -160,6 +169,15 @@ type IsolationConfig struct {
 	// Default false in phase 1 so agents can reach their providers; egress is
 	// controlled by the container/infrastructure instead.
 	NetworkNamespace bool `toml:"network_namespace"`
+
+	// CloneNewPID gives each jail its own PID namespace. Default true: the
+	// jailed worker becomes PID 1, so killing the nsjail wrapper reliably kills
+	// the entire tree (including an Agent CLI that escaped into its own process
+	// group), and a compromised agent can no longer signal the gateway or
+	// sibling sessions (their PIDs are invisible from inside the namespace). A
+	// namespaced, read-only /proc is mounted with it. Keep a false switch as a
+	// fallback for hosts where PID namespaces are unavailable.
+	CloneNewPID bool `toml:"clone_newpid"`
 }
 
 // MountsConfig configures where real directories are mounted inside the jail.
@@ -244,8 +262,11 @@ func DefaultGatewayConfig() GatewayConfig {
 	return GatewayConfig{
 		Mode: ModeProd,
 		Server: ServerConfig{
-			ListenAddr:   ":4096",
-			DrainTimeout: 30 * time.Second,
+			ListenAddr:        ":4096",
+			DrainTimeout:      30 * time.Second,
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    1 << 20, // 1 MiB (net/http default)
 		},
 		Worker: WorkerConfig{
 			StopGracePeriod:   10 * time.Second,
@@ -278,18 +299,30 @@ func DefaultGatewayConfig() GatewayConfig {
 			},
 			UserNamespace: UserNamespaceConfig{
 				Enabled: true,
-				UID:     1000,
-				GID:     1000,
+				// 65532 matches the container entrypoint (docker/entrypoint.sh)
+				// and the non-privileged smoke gate. 1000 (an arbitrary host uid)
+				// is a deployment foot-gun: an unprivileged process can only map
+				// its own host uid, so a 1000:1000 default fails preflight when the
+				// container runs as 65532 (runAsUser/Group in the documented k8s
+				// securityContext).
+				UID: 65532,
+				GID: 65532,
 			},
 			Seccomp: SeccompConfig{
 				Policy: SeccompKafel,
 			},
 			NetworkNamespace: false,
+			CloneNewPID:      true,
 		},
+		// Agents default to disabled: the base image ships no agent CLIs, so
+		// /v1/models must not advertise a CLI that is not installed. An
+		// operator enables an agent AND sets agents.<id>.command (with the
+		// CLI installed in the image) to make it available; model discovery
+		// then probes that command before advertising it (O-F04).
 		Agents: map[string]AgentConfig{
-			"codex":       {Enabled: true, Permission: PermissionAuto},
-			"claude-code": {Enabled: true, Permission: PermissionAuto},
-			"kimi":        {Enabled: true, Permission: PermissionAuto},
+			"codex":       {Enabled: false, Permission: PermissionAuto},
+			"claude-code": {Enabled: false, Permission: PermissionAuto},
+			"kimi":        {Enabled: false, Permission: PermissionAuto},
 		},
 	}
 }
@@ -369,6 +402,15 @@ func (c *GatewayConfig) Validate() error {
 	}
 	if c.Server.DrainTimeout <= 0 {
 		return fmt.Errorf("config: server.drain_timeout must be positive")
+	}
+	if c.Server.ReadHeaderTimeout <= 0 {
+		return fmt.Errorf("config: server.read_header_timeout must be positive")
+	}
+	if c.Server.IdleTimeout <= 0 {
+		return fmt.Errorf("config: server.idle_timeout must be positive")
+	}
+	if c.Server.MaxHeaderBytes < 0 {
+		return fmt.Errorf("config: server.max_header_bytes must not be negative")
 	}
 	if c.Worker.StopGracePeriod <= 0 {
 		return fmt.Errorf("config: worker.stop_grace_period must be positive")

@@ -175,6 +175,10 @@ Production and dev profiles require nsjail:
   per-session agent home at `/agent-home`, and `/tmp` is a per-session tmpfs.
 - Phase 1 keeps the network namespace shared so agents can reach their
   providers; egress is controlled by the container/infrastructure.
+- Each jail gets its own **PID namespace** (`clone_newpid`, default on): the
+  worker is PID 1, so killing the nsjail wrapper reaps the whole tree (even a
+  CLI that escaped into its own process group), and a compromised agent cannot
+  signal the gateway or sibling sessions. A namespaced `/proc` is mounted.
 - **Fail-closed**: a missing/inexecutable nsjail, an unbuildable profile, or a
   spawn failure makes readiness 503 and refuses to start sessions. On
   non-Linux hosts the jailed path fails closed too — it never silently falls
@@ -183,8 +187,12 @@ Production and dev profiles require nsjail:
 Worker failures are isolated to the session: a crashed worker is reaped by the
 supervisor (SIGTERM → SIGKILL escalation, process-group kill) and the gateway
 keeps serving. Unknown turn outcomes are never automatically replayed.
-`docker/nsjail-smoke.sh` validates the nsjail build on Linux CI
-(`--version`, `ldd`, minimal jail).
+`docker/nsjail-smoke.sh` validates the nsjail build on Linux CI in the documented
+production security context (non-root `65532`, `cap-drop=ALL`,
+`no-new-privileges`, no `--privileged`): `ldd`, a minimal jail, and a per-jail
+PID-namespace tree-kill assertion. An arm64 runner runs the same smoke so the
+aarch64 seccomp policy is exercised against real arm64 syscalls, not just a
+cross-build.
 
 ## Configuration
 
@@ -196,6 +204,7 @@ See [`config.example.toml`](config.example.toml) for a full annotated example.
 | (root) | `mode` | `prod` | `prod` / `dev` / `test`. Only `test` may disable nsjail |
 | `[server]` | `listen_addr` | `:4096` | HTTP listen address |
 | `[server]` | `drain_timeout` | `30s` | HTTP request drain bound during Gateway shutdown |
+| `[server]` | `read_header_timeout` / `idle_timeout` / `max_header_bytes` | `10s` / `60s` / `1048576` | Slow-header / keep-alive / header-size bounds (no `WriteTimeout` so SSE survives) |
 | `[worker]` | `stop_grace_period` | `10s` | CloseSession/SIGTERM grace before SIGKILL |
 | `[worker]` | `heartbeat_interval` / `heartbeat_timeout` / `heartbeat_failures` | `15s` / `3s` / `3` | Runtime Worker failure detection |
 | `[sessions]` | `idle_timeout` / `reap_interval` | `2h` / `1m` | Idle Worker reclamation; conversation/native session identity is retained |
@@ -205,14 +214,53 @@ See [`config.example.toml`](config.example.toml) for a full annotated example.
 | `[isolation]` | `nsjail_version` / `nsjail_source` | `3.6` / upstream URL | Pinned build provenance |
 | `[isolation]` | `binary_path` | `/usr/local/bin/nsjail` | nsjail executable |
 | `[isolation.mounts]` | `workspace_dir` / `agent_home_dir` / `tmp_dir` | `/workspace` / `/agent-home` / `/tmp` | Sandbox mount layout |
-| `[isolation.user_namespace]` | `enabled`, `uid`, `gid` | `true`, `1000`, `1000` | Unprivileged user namespace |
-| `[isolation.seccomp]` | `policy` | `kafel` | `kafel` or `off` (test only) |
-| `[agents.<id>]` | `enabled` | `true` | Whether the agent is available |
+| `[isolation]` | `clone_newpid` | `true` | Per-jail PID namespace (PID 1 = worker; a namespaced `/proc` is mounted) |
+| `[isolation.user_namespace]` | `enabled`, `uid`, `gid` | `true`, `65532`, `65532` | Unprivileged user namespace |
+| `[isolation.seccomp]` | `policy` | `kafel` | `kafel` or `off` (test only); policy arch is selected from `GOARCH` |
+| `[agents.<id>]` | `enabled` | `false` | Whether the agent is available (see "Installing and enabling an agent") |
+| `[agents.<id>]` | `command` | *(empty)* | CLI executable name/path; probed before the agent is advertised |
 | `[agents.<id>]` | `permission` | `auto` | `auto` / `ask` / `deny` |
 | `[agents.<id>]` | `inject_system_prompt` | `false` | Forward caller `system` role messages into the native prompt each turn |
 
 Agent settings are passed to the single-session worker over the canonical RPC
 contract; provider secrets remain worker/container environment configuration.
+
+## Installing and enabling an agent
+
+The base image ships **no agent CLIs**, and every agent defaults to **disabled**,
+so `/v1/models` advertises nothing out of the box. To make an agent available:
+
+1. install its CLI, then
+2. set `[agents.<id>] enabled = true` and `command` to the installed binary.
+
+Model discovery probes that `command` (`exec.LookPath`) and only advertises an
+agent whose CLI is actually installed, so the image can never claim an agent it
+cannot run. The three CLIs are Node packages:
+
+| Agent | npm package | default binary |
+|---|---|---|
+| Codex | `@openai/codex` | `codex` |
+| Claude Code | `@anthropic-ai/claude-code` | `claude` |
+| Kimi | *(pinned per deployment; see `adapters/kimi/SOURCE.md`)* | `kimi` |
+
+**Path A — bake the CLIs (product image).** Build the base image, then the
+product image on top of it:
+
+```bash
+make image-base
+make image-product CODEX_VERSION=... CLAUDE_VERSION=...
+```
+
+`docker/Dockerfile.agents` layers Node.js and the pinned npm packages onto the
+base image. Mount (or let the entrypoint write) a config that enables them, e.g.
+`[agents.codex] enabled = true` + `command = "codex"`.
+
+**Path B — derived image or volume.** Extend the image yourself
+(`FROM agent-gateway:…` then `RUN npm install -g …`), or bind-mount a directory
+containing the CLIs into one of the read-only-mounted paths (`/usr`, `/usr/local`,
+`/bin`, `/lib`) and point `command` at it. The jail bind-mounts those paths
+read-only, so a CLI installed there is visible to both the gateway probe and the
+jailed worker.
 
 ## Architecture
 

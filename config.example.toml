@@ -10,6 +10,11 @@ mode = "prod"
 [server]
 listen_addr = ":4096"
 drain_timeout = "30s"
+# HTTP listener hardening (O-F07): bound slow-header/keep-alive abuse without
+# breaking long-lived SSE turns (WriteTimeout/ReadTimeout are deliberately unset).
+read_header_timeout = "10s"
+idle_timeout = "60s"
+max_header_bytes = 1048576
 
 [worker]
 stop_grace_period = "10s"
@@ -46,6 +51,11 @@ required = true
 nsjail_version = "3.6"
 nsjail_source = "https://github.com/google/nsjail"
 binary_path = "/usr/local/bin/nsjail"
+# Per-jail PID namespace (O-A3): the jailed worker becomes PID 1, so killing
+# the nsjail wrapper reaps the whole tree (including a CLI that escaped into
+# its own process group) and a compromised agent can no longer signal the
+# gateway or sibling sessions. A namespaced, read-only /proc is mounted with it.
+clone_newpid = true
 
 [isolation.mounts]
 workspace_dir = "/workspace"
@@ -65,13 +75,16 @@ gid = 65532
 policy = "kafel"
 
 # --- Agents ----------------------------------------------------------------
-# The three agents default to enabled with auto permission. Each enabled
-# Gateway session starts one persistent native protocol process: Codex
-# app-server, Claude bidirectional stream-json, or Kimi ACP. There is no
-# per-turn CLI fallback.
+# The three agents default to DISABLED: the base image ships no agent CLIs, so
+# /v1/models advertises nothing until an operator enables an agent AND provides
+# its CLI. To make an agent available:
+#   1. install its CLI (see docker/Dockerfile.agents or a derived image), then
+#   2. set `enabled = true` AND `command` to the installed binary's name/path.
+# The gateway probes that command (exec.LookPath) before advertising it.
 
 [agents.codex]
-enabled = true
+enabled = false
+# command = "codex"
 permission = "auto"
 # Forward the caller's system role messages into the native prompt each turn.
 # Default false: system messages are ignored so a client cannot pollute the
@@ -79,14 +92,15 @@ permission = "auto"
 # inject_system_prompt = false
 
 [agents.claude-code]
-enabled = true
+enabled = false
+# command = "claude"
 permission = "auto"
 default_model = "sonnet"
 models = ["sonnet", "opus", "haiku"]
 # inject_system_prompt = false
 
 [agents.kimi]
-enabled = true
+enabled = false
 command = "kimi"
 permission = "auto"
 # Per-agent turn bound. Only the kimi adapter honors agents.<id>.timeout today;

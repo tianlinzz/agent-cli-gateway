@@ -595,6 +595,37 @@ func TestSupervisor_DirectSpawnRefusedWhenIsolationRequired(t *testing.T) {
 	}
 }
 
+// TestSupervisor_SeccompOffRejectedOutsideTestProfile is a regression test for
+// the layered fail-closed gap (O-C2): the config layer rejects seccomp off
+// outside the test profile, but a directly-constructed Supervisor previously
+// accepted prod/dev + seccomp off and would run without a seccomp filter. The
+// supervisor's own config validation must enforce the same constraint.
+func TestSupervisor_SeccompOffRejectedOutsideTestProfile(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Mode = config.ModeProd
+	cfg.WorkspaceRoot = t.TempDir()
+	cfg.RuntimeDir = testRuntimeDir(t)
+	cfg.WorkerExec = stubWorkerBin
+	cfg.Isolation = config.IsolationConfig{
+		Required:   true,
+		BinaryPath: "/usr/local/bin/nsjail",
+		Seccomp:    config.SeccompConfig{Policy: config.SeccompOff},
+	}
+	if _, err := NewSupervisor(cfg); err == nil {
+		t.Fatal("NewSupervisor must reject seccomp off in prod mode")
+	} else if !strings.Contains(err.Error(), "seccomp") {
+		t.Errorf("seccomp-off rejection should mention seccomp, got %v", err)
+	}
+
+	// The same config in test mode is accepted (the only profile allowed to
+	// disable the filter).
+	cfg.Mode = config.ModeTest
+	cfg.Isolation.Required = false
+	if _, err := NewSupervisor(cfg); err != nil {
+		t.Errorf("test profile may disable seccomp, got %v", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Handshake failure and reaping
 // ---------------------------------------------------------------------------

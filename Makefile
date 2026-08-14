@@ -15,7 +15,7 @@ LDFLAGS := -s -w \
   -X main.buildTime=$(BUILD_TIME)
 
 .PHONY: build build-worker dev run clean vet fmt test test-race test-integration \
-        generate docker
+        generate docker image-base image-product
 
 # ---------------------------------------------------------------------------
 # Build / test
@@ -68,3 +68,17 @@ generate:
 # a darwin host, or in Linux CI. See Dockerfile for the full security model.
 docker:
 	docker build -t agent-gateway:$(VERSION) .
+
+# Build the lean base image (no agent CLIs; every agent disabled by default).
+image-base:
+	docker build -t agent-gateway:$(VERSION) .
+
+# Build the product image on top of the base image (adds Node.js + pinned CLIs).
+# Override BASE_IMAGE and the per-provider version args as needed.
+image-product: image-base
+	docker build -f docker/Dockerfile.agents \
+	  --build-arg BASE_IMAGE=agent-gateway:$(VERSION) \
+	  --build-arg CODEX_VERSION=$(CODEX_VERSION) \
+	  --build-arg CLAUDE_VERSION=$(CLAUDE_VERSION) \
+	  --build-arg KIMI_VERSION=$(KIMI_VERSION) \
+	  -t agent-gateway:$(VERSION)-agents .

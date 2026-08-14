@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -94,13 +95,18 @@ func Build(iso config.IsolationConfig, layout SessionLayout, sessionID string) (
 	b.WriteString("hostname: \"agent\";\n")
 	b.WriteString("max_conns_per_ip: 0;\n")
 	b.WriteString("\n")
-	// Namespaces. Phase 1: no separate network namespace (agents must reach
-	// their providers; egress is controlled by the container), and the PID
-	// namespace stays shared so the worker PID observed by the supervisor is
-	// the host PID.
+	// Namespaces. The network namespace stays shared in phase 1 (agents must
+	// reach their providers; egress is controlled by the container). The PID
+	// namespace is per-jail by default (CloneNewPID): the worker becomes PID 1,
+	// so a killed nsjail wrapper reaps the whole tree and a compromised agent
+	// can no longer signal the gateway or sibling sessions.
 	b.WriteString("clone_newns: true;\n")
 	b.WriteString("clone_newroot: true;\n")
-	b.WriteString("clone_newpid: false;\n")
+	if iso.CloneNewPID {
+		b.WriteString("clone_newpid: true;\n")
+	} else {
+		b.WriteString("clone_newpid: false;\n")
+	}
 	b.WriteString("clone_newipc: true;\n")
 	b.WriteString("clone_newuts: true;\n")
 	if iso.NetworkNamespace {
@@ -128,18 +134,39 @@ func Build(iso config.IsolationConfig, layout SessionLayout, sessionID string) (
 	// Runtime dependencies are read-only mounts into the private root. No
 	// gateway runtime/config/workspace parent is mounted, so sibling sessions
 	// and gateway secrets remain outside the jail view.
-	for _, dir := range []string{"/bin", "/usr", "/usr/local", "/lib", "/etc"} {
+	for _, dir := range []string{"/bin", "/usr", "/usr/local", "/lib"} {
 		if _, err := os.Stat(dir); err == nil {
 			fmt.Fprintf(&b, "mount: { src: %q; dst: %q; is_bind: true; rw: false; mandatory: true; } ;\n", dir, dir)
 		}
+	}
+	// /etc is narrowed from the whole directory to the minimal read-only files
+	// the runtime CLIs need (DNS + user/group lookup for glibc/Node, plus TLS
+	// roots). Binding the entire /etc would expose host world-readable files
+	// beyond the boundary the deployment docs claim. Each path is mounted
+	// individually; a path absent from the host image is skipped. The exact
+	// minimal set is validated against real CLIs on Linux CI (O-F05).
+	for _, f := range []string{"/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/etc/passwd", "/etc/group", "/etc/ssl/certs"} {
+		if _, err := os.Stat(f); err == nil {
+			fmt.Fprintf(&b, "mount: { src: %q; dst: %q; is_bind: true; rw: false; mandatory: true; } ;\n", f, f)
+		}
+	}
+	// A private PID namespace requires a namespaced /proc: many CLIs read
+	// /proc/self/*, and with clone_newpid the proc pseudo-fs must reflect the
+	// jail's PID namespace rather than the host's. Mounted read-only.
+	if iso.CloneNewPID {
+		fmt.Fprintf(&b, "mount: { dst: %q; fstype: \"proc\"; rw: false; mandatory: true; } ;\n", "/proc")
 	}
 	fmt.Fprintf(&b, "mount: { dst: %q; fstype: \"tmpfs\"; options: \"size=256m\"; rw: true; mandatory: true; };\n", mounts.TmpDir)
 	b.WriteString("\n")
 
 	switch iso.Seccomp.Policy {
 	case config.SeccompKafel, "":
+		policy, err := kafelPolicyForArch(runtime.GOARCH)
+		if err != nil {
+			return Profile{}, err
+		}
 		b.WriteString("seccomp_string: ")
-		b.WriteString(strconv.Quote(kafelPolicy))
+		b.WriteString(strconv.Quote(policy))
 		b.WriteString(";\n")
 	case config.SeccompOff:
 		// Only valid in the test profile; no seccomp filter applied.
@@ -250,51 +277,107 @@ func dedupe(in []string) []string {
 	return out
 }
 
-// kafelPolicy is the base seccomp whitelist. It is deliberately generous: the
-// three first-generation agents run on modern Go runtimes and need the usual
-// process/io/fs/network/time syscalls. The exact whitelist is validated
-// against real agents on Linux CI (task 7) and refined there.
-const kafelPolicy = `POLICY x86_64 {
-    ALLOW {
-        /* process */
-        read, write, close, dup, dup2, dup3, fcntl, ioctl,
-        readv, writev, pread64, pwrite64, preadv, pwritev,
-        open, openat, openat2, creat, close_range, lseek,
-        mmap, mmap2, munmap, mprotect, mremap, msync, brk, madvise,
-        stat, lstat, fstat, newfstatat, statx, stat64, lstat64, fstat64,
-        access, faccessat, faccessat2, readlink, readlinkat,
-        unlink, unlinkat, mkdir, mkdirat, rmdir, rename, renameat, renameat2,
-        chmod, fchmod, fchmodat, chown, fchown, lchown, fchownat,
-        chown32, fchown32, truncate, ftruncate,
-        link, linkat, symlink, symlinkat, getdents, getdents64,
-        utimensat, futimesat, futimes, utime, utimes,
-        exit, exit_group, fork, vfork, clone, clone3, execve, execveat,
-        wait4, waitid, waitpid, kill, tkill, tgkill,
-        rt_sigaction, rt_sigprocmask, rt_sigpending, rt_sigtimedwait,
-        rt_sigqueueinfo, rt_sigsuspend, rt_sigreturn, sigaltstack,
-        getpid, getppid, gettid, getsid, setsid, setpgid, getpgid,
-        getuid, getgid, geteuid, getegid, getuid32, getgid32,
-        geteuid32, getegid32, setuid, setgid, setreuid, setregid,
-        setresuid, setresgid, setuid32, setgid32, setreuid32, setregid32,
-        setresuid32, setresgid32, getgroups, getgroups32, setgroups,
-        prctl, getrlimit, setrlimit, prlimit64, ugetrlimit, umask,
-        uname, sched_yield, sched_getaffinity, sched_setaffinity,
-        nanosleep, clock_nanosleep, clock_gettime, clock_getres,
-        gettimeofday, time, times, getitimer, setitimer,
-        futex, futex_waitv, getrandom, pipe, pipe2, socketpair,
-        poll, ppoll, select, pselect6,
-        epoll_create, epoll_create1, epoll_ctl, epoll_wait, epoll_pwait,
-        eventfd, eventfd2, inotify_init, inotify_init1,
-        inotify_add_watch, inotify_rm_watch,
-        fdatasync, fsync, sync, syncfs, sendfile, copy_file_range,
-        statfs, fstatfs, statfs64, fstatfs64,
-        arch_prctl, set_tid_address, set_robust_list, rseq,
-        getcpu, getcwd, chdir, fchdir, sysinfo, alarm,
-        /* network (phase 1 keeps the provider reachable) */
-        socket, bind, listen, accept, accept4, connect,
-        getsockname, getpeername, getsockopt, setsockopt,
-        sendto, recvfrom, sendmsg, recvmsg, sendmmsg, recvmmsg, shutdown,
-        /* memory */
-        mlock, munlock, mlockall, munlockall, mincore, mlock2
-    }
-}`
+// kafelSyscalls is the base seccomp whitelist shared by every architecture's
+// policy. It is deliberately generous: the first-generation agents run on
+// modern Go/Node runtimes and need the usual process/io/fs/network/time
+// syscalls. The exact whitelist is validated against real agents on Linux CI
+// and refined there.
+var kafelSyscalls = []string{
+	"read", "write", "close", "dup", "dup2", "dup3", "fcntl", "ioctl",
+	"readv", "writev", "pread64", "pwrite64", "preadv", "pwritev",
+	"open", "openat", "openat2", "creat", "close_range", "lseek",
+	"mmap", "mmap2", "munmap", "mprotect", "mremap", "msync", "brk", "madvise",
+	"stat", "lstat", "fstat", "newfstatat", "statx", "stat64", "lstat64", "fstat64",
+	"access", "faccessat", "faccessat2", "readlink", "readlinkat",
+	"unlink", "unlinkat", "mkdir", "mkdirat", "rmdir", "rename", "renameat", "renameat2",
+	"chmod", "fchmod", "fchmodat", "chown", "fchown", "lchown", "fchownat",
+	"chown32", "fchown32", "truncate", "ftruncate",
+	"link", "linkat", "symlink", "symlinkat", "getdents", "getdents64",
+	"utimensat", "futimesat", "futimes", "utime", "utimes",
+	"exit", "exit_group", "fork", "vfork", "clone", "clone3", "execve", "execveat",
+	"wait4", "waitid", "waitpid", "kill", "tkill", "tgkill",
+	"rt_sigaction", "rt_sigprocmask", "rt_sigpending", "rt_sigtimedwait",
+	"rt_sigqueueinfo", "rt_sigsuspend", "rt_sigreturn", "sigaltstack",
+	"getpid", "getppid", "gettid", "getsid", "setsid", "setpgid", "getpgid",
+	"getuid", "getgid", "geteuid", "getegid", "getuid32", "getgid32",
+	"geteuid32", "getegid32", "setuid", "setgid", "setreuid", "setregid",
+	"setresuid", "setresgid", "setuid32", "setgid32", "setreuid32", "setregid32",
+	"setresuid32", "setresgid32", "getgroups", "getgroups32", "setgroups",
+	"prctl", "getrlimit", "setrlimit", "prlimit64", "ugetrlimit", "umask",
+	"uname", "sched_yield", "sched_getaffinity", "sched_setaffinity",
+	"nanosleep", "clock_nanosleep", "clock_gettime", "clock_getres",
+	"gettimeofday", "time", "times", "getitimer", "setitimer",
+	"futex", "futex_waitv", "getrandom", "pipe", "pipe2", "socketpair",
+	"poll", "ppoll", "select", "pselect6",
+	"epoll_create", "epoll_create1", "epoll_ctl", "epoll_wait", "epoll_pwait",
+	"eventfd", "eventfd2", "inotify_init", "inotify_init1",
+	"inotify_add_watch", "inotify_rm_watch",
+	"fdatasync", "fsync", "sync", "syncfs", "sendfile", "copy_file_range",
+	"statfs", "fstatfs", "statfs64", "fstatfs64",
+	"arch_prctl", "set_tid_address", "set_robust_list", "rseq",
+	"getcpu", "getcwd", "chdir", "fchdir", "sysinfo", "alarm",
+	"socket", "bind", "listen", "accept", "accept4", "connect",
+	"getsockname", "getpeername", "getsockopt", "setsockopt",
+	"sendto", "recvfrom", "sendmsg", "recvmsg", "sendmmsg", "recvmmsg", "shutdown",
+	"mlock", "munlock", "mlockall", "munlockall", "mincore", "mlock2",
+}
+
+// kafelX86OnlySyscalls are allowed in the x86_64 policy but absent from
+// aarch64 (legacy 32-bit stat/uid variants, mmap2, ugetrlimit, and the
+// x86_64-only arch_prctl). The aarch64 policy drops them so the whitelist stays
+// valid for that ISA. The aarch64 allowlist is validated on arm64 CI (O-F06).
+var kafelX86OnlySyscalls = map[string]bool{
+	"mmap2":       true,
+	"stat64":      true,
+	"lstat64":     true,
+	"fstat64":     true,
+	"chown32":     true,
+	"fchown32":    true,
+	"getuid32":    true,
+	"getgid32":    true,
+	"geteuid32":   true,
+	"getegid32":   true,
+	"setuid32":    true,
+	"setgid32":    true,
+	"setreuid32":  true,
+	"setregid32":  true,
+	"setresuid32": true,
+	"setresgid32": true,
+	"getgroups32": true,
+	"ugetrlimit":  true,
+	"statfs64":    true,
+	"fstatfs64":   true,
+	"arch_prctl":  true,
+}
+
+// kafelPolicyForArch returns the Kafel seccomp policy for a compiled binary's
+// GOARCH. amd64 maps to the x86_64 policy, arm64 to the aarch64 policy
+// (the shared allowlist minus x86-only syscalls). Any other architecture fails
+// closed with a clear error rather than emitting an invalid or absent filter.
+func kafelPolicyForArch(goarch string) (string, error) {
+	var kafelArch string
+	dropX86 := false
+	switch goarch {
+	case "amd64":
+		kafelArch = "x86_64"
+	case "arm64":
+		kafelArch = "aarch64"
+		dropX86 = true
+	default:
+		return "", fmt.Errorf("nsjail: seccomp: unsupported architecture %q (no validated Kafel policy; supported: amd64, arm64)", goarch)
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "POLICY %s {\n", kafelArch)
+	b.WriteString("    ALLOW {\n")
+	for _, s := range kafelSyscalls {
+		if dropX86 && kafelX86OnlySyscalls[s] {
+			continue
+		}
+		b.WriteString("        ")
+		b.WriteString(s)
+		b.WriteString(",\n")
+	}
+	b.WriteString("    }\n}")
+	return b.String(), nil
+}

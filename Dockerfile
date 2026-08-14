@@ -100,9 +100,14 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/gateway ./cmd/gateway \
     && go build -trimpath -ldflags="-s -w" -o /out/gateway-worker ./cmd/gateway-worker
 
 # ---------------------------------------------------------------------------
-# Stage 3: runtime image
+# Stage 3: runtime image (base image — ships no agent CLIs)
 # ---------------------------------------------------------------------------
-FROM debian:bookworm-slim
+# This is the lean, hermetic base image: gateway + gateway-worker + nsjail and
+# their runtime libs, with every agent disabled by default. Model discovery
+# (/v1/models) therefore advertises nothing until an operator enables an agent
+# AND provides its CLI. To ship the CLIs, build the product image on top of this
+# base: see docker/Dockerfile.agents (adds Node.js and the pinned npm CLIs).
+FROM debian:bookworm-slim AS gateway-base
 
 # Runtime libs nsjail needs (mirrors upstream Dockerfile's runtime stage) plus
 # tools the agent CLIs commonly shell out to (git, python3, curl).
@@ -116,6 +121,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         python3 \
         tini \
+        procps \
     && rm -rf /var/lib/apt/lists/*
 
 # nsjail + its runtime shared-lib deps. ldd is used so the image never carries

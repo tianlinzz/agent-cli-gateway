@@ -14,6 +14,15 @@ func TestDefaultGatewayConfig_LifecycleGovernance(t *testing.T) {
 	if c.Server.DrainTimeout != 30*time.Second {
 		t.Errorf("Server.DrainTimeout = %v, want 30s", c.Server.DrainTimeout)
 	}
+	if c.Server.ReadHeaderTimeout != 10*time.Second {
+		t.Errorf("Server.ReadHeaderTimeout = %v, want 10s", c.Server.ReadHeaderTimeout)
+	}
+	if c.Server.IdleTimeout != 60*time.Second {
+		t.Errorf("Server.IdleTimeout = %v, want 60s", c.Server.IdleTimeout)
+	}
+	if c.Server.MaxHeaderBytes != 1<<20 {
+		t.Errorf("Server.MaxHeaderBytes = %d, want 1 MiB", c.Server.MaxHeaderBytes)
+	}
 	if c.Worker.StopGracePeriod != 10*time.Second {
 		t.Errorf("Worker.StopGracePeriod = %v, want 10s", c.Worker.StopGracePeriod)
 	}
@@ -137,6 +146,9 @@ func TestDefaultGatewayConfig_IsolationRequired(t *testing.T) {
 	if c.Isolation.NetworkNamespace {
 		t.Error("Isolation.NetworkNamespace must default to false in phase 1 (agents must reach providers)")
 	}
+	if !c.Isolation.CloneNewPID {
+		t.Error("Isolation.CloneNewPID must default to true (per-jail PID namespace)")
+	}
 	if c.Isolation.NsjailVersion == "" {
 		t.Error("Isolation.NsjailVersion must be pinned")
 	}
@@ -160,6 +172,19 @@ func TestDefaultGatewayConfig_IsolationRequired(t *testing.T) {
 	}
 }
 
+// TestDefaultGatewayConfig_UserNamespaceUIDMatchesContainer is a regression
+// test for the uidmap deployment foot-gun (O-C3): the default uid/gid was 1000,
+// but the container entrypoint and non-privileged smoke run as 65532. An
+// unprivileged process can only map its own host uid, so a 1000 default made
+// nsjail's user-namespace mapping fail preflight in the documented deployment.
+// The default must match the container runtime user.
+func TestDefaultGatewayConfig_UserNamespaceUIDMatchesContainer(t *testing.T) {
+	c := DefaultGatewayConfig()
+	if c.Isolation.UserNamespace.UID != 65532 || c.Isolation.UserNamespace.GID != 65532 {
+		t.Fatalf("UserNamespace UID/GID = %d/%d, want 65532/65532 (matches docker/entrypoint.sh and the non-privileged smoke gate)", c.Isolation.UserNamespace.UID, c.Isolation.UserNamespace.GID)
+	}
+}
+
 func TestGatewayConfigRejectsProdWithoutCallers(t *testing.T) {
 	c := DefaultGatewayConfig()
 	c.Auth.Callers = nil
@@ -179,15 +204,19 @@ func TestGatewayConfigRejectsDuplicateCallerToken(t *testing.T) {
 	}
 }
 
-func TestDefaultGatewayConfig_ThreeAgentsEnabled(t *testing.T) {
+func TestDefaultGatewayConfig_AgentsDisabledByDefault(t *testing.T) {
 	c := DefaultGatewayConfig()
 	for _, name := range []string{"codex", "claude-code", "kimi"} {
 		agent, ok := c.Agents[name]
 		if !ok {
 			t.Fatalf("default config missing agent %q", name)
 		}
-		if !agent.Enabled {
-			t.Errorf("agent %q must default to enabled", name)
+		// The base image ships no agent CLIs, so agents default to disabled and
+		// /v1/models advertises nothing until an operator enables one AND sets
+		// its command (O-F04). This is the regression guard for the
+		// "advertise an unusable Agent" finding.
+		if agent.Enabled {
+			t.Errorf("agent %q must default to disabled (base image has no CLI)", name)
 		}
 		if agent.Permission != PermissionAuto {
 			t.Errorf("agent %q permission = %q, want %q", name, agent.Permission, PermissionAuto)
@@ -346,8 +375,8 @@ permission = "ask"
 	if c.Server.ListenAddr != ":4096" {
 		t.Errorf("Server.ListenAddr = %q, want default %q", c.Server.ListenAddr, ":4096")
 	}
-	if !c.Agents["claude-code"].Enabled {
-		t.Error("claude-code must retain default enabled (map defaults merge)")
+	if c.Agents["claude-code"].Enabled {
+		t.Error("claude-code must retain default disabled (map defaults merge)")
 	}
 	if c.Agents["kimi"].Permission != PermissionAuto {
 		t.Errorf("kimi permission = %q, want default %q", c.Agents["kimi"].Permission, PermissionAuto)

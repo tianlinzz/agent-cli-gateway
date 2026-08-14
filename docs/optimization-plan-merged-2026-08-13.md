@@ -142,12 +142,21 @@ Phase 0 — 正确性与信任边界闭环（对应 ROADMAP Phase 0 + AUDIT Tran
         客户端 metadata 无法注入/覆盖 native session ID（含负向测试）。
 
 Phase 1 — 发布与沙箱声明可证明（对应 ROADMAP Phase 1 + AUDIT A3/C 类）
-  6. O-F04 Agent 可用性探针 + /v1/models 只广告可用项 + 镜像 CLI 契约
-  7. O-F05 非特权（65532/cap-drop=ALL/no-new-privileges）CI 安全矩阵
-  8. O-A3  clone_newpid 可配置默认 true，smoke 加"杀 nsjail 整树死亡"断言
-  9. O-F06 seccomp 架构感知（amd64/arm64，未知架构 fail-closed）
- 10. O-F07 HTTP 加固（ReadHeaderTimeout/MaxHeaderBytes/MaxBytesReader→413）
- 11. 顺手：O-C2 / O-C3 / O-C4 / U3
+  6. O-C3  uidmap 默认值对齐（1000→65532，O-A3 smoke 的前置）
+  7. O-F04 Agent 可用性探针 + /v1/models 只广告可用项 + 镜像 CLI 契约
+         （基础镜像不含 CLI、agent 默认禁用；产品镜像 docker/Dockerfile.agents）
+  8. O-F07 HTTP 加固（ReadHeaderTimeout/IdleTimeout/MaxHeaderBytes +
+         MaxBytesReader→413 + 拒绝多 JSON/尾随字节 + metadata 键/长/值上限）
+  9. O-C2  seccomp-off 分层 fail-closed（supervisor 层 + nsjail.Build）
+ 10. O-C4  /etc 挂载收窄（最小文件集：resolv/hosts/nsswitch/passwd/group/ssl）
+ 11. O-A3  clone_newpid 可配置默认 true + namespaced /proc 挂载（翻转前置，
+         非"配套"）+ smoke 加"杀 nsjail 整树死亡"断言
+ 12. O-F05 非特权（65532/cap-drop=ALL/no-new-privileges/只读 rootfs）CI 安全矩阵
+ 13. O-F06 seccomp 架构感知（amd64→x86_64、arm64→aarch64、未知架构 fail-closed）
+         + arm64 真机 smoke job（cross-build 不足）
+ 出口：/v1/models 不广告缺失/不可用命令；镜像契约点名 CLI 版本；非特权 Linux
+       容器测试通过；每个声称的 arch 跑真 nsjail smoke；slow-header/oversized/
+       尾随 JSON/metadata 超限测试通过；文档与 CI 同一安全上下文（ROADMAP §6）。
 
 Phase 2 — Run 治理、观测与资源上限（对应 ROADMAP Phase 2 + AUDIT B 剩余）
  12. O-F11 RunRecord + X-Gateway-Run-Id + 指标/trace/日志规范

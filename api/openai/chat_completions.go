@@ -17,6 +17,15 @@ import (
 // maxBodyBytes bounds the chat request body.
 const maxBodyBytes = 1 << 20 // 1 MiB
 
+// Metadata pass-through bounds (HTTP input hardening, O-F07). They cap the
+// number of keys and the byte length of each key/value so an oversized
+// metadata map cannot balloon memory or the native prompt.
+const (
+	maxMetadataKeys       = 64
+	maxMetadataKeyBytes   = 64
+	maxMetadataValueBytes = 1024
+)
+
 // ---------------------------------------------------------------------------
 // Normalizer: OpenAI request -> canonical runtime Input/StartRequest.
 // ---------------------------------------------------------------------------
@@ -44,7 +53,11 @@ func normalizeInput(req ChatCompletionRequest) (runtime.Input, error) {
 			Parameters:  t.Function.Parameters,
 		})
 	}
-	in.Metadata = sanitizeMetadata(req.Metadata)
+	meta, err := sanitizeMetadata(req.Metadata)
+	if err != nil {
+		return runtime.Input{}, err
+	}
+	in.Metadata = meta
 	return in, nil
 }
 
@@ -125,7 +138,10 @@ func normalizeToolCall(tc ChatToolCall) (runtime.ToolCall, error) {
 //     client can never select or override the native session/thread the
 //     gateway resumes into. The gateway injects the sole canonical
 //     native_session_id from its own SessionRecord after this step.
-func sanitizeMetadata(m map[string]any) map[string]string {
+func sanitizeMetadata(m map[string]any) (map[string]string, error) {
+	if len(m) > maxMetadataKeys {
+		return nil, fmt.Errorf("metadata has %d keys; max %d", len(m), maxMetadataKeys)
+	}
 	out := make(map[string]string, len(m))
 	for k, v := range m {
 		switch strings.ToLower(strings.TrimSpace(k)) {
@@ -134,14 +150,22 @@ func sanitizeMetadata(m map[string]any) map[string]string {
 		case "native_session_id", "codex_thread_id", "claude_session_id", "kimi_session_id":
 			continue
 		}
+		if len(k) > maxMetadataKeyBytes {
+			return nil, fmt.Errorf("metadata key %q exceeds %d bytes", k, maxMetadataKeyBytes)
+		}
+		var s string
 		switch t := v.(type) {
 		case string:
-			out[k] = t
+			s = t
 		default:
-			out[k] = fmt.Sprint(t)
+			s = fmt.Sprint(t)
 		}
+		if len(s) > maxMetadataValueBytes {
+			return nil, fmt.Errorf("metadata value for key %q exceeds %d bytes", k, maxMetadataValueBytes)
+		}
+		out[k] = s
 	}
-	return out
+	return out, nil
 }
 
 func metaString(m map[string]any, key string) string {
@@ -182,8 +206,21 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	callerID := caller.ID
 
 	var req ChatCompletionRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, maxBodyBytes)).Decode(&req); err != nil {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err := dec.Decode(&req); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, invalidRequest("request body exceeds 1 MiB"))
+			return
+		}
 		writeError(w, http.StatusBadRequest, invalidRequest("invalid JSON body: "+err.Error()))
+		return
+	}
+	// Reject a body holding more than one top-level JSON value, or trailing
+	// bytes after a valid object. Without this, a second JSON value (or garbage)
+	// after a valid object is silently ignored by the single Decode above.
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		writeError(w, http.StatusBadRequest, invalidRequest("request body must contain a single JSON object"))
 		return
 	}
 	if strings.TrimSpace(req.Model) == "" {

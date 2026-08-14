@@ -63,6 +63,13 @@ type Options struct {
 	Enabled func(name string) bool
 	Models  map[string][]string
 
+	// Commands maps adapter id -> configured CLI command. When nil, model
+	// discovery advertises an enabled adapter on Describe success alone. When
+	// non-nil (the production gateway always sets it), an enabled adapter is
+	// probed via exec.LookPath and only advertised if its command resolves, so
+	// /v1/models never exposes a CLI that is not installed.
+	Commands map[string]string
+
 	// TurnTimeout bounds a single turn. Zero means no hard API-side bound
 	// (the adapter/worker own their timeouts). NewHandler defaults this to a
 	// generous safety net.
@@ -306,7 +313,7 @@ func NewHandler(opts Options) *Handler {
 		turns:           make(map[string]*turnState),
 		serverToolIDs:   make(map[string]*serverToolLedger),
 	}
-	h.catalog = &modelCatalog{reg: opts.Registry, enabled: opts.Enabled, models: opts.Models}
+	h.catalog = &modelCatalog{reg: opts.Registry, enabled: opts.Enabled, models: opts.Models, commands: opts.Commands}
 	// stop is always created so Close can signal every background goroutine
 	// (prune loop + handle-termination watchers) even when record expiry is off.
 	h.stop = make(chan struct{})

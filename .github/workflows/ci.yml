@@ -162,6 +162,13 @@ jobs:
     # Required Linux release gate: build the pinned nsjail image and execute
     # version, linkage, preflight, and minimal-jail validation. This job is
     # intentionally blocking; isolation regressions must prevent a merge.
+    #
+    # The gate is NON-PRIVILEGED: it runs the documented production security
+    # context (non-root 65532, cap-drop=ALL, no-new-privileges) so the claim
+    # "unprivileged user namespace + mount + PID namespace, no --privileged" is
+    # actually proven by CI, not just asserted in docs. If the runner kernel
+    # blocks unprivileged user namespaces, the deployment contract must be
+    # revised explicitly — never silently add --privileged back.
     runs-on: ubuntu-latest
     needs: lint
 
@@ -171,9 +178,38 @@ jobs:
       - name: Build image
         run: docker build -t agent-gateway:ci .
 
-      - name: Run nsjail smoke validation
+      - name: Run nsjail smoke validation (non-privileged)
         run: |
           docker run --rm --entrypoint /bin/sh \
-            --privileged \
+            --user 65532:65532 \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            --read-only \
+            --tmpfs /tmp \
             -v "$PWD/docker/nsjail-smoke.sh:/nsjail-smoke.sh:ro" \
             agent-gateway:ci /nsjail-smoke.sh
+
+  smoke-arm64:
+    # Architecture-specific sandbox gate (O-F06): a cross-build alone does not
+    # prove the seccomp policy or nsjail run on arm64. This runs the same
+    # non-privileged smoke on a real arm64 runner so the aarch64 Kafel policy
+    # is exercised against actual arm64 syscalls, not just compiled.
+    runs-on: ubuntu-24.04-arm
+    needs: lint
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image (arm64)
+        run: docker build -t agent-gateway:ci-arm64 .
+
+      - name: Run nsjail smoke validation (arm64, non-privileged)
+        run: |
+          docker run --rm --entrypoint /bin/sh \
+            --user 65532:65532 \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            --read-only \
+            --tmpfs /tmp \
+            -v "$PWD/docker/nsjail-smoke.sh:/nsjail-smoke.sh:ro" \
+            agent-gateway:ci-arm64 /nsjail-smoke.sh
