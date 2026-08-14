@@ -36,6 +36,18 @@ func TestDependencyRules(t *testing.T) {
 				rejectImport(t, relative, path, "agent", "adapters", "worker", "api")
 			case "agent":
 				rejectImport(t, relative, path, "runtime", "adapters", "worker", "api", "config")
+				// agent/<name> packages may only share code through the
+				// sanctioned agent/* foundations: events (D1), process, and
+				// protocol. One agent importing another is forbidden.
+				if seg := agentSubPackage(relative); seg != "" {
+					if path == modulePath+"/agent" || strings.HasPrefix(path, modulePath+"/agent/") {
+						switch path {
+						case modulePath + "/agent/process", modulePath + "/agent/protocol", modulePath + "/agent/events":
+						default:
+							t.Errorf("forbidden dependency: %s imports %s (agent/<name> may only import agent/events, agent/process, agent/protocol, stdlib)", relative, path)
+						}
+					}
+				}
 			case "adapters":
 				rejectImport(t, relative, path, "worker", "api")
 			case "worker":
@@ -43,6 +55,21 @@ func TestDependencyRules(t *testing.T) {
 			}
 		}
 	})
+}
+
+// agentSubPackage returns the second path segment for files under agent/<name>
+// (e.g. "codex" for agent/codex/session.go), or "" for the foundation
+// packages themselves (agent/process, agent/protocol, agent/events).
+func agentSubPackage(relative string) string {
+	parts := strings.Split(filepath.ToSlash(relative), "/")
+	if len(parts) < 2 || parts[0] != "agent" {
+		return ""
+	}
+	switch parts[1] {
+	case "process", "protocol", "events":
+		return ""
+	}
+	return parts[1]
 }
 
 func TestNoLegacyAgentSources(t *testing.T) {

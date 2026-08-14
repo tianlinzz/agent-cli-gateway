@@ -1,37 +1,28 @@
 package kimi
 
-type EventKind string
+// The native event contract is shared across all agents (agent/events, D1).
+// These aliases re-export it under the package-local names the Kimi session
+// and its tests already use; there is deliberately no Kimi-specific copy.
+import "github.com/tianlinzz/agent-cli-gateway/agent/events"
 
-const (
-	EventText          EventKind = "text"
-	EventReasoning     EventKind = "reasoning"
-	EventToolUse       EventKind = "tool_use"
-	EventToolResult    EventKind = "tool_result"
-	EventPermission    EventKind = "permission"
-	EventUsage         EventKind = "usage"
-	EventError         EventKind = "error"
-	EventFinish        EventKind = "finish"
-	EventNativeSession EventKind = "native_session"
+type (
+	EventKind         = events.EventKind
+	Input             = events.Input
+	Usage             = events.Usage
+	Reasoning         = events.Reasoning
+	ToolCall          = events.ToolCall
+	PermissionRequest = events.PermissionRequest
+	Event             = events.Event
 )
 
-type Input struct{ Prompt string }
-type Usage struct{ InputTokens, OutputTokens, TotalTokens int }
-type Reasoning struct{ ID, Text string }
-type ToolCall struct {
-	ID, Name  string
-	Arguments map[string]any
-	Result    string
-	IsError   bool
-}
-type PermissionRequest struct{ ID, Action, Detail string }
-type Event struct {
-	Kind            EventKind
-	Text            string
-	Reasoning       *Reasoning
-	Tool            *ToolCall
-	Permission      *PermissionRequest
-	Usage           *Usage
-	Err             error
-	FinishReason    string
-	NativeSessionID string
-}
+const (
+	EventText          = events.EventText
+	EventReasoning     = events.EventReasoning
+	EventToolUse       = events.EventToolUse
+	EventToolResult    = events.EventToolResult
+	EventPermission    = events.EventPermission
+	EventUsage         = events.EventUsage
+	EventError         = events.EventError
+	EventFinish        = events.EventFinish
+	EventNativeSession = events.EventNativeSession
+)

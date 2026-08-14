@@ -64,11 +64,15 @@ cmd/gateway → config/, runtime/, api/openai/, worker/
 cmd/gateway-worker → adapters/*, runtime/
 api/openai → runtime/   (never adapters/, worker/, or config/)
 adapters/<name> → agent/<name>, runtime/ (never api/, worker/, or another agent)
-agent/<name> → agent/process, agent/protocol, stdlib only
+agent/<name> → agent/events, agent/process, agent/protocol, stdlib only
 worker/     → runtime/, workspace/, config/ (never adapters/ or api/)
 workspace/  → stdlib only
 runtime/    → stdlib only
 ```
+
+`agent/events` is the single canonical native event contract (D1): every
+`agent/<name>` package re-exports it via type aliases instead of carrying its
+own copy.
 
 ### Core Interfaces
 
