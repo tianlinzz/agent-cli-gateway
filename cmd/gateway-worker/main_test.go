@@ -71,7 +71,7 @@ func TestStartSessionPassesTypedConfigToFactory_OF08(t *testing.T) {
 		CallerID:    "c",
 		WorkspaceID: "w",
 		AgentConfig: runtime.AgentExecutionConfig{
-			Command:      "/opt/tools/probe",
+			Command:      []string{"/opt/tools/probe"},
 			DefaultModel: "base-model",
 			Permission:   "deny",
 			Env:          map[string]string{"PROBE_FLAG": "1"},
@@ -81,7 +81,7 @@ func TestStartSessionPassesTypedConfigToFactory_OF08(t *testing.T) {
 	if _, err := h.StartSession(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
-	if got.Execution.Command != "/opt/tools/probe" || got.Execution.Permission != "deny" {
+	if !slicesEqual(got.Execution.Command, []string{"/opt/tools/probe"}) || got.Execution.Permission != "deny" {
 		t.Fatalf("execution config not delivered: %#v", got.Execution)
 	}
 	if got.Execution.DefaultModel != "provider-model" {
@@ -90,4 +90,16 @@ func TestStartSessionPassesTypedConfigToFactory_OF08(t *testing.T) {
 	if got.Execution.Env["PROBE_FLAG"] != "1" {
 		t.Fatalf("env map not delivered: %#v", got.Execution.Env)
 	}
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

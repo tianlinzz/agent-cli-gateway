@@ -383,7 +383,7 @@ func fromProtoStartRequest(p *workerpb.StartSessionRequest) (StartSessionReq, er
 }
 
 func toProtoAgentConfig(c runtime.AgentExecutionConfig) *workerpb.AgentExecutionConfig {
-	return &workerpb.AgentExecutionConfig{Command: c.Command, DefaultModel: c.DefaultModel,
+	return &workerpb.AgentExecutionConfig{CommandArgv: c.Command, DefaultModel: c.DefaultModel,
 		Permission: c.Permission, TurnTimeoutNanos: c.TurnTimeout.Nanoseconds(),
 		MaxConcurrency: int32(c.MaxConcurrency), Env: c.Env, InjectSystemPrompt: c.InjectSystemPrompt}
 }
@@ -392,7 +392,7 @@ func fromProtoAgentConfig(c *workerpb.AgentExecutionConfig) runtime.AgentExecuti
 	if c == nil {
 		return runtime.AgentExecutionConfig{}
 	}
-	return runtime.AgentExecutionConfig{Command: c.Command, DefaultModel: c.DefaultModel,
+	return runtime.AgentExecutionConfig{Command: c.CommandArgv, DefaultModel: c.DefaultModel,
 		Permission: c.Permission, TurnTimeout: time.Duration(c.TurnTimeoutNanos),
 		MaxConcurrency: int(c.MaxConcurrency), Env: c.Env, InjectSystemPrompt: c.InjectSystemPrompt}
 }

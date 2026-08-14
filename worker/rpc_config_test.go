@@ -10,7 +10,7 @@ import (
 
 func TestAgentExecutionConfigRoundTrip(t *testing.T) {
 	want := StartSessionReq{ModelID: "codex", SessionID: "s", CallerID: "c", WorkspaceID: "w",
-		AgentConfig: runtime.AgentExecutionConfig{Command: "codex-test", DefaultModel: "o4-mini",
+		AgentConfig: runtime.AgentExecutionConfig{Command: []string{"codex-test", "--flag"}, DefaultModel: "o4-mini",
 			Permission: "deny", TurnTimeout: 17 * time.Second, MaxConcurrency: 3,
 			Env: map[string]string{"CODEX_API_KEY": "redacted"}, InjectSystemPrompt: true}}
 	p, err := toProtoStartRequest(want)

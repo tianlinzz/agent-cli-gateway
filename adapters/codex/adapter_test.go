@@ -8,6 +8,21 @@ import (
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
 )
 
+// TestStartPassesArgvVerbatim_OF14 pins the argv contract: a configured
+// command flows to the native launcher verbatim — a path containing spaces
+// stays a single token and is never re-tokenized by whitespace.
+func TestStartPassesArgvVerbatim_OF14(t *testing.T) {
+	capture := &captureStarter{session: newFakeSession("")}
+	adapter := newAdapter(Options{Command: []string{"/opt/agent tools/codex", "--quiet"}}, capture.Start)
+	if _, err := adapter.Start(context.Background(), runtime.StartRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/opt/agent tools/codex", "--quiet"}
+	if !slicesEqual(capture.options.Command, want) {
+		t.Fatalf("command = %#v, want %#v (argv must flow verbatim)", capture.options.Command, want)
+	}
+}
+
 func TestDescribeDeclaresPersistentProcess(t *testing.T) {
 	descriptor, err := newAdapter(Options{}, nil).Describe(context.Background())
 	if err != nil {
@@ -25,7 +40,7 @@ func TestDescribeDeclaresPersistentProcess(t *testing.T) {
 func TestNewConsumesTypedConfigDirectly_OF08(t *testing.T) {
 	opts := optionsFromConfig(runtime.AdapterConfig{
 		Execution: runtime.AgentExecutionConfig{
-			Command:            "/opt/tools/codex",
+			Command:            []string{"/opt/tools/codex"},
 			DefaultModel:       "gpt-5",
 			Permission:         "deny",
 			Env:                map[string]string{"B": "2", "A": "1"},
@@ -34,7 +49,7 @@ func TestNewConsumesTypedConfigDirectly_OF08(t *testing.T) {
 		WorkspaceDir: "/ws",
 		AgentHome:    "/home-agent",
 	})
-	if opts.Command != "/opt/tools/codex" || opts.Model != "gpt-5" || opts.Permission != "deny" || !opts.InjectSystemPrompt {
+	if !slicesEqual(opts.Command, []string{"/opt/tools/codex"}) || opts.Model != "gpt-5" || opts.Permission != "deny" || !opts.InjectSystemPrompt {
 		t.Fatalf("options = %#v", opts)
 	}
 	if opts.WorkDir != "/ws" || opts.CodexHome != "/home-agent" {
@@ -48,7 +63,7 @@ func TestNewConsumesTypedConfigDirectly_OF08(t *testing.T) {
 
 func TestStartMapsCodexHomeAndResumeMetadata(t *testing.T) {
 	capture := &captureStarter{session: newFakeSession("")}
-	adapter := newAdapter(Options{Command: "codex --quiet", WorkDir: "/workspace", CodexHome: "/agent-home", Model: "gpt-5", Permission: "deny"}, capture.Start)
+	adapter := newAdapter(Options{Command: []string{"codex", "--quiet"}, WorkDir: "/workspace", CodexHome: "/agent-home", Model: "gpt-5", Permission: "deny"}, capture.Start)
 	_, err := adapter.Start(context.Background(), runtime.StartRequest{Metadata: map[string]string{"native_session_id": "thread-1"}})
 	if err != nil {
 		t.Fatal(err)
@@ -166,4 +181,16 @@ func containsValue(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

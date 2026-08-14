@@ -17,7 +17,9 @@ func init() {
 
 // Options is trusted deployment configuration for the Claude adapter.
 type Options struct {
-	Command            string
+	// Command is the CLI command in argv form (executable first), passed to
+	// exec verbatim — never through a shell or whitespace re-tokenization.
+	Command            []string
 	Env                []string
 	WorkDir            string
 	Model              string
@@ -79,8 +81,8 @@ func NewAdapter(opts Options) (*Adapter, error) {
 }
 
 func newAdapter(opts Options, start starter) *Adapter {
-	if strings.TrimSpace(opts.Command) == "" {
-		opts.Command = "claude"
+	if len(opts.Command) == 0 {
+		opts.Command = []string{"claude"}
 	}
 	if strings.TrimSpace(opts.WorkDir) == "" {
 		opts.WorkDir = "/workspace"
@@ -118,7 +120,7 @@ func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.
 		}
 	}
 	session, err := start(ctx, native.Options{
-		Command:            splitCommand(a.opts.Command),
+		Command:            append([]string(nil), a.opts.Command...),
 		Env:                append([]string(nil), a.opts.Env...),
 		WorkDir:            a.opts.WorkDir,
 		Model:              a.opts.Model,
@@ -136,14 +138,6 @@ func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.
 		return nil, err
 	}
 	return wrapSession(session, a.opts.InjectSystemPrompt), nil
-}
-
-func splitCommand(command string) []string {
-	parts := strings.Fields(command)
-	if len(parts) == 0 {
-		return []string{"claude"}
-	}
-	return parts
 }
 
 // envSlice renders a config env map as the K=V slice the native process spec

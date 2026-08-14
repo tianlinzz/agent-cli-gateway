@@ -16,14 +16,17 @@ import (
 // AgentExecutionConfig is the trusted, deployment-owned configuration passed
 // from the gateway to a worker. It is never populated from request metadata.
 type AgentExecutionConfig struct {
-	Command        string
+	// Command is the agent CLI command in argv form (executable first). It is
+	// passed to exec verbatim — never through a shell or whitespace
+	// re-tokenization (O-F14). Empty means the adapter default.
+	Command        []string
 	DefaultModel   string
 	Permission     string
 	TurnTimeout    time.Duration
 	MaxConcurrency int
 	Env            map[string]string
-	// InjectSystemPrompt forwards caller-supplied system role messages into the
-	// native prompt at each turn (default false).
+	// InjectSystemPrompt forwards caller-supplied system role messages into
+	// the native prompt at each turn (default false).
 	InjectSystemPrompt bool
 }
 

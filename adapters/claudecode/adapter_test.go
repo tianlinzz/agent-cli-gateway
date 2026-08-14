@@ -29,7 +29,7 @@ func TestDescribeDeclaresClaudeCapabilities(t *testing.T) {
 func TestNewConsumesTypedConfigDirectly_OF08(t *testing.T) {
 	opts := optionsFromConfig(runtime.AdapterConfig{
 		Execution: runtime.AgentExecutionConfig{
-			Command:            "/opt/tools/claude",
+			Command:            []string{"/opt/tools/claude"},
 			DefaultModel:       "sonnet",
 			Permission:         "deny",
 			Env:                map[string]string{"B": "2", "A": "1"},
@@ -37,7 +37,7 @@ func TestNewConsumesTypedConfigDirectly_OF08(t *testing.T) {
 		},
 		WorkspaceDir: "/ws",
 	})
-	if opts.Command != "/opt/tools/claude" || opts.Model != "sonnet" || opts.Permission != "deny" || !opts.InjectSystemPrompt {
+	if !slicesEqual(opts.Command, []string{"/opt/tools/claude"}) || opts.Model != "sonnet" || opts.Permission != "deny" || !opts.InjectSystemPrompt {
 		t.Fatalf("options = %#v", opts)
 	}
 	if opts.WorkDir != "/ws" {
@@ -48,10 +48,25 @@ func TestNewConsumesTypedConfigDirectly_OF08(t *testing.T) {
 	}
 }
 
+// TestStartPassesArgvVerbatim_OF14 pins the argv contract: a configured
+// command flows to the native launcher verbatim — a path containing spaces
+// stays a single token and is never re-tokenized by whitespace.
+func TestStartPassesArgvVerbatim_OF14(t *testing.T) {
+	capture := &captureStarter{session: newFakeNativeSession()}
+	adapter := newAdapter(Options{Command: []string{"/opt/agent tools/claude", "--quiet"}}, capture.Start)
+	if _, err := adapter.Start(context.Background(), runtime.StartRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/opt/agent tools/claude", "--quiet"}
+	if !slicesEqual(capture.options.Command, want) {
+		t.Fatalf("command = %#v, want %#v (argv must flow verbatim)", capture.options.Command, want)
+	}
+}
+
 func TestStartMapsTrustedOptionsAndNativeResumeID(t *testing.T) {
 	capture := &captureStarter{session: newFakeNativeSession()}
 	adapter := newAdapter(Options{
-		Command: "claude --debug",
+		Command: []string{"claude", "--debug"},
 		WorkDir: "/workspace",
 		Model:   "haiku",
 		Mode:    "acceptEdits",
@@ -187,3 +202,15 @@ func (s *fakeNativeSession) Close(context.Context) error {
 	return nil
 }
 func (s *fakeNativeSession) NativeSessionID() string { return "native-1" }
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

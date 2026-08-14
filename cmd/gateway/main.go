@@ -42,7 +42,7 @@ func agentExecutionConfigs(in map[string]config.AgentConfig) map[string]runtime.
 		for k, v := range c.Env {
 			env[k] = v
 		}
-		out[name] = runtime.AgentExecutionConfig{Command: c.Command, DefaultModel: c.DefaultModel,
+		out[name] = runtime.AgentExecutionConfig{Command: c.Command.Argv(), DefaultModel: c.DefaultModel,
 			Permission: c.Permission, TurnTimeout: c.Timeout, MaxConcurrency: c.MaxConcurrency, Env: env,
 			InjectSystemPrompt: c.InjectSystemPrompt}
 	}
@@ -57,14 +57,15 @@ func agentModels(in map[string]config.AgentConfig) map[string][]string {
 	return out
 }
 
-// agentCommands extracts each agent's configured CLI command so model
-// discovery can probe availability (exec.LookPath) before advertising it.
-// A non-nil map puts the catalog in probe mode: enabled agents with an empty
-// or unresolvable command are hidden from /v1/models.
-func agentCommands(in map[string]config.AgentConfig) map[string]string {
-	out := make(map[string]string, len(in))
+// agentCommands extracts each agent's configured CLI command (argv form) so
+// model discovery can probe availability (exec.LookPath on the executable)
+// before advertising it. A non-nil map puts the catalog in probe mode:
+// enabled agents with an empty or unresolvable command are hidden from
+// /v1/models.
+func agentCommands(in map[string]config.AgentConfig) map[string][]string {
+	out := make(map[string][]string, len(in))
 	for name, c := range in {
-		out[name] = c.Command
+		out[name] = c.Command.Argv()
 	}
 	return out
 }

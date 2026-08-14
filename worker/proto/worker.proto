@@ -67,14 +67,19 @@ message StartSessionRequest {
   string provider_model = 8;
 }
 
+// AgentExecutionConfig carries the trusted per-agent deployment config. The
+// command is an argv array executed verbatim (never a shell string); field 1
+// held the deprecated single-string form removed by O-F14.
 message AgentExecutionConfig {
-  string command = 1;
+  reserved 1;
+  reserved "command";
   string default_model = 2;
   string permission = 3;
   int64 turn_timeout_nanos = 4;
   int32 max_concurrency = 5;
   map<string, string> env = 6;
   bool inject_system_prompt = 7;
+  repeated string command_argv = 8;
 }
 
 message StartSessionResponse {

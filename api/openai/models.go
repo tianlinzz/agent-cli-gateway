@@ -53,11 +53,12 @@ type modelCatalog struct {
 	reg     *runtime.Registry
 	enabled func(name string) bool
 	models  map[string][]string
-	// commands maps adapter id -> configured CLI command. A nil map disables
-	// availability probing (tests and defaults advertise on Describe success
-	// alone); a non-nil map probes each enabled adapter via exec.LookPath so
-	// /v1/models never advertises a CLI that is not installed.
-	commands map[string]string
+	// commands maps adapter id -> configured CLI command in argv form. A nil
+	// map disables availability probing (tests and defaults advertise on
+	// Describe success alone); a non-nil map probes each enabled adapter's
+	// executable (argv[0]) via exec.LookPath so /v1/models never advertises a
+	// CLI that is not installed.
+	commands map[string][]string
 
 	mu     sync.Mutex
 	snap   catalogSnapshot
@@ -185,15 +186,18 @@ func (c *modelCatalog) commandAvailable(name string) bool {
 	if c.commands == nil {
 		return true
 	}
-	cmd := strings.TrimSpace(c.commands[name])
-	if cmd == "" {
+	argv := c.commands[name]
+	if len(argv) == 0 {
 		slog.Warn("openai: hiding enabled agent without a configured command", "adapter", name)
 		return false
 	}
-	// The configured command may carry argv (see the splitCommand adapters);
-	// probe only the executable's first token. Absolute paths and bare names
-	// are both handled by LookPath.
-	exe := strings.Fields(cmd)[0]
+	// Probe only the executable (argv[0]). Absolute paths and bare names are
+	// both handled by LookPath.
+	exe := strings.TrimSpace(argv[0])
+	if exe == "" {
+		slog.Warn("openai: hiding enabled agent without a configured command", "adapter", name)
+		return false
+	}
 	if _, err := exec.LookPath(exe); err != nil {
 		slog.Warn("openai: hiding agent whose CLI is not installed", "adapter", name, "command", exe, "error", err)
 		return false

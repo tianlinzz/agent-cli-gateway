@@ -67,12 +67,13 @@ type Options struct {
 	Enabled func(name string) bool
 	Models  map[string][]string
 
-	// Commands maps adapter id -> configured CLI command. When nil, model
-	// discovery advertises an enabled adapter on Describe success alone. When
-	// non-nil (the production gateway always sets it), an enabled adapter is
-	// probed via exec.LookPath and only advertised if its command resolves, so
-	// /v1/models never exposes a CLI that is not installed.
-	Commands map[string]string
+	// Commands maps adapter id -> configured CLI command in argv form. When
+	// nil, model discovery advertises an enabled adapter on Describe success
+	// alone. When non-nil (the production gateway always sets it), an enabled
+	// adapter is probed via exec.LookPath on the executable (argv[0]) and only
+	// advertised if it resolves, so /v1/models never exposes a CLI that is not
+	// installed.
+	Commands map[string][]string
 
 	// TurnTimeout bounds a single turn. Zero means no hard API-side bound
 	// (the adapter/worker own their timeouts). NewHandler defaults this to a

@@ -235,15 +235,18 @@ func (x *StartSessionRequest) GetProviderModel() string {
 	return ""
 }
 
+// AgentExecutionConfig carries the trusted per-agent deployment config. The
+// command is an argv array executed verbatim (never a shell string); field 1
+// held the deprecated single-string form removed by O-F14.
 type AgentExecutionConfig struct {
 	state              protoimpl.MessageState `protogen:"open.v1"`
-	Command            string                 `protobuf:"bytes,1,opt,name=command,proto3" json:"command,omitempty"`
 	DefaultModel       string                 `protobuf:"bytes,2,opt,name=default_model,json=defaultModel,proto3" json:"default_model,omitempty"`
 	Permission         string                 `protobuf:"bytes,3,opt,name=permission,proto3" json:"permission,omitempty"`
 	TurnTimeoutNanos   int64                  `protobuf:"varint,4,opt,name=turn_timeout_nanos,json=turnTimeoutNanos,proto3" json:"turn_timeout_nanos,omitempty"`
 	MaxConcurrency     int32                  `protobuf:"varint,5,opt,name=max_concurrency,json=maxConcurrency,proto3" json:"max_concurrency,omitempty"`
 	Env                map[string]string      `protobuf:"bytes,6,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	InjectSystemPrompt bool                   `protobuf:"varint,7,opt,name=inject_system_prompt,json=injectSystemPrompt,proto3" json:"inject_system_prompt,omitempty"`
+	CommandArgv        []string               `protobuf:"bytes,8,rep,name=command_argv,json=commandArgv,proto3" json:"command_argv,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -276,13 +279,6 @@ func (x *AgentExecutionConfig) ProtoReflect() protoreflect.Message {
 // Deprecated: Use AgentExecutionConfig.ProtoReflect.Descriptor instead.
 func (*AgentExecutionConfig) Descriptor() ([]byte, []int) {
 	return file_worker_proto_worker_proto_rawDescGZIP(), []int{3}
-}
-
-func (x *AgentExecutionConfig) GetCommand() string {
-	if x != nil {
-		return x.Command
-	}
-	return ""
 }
 
 func (x *AgentExecutionConfig) GetDefaultModel() string {
@@ -325,6 +321,13 @@ func (x *AgentExecutionConfig) GetInjectSystemPrompt() bool {
 		return x.InjectSystemPrompt
 	}
 	return false
+}
+
+func (x *AgentExecutionConfig) GetCommandArgv() []string {
+	if x != nil {
+		return x.CommandArgv
+	}
+	return nil
 }
 
 type StartSessionResponse struct {
@@ -1258,9 +1261,8 @@ const file_worker_proto_worker_proto_rawDesc = "" +
 	"\x0eprovider_model\x18\b \x01(\tR\rproviderModel\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xf7\x02\n" +
-	"\x14AgentExecutionConfig\x12\x18\n" +
-	"\acommand\x18\x01 \x01(\tR\acommand\x12#\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x8f\x03\n" +
+	"\x14AgentExecutionConfig\x12#\n" +
 	"\rdefault_model\x18\x02 \x01(\tR\fdefaultModel\x12\x1e\n" +
 	"\n" +
 	"permission\x18\x03 \x01(\tR\n" +
@@ -1268,10 +1270,11 @@ const file_worker_proto_worker_proto_rawDesc = "" +
 	"\x12turn_timeout_nanos\x18\x04 \x01(\x03R\x10turnTimeoutNanos\x12'\n" +
 	"\x0fmax_concurrency\x18\x05 \x01(\x05R\x0emaxConcurrency\x12?\n" +
 	"\x03env\x18\x06 \x03(\v2-.gateway.worker.AgentExecutionConfig.EnvEntryR\x03env\x120\n" +
-	"\x14inject_system_prompt\x18\a \x01(\bR\x12injectSystemPrompt\x1a6\n" +
+	"\x14inject_system_prompt\x18\a \x01(\bR\x12injectSystemPrompt\x12!\n" +
+	"\fcommand_argv\x18\b \x03(\tR\vcommandArgv\x1a6\n" +
 	"\bEnvEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"=\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x01\x10\x02R\acommand\"=\n" +
 	"\x14StartSessionResponse\x12%\n" +
 	"\x0elifecycle_mode\x18\x01 \x01(\tR\rlifecycleMode\"^\n" +
 	"\x10SendInputRequest\x12\x1d\n" +

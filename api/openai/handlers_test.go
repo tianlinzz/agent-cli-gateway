@@ -670,10 +670,11 @@ func TestModels_CommandProbeHidesUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	ts, _, _ := newTestServer(t, func(o *Options) {
-		o.Commands = map[string]string{
-			"codex":  exe,                         // resolves -> advertised
-			"zeta":   "/definitely/not/installed", // missing -> hidden
-			"broken": exe,                         // resolves but Describe fails -> hidden
+		o.Commands = map[string][]string{
+			"codex":  {exe},                         // resolves -> advertised
+			"zeta":   {"/definitely/not/installed"}, // missing -> hidden
+			"broken": {exe},                         // resolves but Describe fails -> hidden
+			"argv":   {exe, "--flag", "with space"}, // argv form; only argv[0] probed
 		}
 	})
 	resp := doAuthJSON(t, "GET", ts.URL+"/v1/models", testToken, testOwner, nil)
@@ -696,7 +697,7 @@ func TestModels_CommandProbeHidesUnavailable(t *testing.T) {
 // rather than advertised as usable.
 func TestModels_EnabledWithoutCommandHidden(t *testing.T) {
 	ts, _, _ := newTestServer(t, func(o *Options) {
-		o.Commands = map[string]string{"codex": ""}
+		o.Commands = map[string][]string{"codex": nil}
 	})
 	resp := doAuthJSON(t, "GET", ts.URL+"/v1/models", testToken, testOwner, nil)
 	var ml struct {

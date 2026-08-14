@@ -13,7 +13,9 @@ import (
 func init() { _ = runtime.Register("codex", New) }
 
 type Options struct {
-	Command         string
+	// Command is the CLI command in argv form (executable first), passed to
+	// exec verbatim — never through a shell or whitespace re-tokenization.
+	Command         []string
 	Env             []string
 	WorkDir         string
 	CodexHome       string
@@ -74,8 +76,8 @@ func startNative(ctx context.Context, options native.Options) (nativeSession, er
 }
 
 func newAdapter(opts Options, start starter) *Adapter {
-	if strings.TrimSpace(opts.Command) == "" {
-		opts.Command = "codex"
+	if len(opts.Command) == 0 {
+		opts.Command = []string{"codex"}
 	}
 	if strings.TrimSpace(opts.WorkDir) == "" {
 		opts.WorkDir = "/workspace"
@@ -109,7 +111,7 @@ func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.
 		start = startNative
 	}
 	nativeSession, err := start(ctx, native.Options{
-		Command: splitCommand(a.opts.Command), Env: env, WorkDir: a.opts.WorkDir,
+		Command: append([]string(nil), a.opts.Command...), Env: env, WorkDir: a.opts.WorkDir,
 		Model: a.opts.Model, ReasoningEffort: a.opts.ReasoningEffort, Mode: a.opts.Mode, Permission: a.opts.Permission,
 		ResumeID: resumeID, SystemPrompt: a.opts.SystemPrompt, AppendSystemPrompt: a.opts.AppendPrompt,
 	})
@@ -117,14 +119,6 @@ func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.
 		return nil, err
 	}
 	return wrapSession(nativeSession, a.opts.InjectSystemPrompt), nil
-}
-
-func splitCommand(command string) []string {
-	parts := strings.Fields(command)
-	if len(parts) == 0 {
-		return []string{"codex"}
-	}
-	return parts
 }
 
 // envSlice renders a config env map as the K=V slice the native process spec

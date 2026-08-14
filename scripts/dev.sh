@@ -80,19 +80,19 @@ policy = "$SECCOMP"
 
 [agents.codex]
 enabled = $CODEX_ENABLED
-command = "$(toml_quote "$CODEX_COMMAND")"
+command = ["$(toml_quote "$CODEX_COMMAND")"]
 permission = "auto"
 
 [agents.claude-code]
 enabled = $CLAUDE_ENABLED
-command = "$(toml_quote "$CLAUDE_COMMAND")"
+command = ["$(toml_quote "$CLAUDE_COMMAND")"]
 permission = "auto"
 default_model = "sonnet"
 models = ["sonnet", "opus", "haiku"]
 
 [agents.kimi]
 enabled = $KIMI_ENABLED
-command = "$(toml_quote "$KIMI_COMMAND")"
+command = ["$(toml_quote "$KIMI_COMMAND")"]
 permission = "auto"
 timeout = "30m"
 models = ["kimi-k3", "deepseek-v4-flash"]

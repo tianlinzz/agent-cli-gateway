@@ -279,9 +279,11 @@ type AgentConfig struct {
 	// Enabled toggles whether the agent is available. Defaults to enabled for
 	// the three first-generation agents.
 	Enabled bool `toml:"enabled"`
-	// Command is the agent CLI executable. Empty means the adapter resolves
-	// its own binary.
-	Command string `toml:"command"`
+	// Command is the agent CLI command in argv form. Empty means the adapter
+	// resolves its own binary. The canonical form is an argv array
+	// (`command = ["/opt/tools/codex", "--flag"]`); a single string is still
+	// accepted for one deprecation window (O-F14).
+	Command CommandSpec `toml:"command"`
 	// DefaultModel is the LLM used when the request does not pin one. Empty
 	// means the adapter default.
 	DefaultModel string `toml:"default_model"`
@@ -400,6 +402,11 @@ func LoadGateway(path string) (*GatewayConfig, error) {
 	cfg.normalize()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
+	}
+	for name, agent := range cfg.Agents {
+		if agent.Command.IsLegacyString() {
+			warnLegacyCommand(name, agent.Command)
+		}
 	}
 	return &cfg, nil
 }

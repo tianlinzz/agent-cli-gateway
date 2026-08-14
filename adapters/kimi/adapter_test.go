@@ -30,7 +30,7 @@ func TestDescribeDeclaresPersistentProcess(t *testing.T) {
 func TestNewConsumesTypedConfigDirectly_OF08(t *testing.T) {
 	opts := optionsFromConfig(runtime.AdapterConfig{
 		Execution: runtime.AgentExecutionConfig{
-			Command:            "/opt/tools/kimi",
+			Command:            []string{"/opt/tools/kimi"},
 			DefaultModel:       "kimi-k3",
 			Permission:         "deny",
 			TurnTimeout:        90 * time.Second,
@@ -39,7 +39,7 @@ func TestNewConsumesTypedConfigDirectly_OF08(t *testing.T) {
 		},
 		WorkspaceDir: "/ws",
 	})
-	if opts.Command != "/opt/tools/kimi" || opts.Model != "kimi-k3" || opts.Permission != "deny" || opts.Timeout != 90*time.Second || !opts.InjectSystemPrompt {
+	if !slicesEqual(opts.Command, []string{"/opt/tools/kimi"}) || opts.Model != "kimi-k3" || opts.Permission != "deny" || opts.Timeout != 90*time.Second || !opts.InjectSystemPrompt {
 		t.Fatalf("options = %#v", opts)
 	}
 	if opts.WorkDir != "/ws" {
@@ -50,10 +50,25 @@ func TestNewConsumesTypedConfigDirectly_OF08(t *testing.T) {
 	}
 }
 
+// TestStartPassesArgvVerbatim_OF14 pins the argv contract: a configured
+// command flows to the native launcher verbatim — a path containing spaces
+// stays a single token and is never re-tokenized by whitespace.
+func TestStartPassesArgvVerbatim_OF14(t *testing.T) {
+	capture := &captureStarter{session: newFakeSession("native-1")}
+	adapter := newAdapter(Options{Command: []string{"/opt/agent tools/kimi", "--quiet"}}, capture.Start)
+	if _, err := adapter.Start(context.Background(), runtime.StartRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/opt/agent tools/kimi", "--quiet"}
+	if !slicesEqual(capture.options.Command, want) {
+		t.Fatalf("command = %#v, want %#v (argv must flow verbatim)", capture.options.Command, want)
+	}
+}
+
 func TestAdapterMapsTrustedOptions(t *testing.T) {
 	capture := &captureStarter{session: newFakeSession("native-1")}
 	adapter := newAdapter(Options{
-		Command:    "kimi --debug",
+		Command:    []string{"kimi", "--debug"},
 		Env:        []string{"KIMI_API_KEY=secret"},
 		WorkDir:    "/workspace",
 		Model:      "kimi-k2",
@@ -205,3 +220,15 @@ func (s *fakeSession) Events() <-chan native.Event                      { return
 func (s *fakeSession) Abort(context.Context) error                      { s.aborts++; return nil }
 func (s *fakeSession) Close(context.Context) error                      { s.closes++; return nil }
 func (s *fakeSession) NativeSessionID() string                          { return s.id }
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
