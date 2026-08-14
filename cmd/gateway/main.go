@@ -22,6 +22,7 @@ import (
 
 	"github.com/tianlinzz/agent-cli-gateway/api/openai"
 	"github.com/tianlinzz/agent-cli-gateway/config"
+	"github.com/tianlinzz/agent-cli-gateway/metrics"
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
 	"github.com/tianlinzz/agent-cli-gateway/worker"
 )
@@ -148,6 +149,16 @@ func main() {
 			callerTokens[token] = caller.ID
 		}
 	}
+
+	// Configure structured JSON logging so every run/session/correlation field
+	// is machine-parseable. The handler receives its own logger reference.
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
+	metricsReg := metrics.NewRegistry()
+
 	handler := openai.NewHandler(openai.Options{
 		Registry:         reg,
 		Store:            runtime.NewMemorySessionStore(),
@@ -155,6 +166,9 @@ func main() {
 		CallerTokens:     callerTokens,
 		SessionRecordTTL: cfg.Sessions.RecordTTL,
 		PruneInterval:    cfg.Sessions.ReapInterval,
+		Runs:             runtime.NewMemoryRunStore(),
+		Logger:           logger,
+		Metrics:          metricsReg,
 		Enabled: func(name string) bool {
 			agent, ok := cfg.Agents[name]
 			return !ok || agent.Enabled

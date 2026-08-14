@@ -19,6 +19,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/tianlinzz/agent-cli-gateway/metrics"
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
 )
 
@@ -2269,4 +2270,199 @@ func jsonReader(t *testing.T, v any) io.Reader {
 		t.Fatal(err)
 	}
 	return bytes.NewReader(b)
+}
+
+// ---------------------------------------------------------------------------
+// O-F11: Run identity, X-Gateway-Run-Id header, RunStatus mapping, metrics
+// ---------------------------------------------------------------------------
+
+func TestChatCompletions_RunIDHeader_NonStream_OF11(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(
+			runtime.Event{Type: runtime.EventText, Text: "hi"},
+			runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"},
+		)
+	})
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", false, defaultMessages()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	runID := resp.Header.Get("X-Gateway-Run-Id")
+	if !strings.HasPrefix(runID, "run-") {
+		t.Fatalf("X-Gateway-Run-Id = %q, want run- prefix", runID)
+	}
+	sessID := resp.Header.Get("X-Gateway-Session-Id")
+	if !strings.HasPrefix(sessID, "sess-") {
+		t.Fatalf("X-Gateway-Session-Id = %q, want sess- prefix", sessID)
+	}
+}
+
+func TestChatCompletions_RunIDHeader_Stream_OF11(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(
+			runtime.Event{Type: runtime.EventText, Text: "hi"},
+			runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"},
+		)
+	})
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", true, defaultMessages()))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	runID := resp.Header.Get("X-Gateway-Run-Id")
+	if !strings.HasPrefix(runID, "run-") {
+		t.Fatalf("X-Gateway-Run-Id = %q on streaming response, want run- prefix", runID)
+	}
+}
+
+func TestChatCompletions_RunRecordSucceeded_OF11(t *testing.T) {
+	ts, h, backend := newTestServer(t)
+	backend.withScript(func(fh *fakeHandle) {
+		fh.emit(
+			runtime.Event{Type: runtime.EventText, Text: "ok"},
+			runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"},
+		)
+	})
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", false, defaultMessages()))
+	runID := resp.Header.Get("X-Gateway-Run-Id")
+	rec, err := h.runs.Get(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("Get run: %v", err)
+	}
+	if rec.Status != runtime.RunSucceeded {
+		t.Errorf("status = %q, want succeeded", rec.Status)
+	}
+	if rec.ModelID != "codex" {
+		t.Errorf("model = %q, want codex", rec.ModelID)
+	}
+}
+
+func TestChatCompletions_RunRecordFailed_OF11(t *testing.T) {
+	ts, h, backend := newTestServer(t)
+	backend.withScript(func(fh *fakeHandle) {
+		fh.emit(runtime.Event{Type: runtime.EventError, Error: "boom"})
+	})
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", false, defaultMessages()))
+	runID := resp.Header.Get("X-Gateway-Run-Id")
+	rec, _ := h.runs.Get(context.Background(), runID)
+	if rec.Status != runtime.RunFailed {
+		t.Errorf("status = %q, want failed", rec.Status)
+	}
+}
+
+func TestChatCompletions_MetricsRecorded_OF11(t *testing.T) {
+	reg := metrics.NewRegistry()
+	ts, _, backend := newTestServer(t, func(o *Options) { o.Metrics = reg })
+	backend.withScript(func(fh *fakeHandle) {
+		fh.emit(
+			runtime.Event{Type: runtime.EventText, Text: "hi"},
+			runtime.Event{Type: runtime.EventUsage, Usage: &runtime.Usage{InputTokens: 5, OutputTokens: 3}},
+			runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"},
+		)
+	})
+	doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", false, defaultMessages()))
+
+	var sb strings.Builder
+	if err := reg.WritePrometheus(&sb); err != nil {
+		t.Fatal(err)
+	}
+	out := sb.String()
+	if !strings.Contains(out, "gateway_runs_total") {
+		t.Errorf("metrics missing gateway_runs_total:\n%s", out)
+	}
+	if !strings.Contains(out, `status="succeeded"`) {
+		t.Errorf("metrics missing succeeded status label:\n%s", out)
+	}
+	if !strings.Contains(out, "gateway_run_duration_seconds") {
+		t.Errorf("metrics missing histogram:\n%s", out)
+	}
+	if !strings.Contains(out, "gateway_agent_tokens_total") {
+		t.Errorf("metrics missing token counter:\n%s", out)
+	}
+}
+
+func TestChatCompletions_RunIDUniquePerRequest_OF11(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(fh *fakeHandle) {
+		fh.emit(runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"})
+	})
+	resp1 := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", false, defaultMessages()))
+	resp2 := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner,
+		chatReq("codex", false, defaultMessages()))
+	run1 := resp1.Header.Get("X-Gateway-Run-Id")
+	run2 := resp2.Header.Get("X-Gateway-Run-Id")
+	if run1 == run2 {
+		t.Fatalf("two requests got the same run id: %q", run1)
+	}
+}
+
+func TestChatCompletions_RunIDNotInClientMetadata_OF11(t *testing.T) {
+	ts, _, backend := newTestServer(t)
+	backend.withScript(func(fh *fakeHandle) {
+		fh.emit(runtime.Event{Type: runtime.EventFinish, FinishReason: "end_turn"})
+	})
+	// Client tries to inject a run_id via metadata.
+	body := chatReq("codex", false, defaultMessages())
+	meta := body["metadata"].(map[string]any)
+	meta["run_id"] = "run-client-injected"
+	meta["X-Gateway-Run-Id"] = "run-client-injected"
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, body)
+	runID := resp.Header.Get("X-Gateway-Run-Id")
+	if runID == "run-client-injected" {
+		t.Fatal("client was able to override the server-owned run id")
+	}
+	if !strings.HasPrefix(runID, "run-") {
+		t.Fatalf("server-generated run id = %q, want run- prefix", runID)
+	}
+}
+
+func TestParseTraceparent_OF11(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"empty", "", ""},
+		{"valid", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01", "0af7651916cd43dd8448eb211c80319c"},
+		{"all-zero trace", "00-00000000000000000000000000000000-b7ad6b7169203331-01", ""},
+		{"too few parts", "00-abc", ""},
+		{"short trace id", "00-abc-b7ad6b7169203331-01", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseTraceparent(tc.input)
+			if got != tc.want {
+				t.Errorf("parseTraceparent(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRunStatusFromTurnResult_OF11(t *testing.T) {
+	tests := []struct {
+		name string
+		res  turnResult
+		want runtime.RunStatus
+	}{
+		{"succeeded", turnResult{finished: true}, runtime.RunSucceeded},
+		{"failed", turnResult{failed: true}, runtime.RunFailed},
+		{"timed out", turnResult{timedOut: true}, runtime.RunTimedOut},
+		{"aborted", turnResult{aborted: true}, runtime.RunCancelled},
+		{"outcome unknown", turnResult{}, runtime.RunOutcomeUnknown},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := runStatusFromTurnResult(tc.res)
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
 }

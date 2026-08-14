@@ -19,6 +19,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -57,6 +58,9 @@ type Options struct {
 	// WorkspaceHeader is the request header carrying the opaque workspace id.
 	// Default "X-Workspace-Id".
 	WorkspaceHeader string
+	// RunHeader is the response header carrying the gateway run id for one
+	// Agent turn. Default "X-Gateway-Run-Id".
+	RunHeader string
 
 	// Enabled reports whether a model/agent id is enabled by configuration.
 	// When nil every registered adapter is enabled.
@@ -92,6 +96,16 @@ type Options struct {
 
 	// Now returns the current time (injectable for deterministic tests).
 	Now func() time.Time
+
+	// Runs is the run metadata store for individual Agent turns. Defaults to
+	// an in-memory store.
+	Runs runtime.RunStore
+	// Logger is the structured logger for request/run lifecycle events.
+	// Defaults to slog.Default().
+	Logger *slog.Logger
+	// Metrics records gateway observability counters/gauges/histograms.
+	// Defaults to NoopMetrics.
+	Metrics runtime.Metrics
 }
 
 // Handler serves the OpenAI-compatible HTTP routes. All state is guarded for
@@ -106,6 +120,11 @@ type Handler struct {
 	callerTokens    map[string]string
 	sessionHeader   string
 	workspaceHeader string
+	runHeader       string
+
+	runs    runtime.RunStore
+	logger  *slog.Logger
+	metrics runtime.Metrics
 
 	turnTimeout time.Duration
 	usageGrace  time.Duration
@@ -281,6 +300,9 @@ func NewHandler(opts Options) *Handler {
 	if opts.WorkspaceHeader == "" {
 		opts.WorkspaceHeader = "X-Workspace-Id"
 	}
+	if opts.RunHeader == "" {
+		opts.RunHeader = "X-Gateway-Run-Id"
+	}
 	if opts.TurnTimeout <= 0 {
 		opts.TurnTimeout = 10 * time.Minute
 	}
@@ -304,6 +326,7 @@ func NewHandler(opts Options) *Handler {
 		callerTokens:    cloneStringMap(opts.CallerTokens),
 		sessionHeader:   opts.SessionHeader,
 		workspaceHeader: opts.WorkspaceHeader,
+		runHeader:       opts.RunHeader,
 		turnTimeout:     opts.TurnTimeout,
 		usageGrace:      opts.UsageGrace,
 		newID:           newRandomID,
@@ -312,6 +335,21 @@ func NewHandler(opts Options) *Handler {
 		handles:         make(map[string]runtime.ExecutionHandle),
 		turns:           make(map[string]*turnState),
 		serverToolIDs:   make(map[string]*serverToolLedger),
+	}
+	if opts.Runs != nil {
+		h.runs = opts.Runs
+	} else {
+		h.runs = runtime.NewMemoryRunStore()
+	}
+	if opts.Logger != nil {
+		h.logger = opts.Logger
+	} else {
+		h.logger = slog.Default()
+	}
+	if opts.Metrics != nil {
+		h.metrics = opts.Metrics
+	} else {
+		h.metrics = runtime.NoopMetrics{}
 	}
 	h.catalog = &modelCatalog{reg: opts.Registry, enabled: opts.Enabled, models: opts.Models, commands: opts.Commands}
 	// stop is always created so Close can signal every background goroutine
@@ -372,7 +410,29 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/models", h.handleModels)
 	mux.HandleFunc("POST /v1/chat/completions", h.handleChatCompletions)
 	mux.HandleFunc("POST /v1/sessions/{id}/abort", h.handleAbort)
+	mux.HandleFunc("GET /metrics", h.handleMetrics)
 	return h.authMiddleware(mux)
+}
+
+// prometheusExporter is an optional capability of the Metrics implementation.
+// When the configured Metrics backend implements it (e.g. *metrics.Registry),
+// the /metrics endpoint exposes Prometheus text exposition format.
+type prometheusExporter interface {
+	WritePrometheus(w io.Writer) error
+}
+
+// handleMetrics exposes Prometheus-format metrics when the configured Metrics
+// backend supports exposition. Returns 404 when metrics are disabled (NoopMetrics).
+func (h *Handler) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	exporter, ok := h.metrics.(prometheusExporter)
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	if err := exporter.WritePrometheus(w); err != nil {
+		slog.Warn("openai: write metrics", "error", err)
+	}
 }
 
 // authMiddleware enforces the bearer token on all /v1/* routes. Health probes
@@ -675,6 +735,11 @@ func newRandomID() string {
 // newSessionID returns a gateway session identifier.
 func newSessionID() string {
 	return "sess-" + newRandomID()
+}
+
+// newRunID returns a gateway run identifier for one Agent turn.
+func (h *Handler) newRunID() string {
+	return "run-" + h.newID()
 }
 
 // constantTimeEqual compares two strings in constant time (hashing first so

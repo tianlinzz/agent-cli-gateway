@@ -205,6 +205,12 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	}
 	callerID := caller.ID
 
+	// Correlation identifiers for structured logging and trace propagation.
+	// request_id is always server-generated; trace_id comes from the W3C
+	// traceparent header when the caller provides one.
+	reqID := "req-" + h.newID()
+	traceID := parseTraceparent(r.Header.Get("traceparent"))
+
 	var req ChatCompletionRequest
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err := dec.Decode(&req); err != nil {
@@ -308,6 +314,11 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	// Echo the gateway session id so the client can resume the session on a
 	// later request.
 	w.Header().Set(h.sessionHeader, sessionID)
+	// Assign a server-owned run id for this turn. The header MUST be set before
+	// the stream/non-stream branch: streamTurn calls WriteHeader before the
+	// first SSE frame.
+	runID := h.newRunID()
+	w.Header().Set(h.runHeader, runID)
 
 	// Single active turn per session (the store's BeginTurn is the arbiter).
 	err = h.store.BeginTurn(r.Context(), sessionID, callerID)
@@ -343,6 +354,18 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	turnCtx, turnCancel := context.WithCancel(r.Context())
 	ts.setCancel(turnCancel)
 
+	// Record the run for observability and status correlation.
+	runStartedAt := h.now()
+	_ = h.runs.Create(r.Context(), runtime.RunRecord{
+		ID:          runID,
+		SessionID:   sessionID,
+		CallerID:    callerID,
+		WorkspaceID: workspaceID,
+		ModelID:     route.AdapterID,
+		Status:      runtime.RunStarting,
+		StartedAt:   runStartedAt,
+	})
+
 	failed := false
 	defer func() {
 		h.clearTurn(sessionID, callerID, ts)
@@ -373,6 +396,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		handle, err = h.backend.Start(r.Context(), startReq)
 		if err != nil {
 			failed = true
+			h.finishRun(runID, route.AdapterID, reqID, traceID, runStartedAt, runtime.RunFailed, nil, "start_failed")
 			writeError(w, http.StatusInternalServerError, serverError("failed to start agent execution: "+err.Error()))
 			return
 		}
@@ -382,11 +406,16 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	// Deliver the turn. A Send failure on a handle whose worker/CLI died while
 	// the session was IDLE between turns is recovered here: the stale handle is
 	// dropped and a FRESH execution is started for the session. Without this, a
-	// dead handle stays in the map and every later request to the session fails
+	// dead handle stays in the map and every later request to that session fails
 	// with "failed to send turn" until the gateway restarts.
 	handle, err = h.deliverTurn(turnCtx, sessionID, handle, startReq, input)
 	if err != nil {
 		failed = true
+		status := runtime.RunFailed
+		if r.Context().Err() != nil {
+			status = runtime.RunCancelled
+		}
+		h.finishRun(runID, route.AdapterID, reqID, traceID, runStartedAt, status, nil, "send_failed")
 		if r.Context().Err() != nil {
 			return // the client is gone; nothing to write
 		}
@@ -396,11 +425,13 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 	if req.Stream {
 		includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
-		h.streamTurn(w, r, turnCtx, req.Model, sessionID, callerID, handle, includeUsage)
+		status := h.streamTurn(w, r, turnCtx, req.Model, sessionID, callerID, handle, includeUsage)
+		h.finishRun(runID, route.AdapterID, reqID, traceID, runStartedAt, status, nil, "")
 		return
 	}
 	res := h.aggregateTurn(turnCtx, sessionID, callerID, handle)
 	h.writeCompletion(w, r, req.Model, res)
+	h.finishRun(runID, route.AdapterID, reqID, traceID, runStartedAt, runStatusFromTurnResult(res), res.usage, "")
 }
 
 // closedHandle is the optional capability an ExecutionHandle implements to
@@ -567,6 +598,7 @@ type turnResult struct {
 	errMsg       string
 	timedOut     bool
 	aborted      bool
+	finished     bool // true when EventFinish was received (distinguishes outcome_unknown)
 }
 
 // aggregateTurn consumes canonical events until the turn ends (EventFinish,
@@ -640,6 +672,7 @@ func (h *Handler) aggregateTurn(ctx context.Context, sessionID, callerID string,
 				}
 				res.finishReason = ev.FinishReason
 				finishSeen = true
+				res.finished = true
 				// Usage may arrive right after the finish marker; drain briefly.
 				if graceTimer != nil {
 					graceTimer.Stop()
@@ -658,6 +691,95 @@ func (h *Handler) aggregateTurn(ctx context.Context, sessionID, callerID string,
 			return res
 		}
 	}
+}
+
+// runStatusFromTurnResult maps the non-streaming turn outcome to a RunStatus.
+// The events-closed-without-finish case is RunOutcomeUnknown, not RunSucceeded.
+func runStatusFromTurnResult(res turnResult) runtime.RunStatus {
+	switch {
+	case res.failed:
+		return runtime.RunFailed
+	case res.timedOut:
+		return runtime.RunTimedOut
+	case res.aborted:
+		return runtime.RunCancelled
+	case !res.finished:
+		return runtime.RunOutcomeUnknown
+	default:
+		return runtime.RunSucceeded
+	}
+}
+
+// finishRun records the terminal run status, usage, and duration in the run
+// store and metrics. It is safe to call on any terminal path.
+func (h *Handler) finishRun(runID, adapterID, reqID, traceID string, startedAt time.Time, status runtime.RunStatus, usage *usageInfo, errorCode string) {
+	now := h.now()
+	duration := now.Sub(startedAt).Seconds()
+
+	_, _ = h.runs.Update(context.Background(), runID, func(r *runtime.RunRecord) {
+		r.Status = status
+		r.FinishedAt = now
+		r.ErrorCode = errorCode
+		if usage != nil {
+			r.Usage = runtime.Usage{
+				InputTokens:  usage.PromptTokens,
+				OutputTokens: usage.CompletionTokens,
+				TotalTokens:  usage.TotalTokens,
+			}
+		}
+	})
+
+	labels := map[string]string{"status": string(status), "adapter": adapterID}
+	h.metrics.IncCounter("gateway_runs_total", 1, labels)
+	h.metrics.ObserveHistogram("gateway_run_duration_seconds", duration, labels)
+	if status == runtime.RunOutcomeUnknown {
+		h.metrics.IncCounter("gateway_unknown_outcomes_total", 1, map[string]string{"adapter": adapterID})
+	}
+	if usage != nil {
+		dirLabels := map[string]string{"adapter": adapterID}
+		h.metrics.IncCounter("gateway_agent_tokens_total", int64(usage.PromptTokens), withLabel(dirLabels, "direction", "input"))
+		h.metrics.IncCounter("gateway_agent_tokens_total", int64(usage.CompletionTokens), withLabel(dirLabels, "direction", "output"))
+	}
+
+	h.logger.Info("openai: run finished",
+		"run_id", runID,
+		"request_id", reqID,
+		"trace_id", traceID,
+		"adapter", adapterID,
+		"status", status,
+		"duration_ms", duration*1000,
+		"error_code", errorCode,
+	)
+}
+
+// withLabel returns a copy of labels with the given key-value added.
+func withLabel(labels map[string]string, key, value string) map[string]string {
+	result := make(map[string]string, len(labels)+1)
+	for k, v := range labels {
+		result[k] = v
+	}
+	result[key] = value
+	return result
+}
+
+// parseTraceparent extracts the trace id from a W3C traceparent header value.
+// Format: version-trace_id-parent_id-trace_flags (e.g.
+// "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"). Returns the
+// empty string when the header is absent or malformed.
+func parseTraceparent(tp string) string {
+	if tp == "" {
+		return ""
+	}
+	parts := strings.Split(tp, "-")
+	if len(parts) < 4 {
+		return ""
+	}
+	// trace_id is a 32-char hex string; reject all-zero (invalid per spec).
+	tid := parts[1]
+	if len(tid) != 32 || tid == "00000000000000000000000000000000" {
+		return ""
+	}
+	return tid
 }
 
 // completionResponse is the OpenAI non-streaming chat completion body.

@@ -132,11 +132,11 @@ func (c streamChunk) withChoices(choices ...streamChoice) streamChunk {
 // "data: [DONE]" frame. Client disconnect and explicit abort cancel the turn
 // and terminate the stream. A closed events channel (execution terminated)
 // drops the dead handle so a later resume starts fresh.
-func (h *Handler) streamTurn(w http.ResponseWriter, r *http.Request, ctx context.Context, model, sessionID, callerID string, handle runtime.ExecutionHandle, includeUsage bool) {
+func (h *Handler) streamTurn(w http.ResponseWriter, r *http.Request, ctx context.Context, model, sessionID, callerID string, handle runtime.ExecutionHandle, includeUsage bool) runtime.RunStatus {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, serverError("streaming not supported by the response writer"))
-		return
+		return runtime.RunFailed
 	}
 	// Guard: unless the stream completes normally, the execution must be
 	// aborted so a dropped client or a mid-stream write failure never leaves
@@ -176,7 +176,7 @@ func (h *Handler) streamTurn(w http.ResponseWriter, r *http.Request, ctx context
 		Index: 0,
 		Delta: streamDelta{Role: "assistant"},
 	})); err != nil {
-		return
+		return runtime.RunCancelled
 	}
 
 	var (
@@ -187,6 +187,7 @@ func (h *Handler) streamTurn(w http.ResponseWriter, r *http.Request, ctx context
 		started    = make(map[string]runtime.ToolCall)
 		completed  = make(map[string]struct{})
 	)
+	runStatus := runtime.RunSucceeded
 	var grace <-chan time.Time
 	var graceTimer *time.Timer
 	defer func() {
@@ -210,8 +211,9 @@ loop:
 			h.markTurnSettling(sessionID)
 			h.abortAndDrain(context.Background(), sessionID, handle)
 			deferredAbort = false
+			runStatus = runtime.RunCancelled
 			if r.Context().Err() != nil {
-				return // the client is gone; nothing more to write
+				return runStatus // the client is gone; nothing more to write
 			}
 			// Explicit abort with the client still connected: terminate the
 			// stream gracefully.
@@ -225,6 +227,7 @@ loop:
 				if finish == "" {
 					finish = "stop"
 				}
+				runStatus = runtime.RunOutcomeUnknown
 				break loop
 			}
 			switch ev.Type {
@@ -236,7 +239,7 @@ loop:
 					Index: 0,
 					Delta: streamDelta{Content: ev.Text},
 				})); err != nil {
-					return
+					return runtime.RunCancelled
 				}
 			case runtime.EventReasoning:
 				if finishSeen || ev.Reasoning == nil || ev.Reasoning.Text == "" {
@@ -246,7 +249,7 @@ loop:
 					Index: 0,
 					Delta: streamDelta{ReasoningContent: ev.Reasoning.Text},
 				})); err != nil {
-					return
+					return runtime.RunCancelled
 				}
 			case runtime.EventToolUse:
 				// Native Agent tools are already executed. Do not emit OpenAI
@@ -283,7 +286,7 @@ loop:
 					Index: 0,
 					Delta: streamDelta{ReasoningContent: summary},
 				})); err != nil {
-					return
+					return runtime.RunCancelled
 				}
 			case runtime.EventUsage:
 				if ev.Usage != nil {
@@ -291,9 +294,10 @@ loop:
 				}
 			case runtime.EventError:
 				if err := writeSSEJSON(w, flusher, errorBody{Error: serverError(ev.Error)}); err != nil {
-					return
+					return runStatus
 				}
 				status = "error"
+				runStatus = runtime.RunFailed
 				break loop
 			case runtime.EventFinish:
 				if ev.NativeSessionID != "" {
@@ -313,6 +317,7 @@ loop:
 		case <-timeout:
 			finish = "length"
 			status = "timeout"
+			runStatus = runtime.RunTimedOut
 			h.markTurnSettling(sessionID)
 			h.abortAndDrain(context.Background(), sessionID, handle)
 			deferredAbort = false
@@ -328,14 +333,14 @@ loop:
 			Delta:        streamDelta{},
 			FinishReason: &fr,
 		})); err != nil {
-			return
+			return runStatus
 		}
 		if includeUsage && usage != nil {
 			chunk := base
 			chunk.Choices = []streamChoice{}
 			chunk.Usage = usage
 			if err := writeChunk(chunk); err != nil {
-				return
+				return runStatus
 			}
 		}
 	}
@@ -350,6 +355,7 @@ loop:
 	if _, err := fmt.Fprint(w, "data: [DONE]\n\n"); err == nil {
 		flusher.Flush()
 	}
+	return runStatus
 }
 
 // writeSSEJSON writes one "data: <json>\n\n" event.
