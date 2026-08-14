@@ -73,12 +73,12 @@ docker:
 image-base:
 	docker build -t agent-gateway:$(VERSION) .
 
-# Build the product image on top of the base image (adds Node.js + pinned CLIs).
+# Build the product image on top of the base image (adds Node.js + pinned CLIs
+# for Codex and Claude Code; Kimi is not shipped — see docker/Dockerfile.agents).
 # Override BASE_IMAGE and the per-provider version args as needed.
 image-product: image-base
 	docker build -f docker/Dockerfile.agents \
 	  --build-arg BASE_IMAGE=agent-gateway:$(VERSION) \
 	  --build-arg CODEX_VERSION=$(CODEX_VERSION) \
 	  --build-arg CLAUDE_VERSION=$(CLAUDE_VERSION) \
-	  --build-arg KIMI_VERSION=$(KIMI_VERSION) \
 	  -t agent-gateway:$(VERSION)-agents .

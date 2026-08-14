@@ -695,6 +695,7 @@ func TestIntegration_PreflightFailClosed(t *testing.T) {
 		c.Mode = config.ModeDev
 		c.Isolation = config.IsolationConfig{
 			Required:      true,
+			CloneNewPID:   true,
 			NsjailVersion: "0.12.0",
 			NsjailSource:  "https://github.com/google/nsjail",
 			BinaryPath:    filepath.Join(t.TempDir(), "nsjail-missing"),

@@ -6,79 +6,61 @@
 #
 # Validates:
 #   1. `ldd` — every shared-library dependency resolves.
-#   2. A minimal smoke jail (mode: ONCE, private mount + user + PID namespace)
-#      executes a trivial command inside the jail as an unprivileged user.
+#   2. The REAL generated profile (via `gateway -print-nsjail-profile`, which
+#      exercises worker/nsjail.Build including the arch-selected seccomp policy,
+#      the per-jail PID namespace, and the narrowed mounts) runs a minimal jail.
 #   3. Per-jail PID namespace: killing the nsjail wrapper reaps its entire
 #      process tree (the O-A3 regression — a CLI that escaped into its own
 #      process group still dies with the wrapper).
 #
 # Usage: docker/nsjail-smoke.sh   (must run inside the runtime image, or on a
-# Linux host with nsjail on PATH).
+# Linux host with nsjail + gateway on PATH).
 set -eu
 
 NSJAIL_BIN="${NSJAIL_BIN:-/usr/local/bin/nsjail}"
+GATEWAY_BIN="${GATEWAY_BIN:-/usr/local/bin/gateway}"
+
+SMOKE_DIR="$(mktemp -d)"
+trap 'rm -rf "$SMOKE_DIR"' EXIT
 
 echo "== ldd =="
 ldd "$NSJAIL_BIN"
 
-echo "== minimal smoke jail (unprivileged, private user+mount+PID ns) =="
-# nsjail -Mo: mode ONCE, one jail, exit when the command exits. The profile
-# mirrors the gateway's generated profile: unprivileged user namespace
-# (65532:65532, no CAP_SYS_ADMIN), a private PID namespace (clone_newpid), a
-# namespaced /proc, and the narrowed read-only runtime mounts.
-"$NSJAIL_BIN" -Mo --config /dev/stdin -- /bin/true <<'EOF'
-mode: ONCE;
-clone_newns: true;
-clone_newpid: true;
-clone_newipc: true;
-clone_newuts: true;
-clone_newnet: false;
-uidmap: { inside_id: "65532"; outside_id: "65532"; count: 1; };
-gidmap: { inside_id: "65532"; outside_id: "65532"; count: 1; };
-mount: { dst: "/tmp"; fstype: "tmpfs"; options: "size=64m"; rw: true; mandatory: true; };
-mount: { dst: "/proc"; fstype: "proc"; rw: false; mandatory: true; };
-mount: { src: "/bin"; dst: "/bin"; is_bind: true; rw: false; mandatory: true; };
-mount: { src: "/usr"; dst: "/usr"; is_bind: true; rw: false; mandatory: true; };
-mount: { src: "/lib"; dst: "/lib"; is_bind: true; rw: false; mandatory: true; };
-mount: { src: "/lib64"; dst: "/lib64"; is_bind: true; rw: false; mandatory: true; };
-mount: { src: "/etc/resolv.conf"; dst: "/etc/resolv.conf"; is_bind: true; rw: false; mandatory: true; };
-mount: { src: "/etc/passwd"; dst: "/etc/passwd"; is_bind: true; rw: false; mandatory: true; };
-mount: { src: "/etc/group"; dst: "/etc/group"; is_bind: true; rw: false; mandatory: true; };
-EOF
+echo "== generate the real nsjail profile =="
+# Emit the exact profile the supervisor will run (same worker/nsjail.Build,
+# arch-selected seccomp policy). This makes the smoke prove the profile loads,
+# rather than running an unrelated hand-written approximation.
+"$GATEWAY_BIN" -print-nsjail-profile smoke > "$SMOKE_DIR/profile.conf"
+grep -q 'seccomp_string: "POLICY ' "$SMOKE_DIR/profile.conf"
+grep -q 'clone_newpid: true;' "$SMOKE_DIR/profile.conf"
+grep -q 'mount: { dst: "/proc"; fstype: "proc"' "$SMOKE_DIR/profile.conf"
+
+echo "== minimal jail with the real profile =="
+"$NSJAIL_BIN" -Mo --config "$SMOKE_DIR/profile.conf" -- /bin/true
 
 echo "== PID namespace: killing the wrapper reaps the whole tree =="
-# Fork a jailed command that leaves a background sleeper running. Killing the
-# nsjail wrapper (PID 1 inside the jail) must make the kernel SIGKILL every
-# process in that namespace, including the background child.
-SMOKE_DIR="$(mktemp -d)"
-trap 'rm -rf "$SMOKE_DIR"' EXIT
-
-cat > "$SMOKE_DIR/pidns.conf" <<'EOF'
-mode: ONCE;
-clone_newns: true;
-clone_newpid: true;
-clone_newipc: true;
-clone_newuts: true;
-clone_newnet: false;
-uidmap: { inside_id: "65532"; outside_id: "65532"; count: 1; };
-gidmap: { inside_id: "65532"; outside_id: "65532"; count: 1; };
-mount: { dst: "/tmp"; fstype: "tmpfs"; options: "size=64m"; rw: true; mandatory: true; };
-mount: { dst: "/proc"; fstype: "proc"; rw: false; mandatory: true; };
-mount: { src: "/bin"; dst: "/bin"; is_bind: true; rw: false; mandatory: true; };
-mount: { src: "/usr"; dst: "/usr"; is_bind: true; rw: false; mandatory: true; };
-mount: { src: "/lib"; dst: "/lib"; is_bind: true; rw: false; mandatory: true; };
-mount: { src: "/lib64"; dst: "/lib64"; is_bind: true; rw: false; mandatory: true; };
-EOF
-
-"$NSJAIL_BIN" -Mo --config "$SMOKE_DIR/pidns.conf" -- /bin/sh -c 'sleep2891 & exec sleep2891' &
+# Run the real profile with a command that forks a background sleeper. The
+# wrapper (PID 1 inside the jail) must reap the whole tree when killed. Use
+# `sleep` with a distinctive duration so we can detect the sleeper by comm name
+# (the wrapper's own argv also mentions it, so we match `sleep` by name only).
+"$NSJAIL_BIN" -Mo --config "$SMOKE_DIR/profile.conf" -- /bin/sh -c 'sleep 2891 & exec sleep 2891' &
 WRAPPER_PID=$!
 
-# Give the wrapper a moment to spawn its PID-1 tree, then kill it.
+# Confirm the wrapper is alive and the sleeper actually spawned before killing.
 sleep 2
+if ! kill -0 "$WRAPPER_PID" 2>/dev/null; then
+  echo "FAIL: nsjail wrapper exited before the tree-kill test" >&2
+  exit 1
+fi
+if ! pgrep -x sleep >/dev/null 2>&1; then
+  echo "FAIL: background sleeper never spawned in the jail" >&2
+  exit 1
+fi
+
 kill -9 "$WRAPPER_PID" 2>/dev/null || true
 wait "$WRAPPER_PID" 2>/dev/null || true
 
-if pgrep -f 'sleep2891' >/dev/null 2>&1; then
+if pgrep -x sleep >/dev/null 2>&1; then
   echo "FAIL: a jailed process survived killing its nsjail wrapper" >&2
   exit 1
 fi

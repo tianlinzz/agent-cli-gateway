@@ -279,6 +279,26 @@ func TestGatewayConfig_SeccompOffRequiresTestProfile(t *testing.T) {
 	}
 }
 
+// TestGatewayConfig_CloneNewPIDRequiredOutsideTestProfile is a regression test
+// for the PID-namespace config hole (code-review F6): the per-jail PID
+// namespace is a security boundary, so an ordinary config must not silently
+// disable it outside the test profile.
+func TestGatewayConfig_CloneNewPIDRequiredOutsideTestProfile(t *testing.T) {
+	c := DefaultGatewayConfig()
+	c.Mode = ModeProd
+	c.Isolation.CloneNewPID = false
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "clone_newpid") {
+		t.Errorf("prod clone_newpid=false: want error mentioning clone_newpid, got %v", err)
+	}
+
+	c = DefaultGatewayConfig()
+	c.Mode = ModeTest
+	c.Isolation.CloneNewPID = false
+	if err := c.Validate(); err != nil {
+		t.Errorf("test profile may disable clone_newpid, got %v", err)
+	}
+}
+
 func TestGatewayConfig_InvalidPermissionRejected(t *testing.T) {
 	c := DefaultGatewayConfig()
 	c.Agents["codex"] = AgentConfig{Enabled: true, Permission: "always"}

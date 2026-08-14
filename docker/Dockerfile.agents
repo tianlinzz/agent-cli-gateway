@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# Product image: the deployable image that actually ships the agent CLIs.
+# Product image: the deployable image that ships the agent CLIs.
 #
 # The base image (Dockerfile) intentionally contains no agent CLIs and has every
 # agent disabled by default, so its /v1/models is empty. This product image
@@ -8,9 +8,14 @@
 # a config that sets `[agents.<id>] enabled = true` + `command`, the gateway
 # advertises and executes them.
 #
+# IMPORTANT — this image ships TWO agents: Codex and Claude Code. Kimi is NOT
+# shipped here because its published npm package name/version is not pinned in
+# this repository (see adapters/kimi/SOURCE.md). A Kimi deployment must build a
+# derived image with its own `npm install -g <kimi-cli-package>@<pin>`.
+#
 # Build (first build the base image, then this one):
 #   make image-base
-#   make image-product
+#   make image-product CODEX_VERSION=... CLAUDE_VERSION=...
 #
 # Each CLI is installed behind a build arg so deployments pin exactly the
 # versions they use and can skip a provider entirely (empty version = skip):
@@ -18,17 +23,12 @@
 #     --build-arg BASE_IMAGE=agent-gateway:dev \
 #     --build-arg CODEX_VERSION=... \
 #     --build-arg CLAUDE_VERSION=... \
-#     --build-arg KIMI_VERSION=... \
 #     -t agent-gateway:agents .
-#
-# NOTE: Kimi's published npm package name/version is deployment-specific and is
-# not pinned in this repository (see adapters/kimi/SOURCE.md). Confirm it
-# against the MoonshotAI kimi-code release before setting KIMI_VERSION.
 ARG BASE_IMAGE=agent-gateway:dev
 FROM ${BASE_IMAGE}
 
-# Node.js runtime (the three first-generation CLIs are Node packages). Bookworm
-# ships Node 18; set NODE_MAJOR to a newer LTS if the CLI pins require it.
+# Node.js runtime (the shipped CLIs are Node packages). Bookworm ships Node 18;
+# set NODE_MAJOR to a newer LTS if the CLI pins require it.
 ARG NODE_MAJOR=18
 RUN apt-get update && apt-get install -y --no-install-recommends \
         nodejs \
@@ -39,13 +39,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # An empty version arg skips that provider.
 ARG CODEX_VERSION=""
 ARG CLAUDE_VERSION=""
-ARG KIMI_VERSION=""
 RUN if [ -n "${CODEX_VERSION}" ]; then npm install -g "@openai/codex@${CODEX_VERSION}"; fi \
  && if [ -n "${CLAUDE_VERSION}" ]; then npm install -g "@anthropic-ai/claude-code@${CLAUDE_VERSION}"; fi
-# Kimi: its published npm package name is NOT pinned in this repository (see
-# adapters/kimi/SOURCE.md and Dockerfile's "<kimi-cli-package>" placeholder).
-# TODO(O-F04): resolve the MoonshotAI kimi-code package name and uncomment:
-# RUN if [ -n "${KIMI_VERSION}" ]; then npm install -g "<kimi-cli-package>@${KIMI_VERSION}"; fi
 
 # The gateway binary, worker, and nsjail are inherited from the base image; the
 # entrypoint is too. Only the config that enables the installed agents needs to

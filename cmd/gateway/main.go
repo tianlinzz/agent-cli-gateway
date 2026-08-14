@@ -25,6 +25,7 @@ import (
 	"github.com/tianlinzz/agent-cli-gateway/metrics"
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
 	"github.com/tianlinzz/agent-cli-gateway/worker"
+	"github.com/tianlinzz/agent-cli-gateway/worker/nsjail"
 )
 
 var (
@@ -75,6 +76,7 @@ func main() {
 	configPath := flag.String("config", envOrDefault("GATEWAY_CONFIG", ""), "path to the gateway TOML config (default: $GATEWAY_CONFIG or built-in defaults)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	workerExec := flag.String("worker-exec", "", "worker child executable (default: $GW_WORKER_EXEC or gateway-worker)")
+	printProfile := flag.String("print-nsjail-profile", "", "print the generated nsjail profile for a session id and exit (diagnostic used by the Linux-CI smoke)")
 	flag.Parse()
 
 	if *showVersion {
@@ -91,6 +93,33 @@ func main() {
 			os.Exit(1)
 		}
 		cfg = *loaded
+	}
+
+	// Diagnostic: emit the exact nsjail profile the supervisor will run so the
+	// Linux-CI smoke tests the REAL profile (seccomp policy, PID namespace,
+	// mounts) rather than a hand-written approximation. Uses runtime.GOARCH so
+	// the seccomp policy matches the architecture the binary runs on.
+	if *printProfile != "" {
+		ws := filepath.Join(os.TempDir(), "gw-profile-ws")
+		home := filepath.Join(os.TempDir(), "gw-profile-home")
+		sock := filepath.Join(os.TempDir(), "gw-profile-sock")
+		for _, d := range []string{ws, home, sock} {
+			if err := os.MkdirAll(d, 0o700); err != nil {
+				slog.Error("create profile dump dir", "dir", d, "error", err)
+				os.Exit(1)
+			}
+		}
+		prof, err := nsjail.Build(cfg.Isolation, nsjail.SessionLayout{
+			WorkspaceDir: ws,
+			AgentHomeDir: home,
+			SocketDir:    sock,
+		}, *printProfile)
+		if err != nil {
+			slog.Error("build nsjail profile", "error", err)
+			os.Exit(1)
+		}
+		fmt.Print(prof.Config)
+		return
 	}
 
 	// The registry is process-wide: adapter packages register into it from

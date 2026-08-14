@@ -252,8 +252,13 @@ make image-product CODEX_VERSION=... CLAUDE_VERSION=...
 ```
 
 `docker/Dockerfile.agents` layers Node.js and the pinned npm packages onto the
-base image. Mount (or let the entrypoint write) a config that enables them, e.g.
-`[agents.codex] enabled = true` + `command = "codex"`.
+base image, then mount (or let the entrypoint write) a config that enables
+them, e.g. `[agents.codex] enabled = true` + `command = "codex"`.
+
+> **The provided product image ships two agents (Codex + Claude Code).** Kimi's
+> published npm package name is not pinned in this repository, so it is not
+> installed by `docker/Dockerfile.agents`. A Kimi deployment must build its own
+> derived image (`FROM agent-gateway:…` then `RUN npm install -g <kimi-cli-package>@<pin>`).
 
 **Path B — derived image or volume.** Extend the image yourself
 (`FROM agent-gateway:…` then `RUN npm install -g …`), or bind-mount a directory

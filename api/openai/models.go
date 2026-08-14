@@ -38,6 +38,10 @@ type modelList struct {
 // removed within seconds.
 const modelCacheTTL = 30 * time.Second
 
+// probeTimeout bounds one model-catalog recompute (adapter Resolve/Describe)
+// so a slow adapter cannot wedge model discovery or chat-request validation.
+const probeTimeout = 5 * time.Second
+
 // catalogSnapshot is one computed view of the public catalog: the descriptors
 // advertised on /v1/models plus the set of adapter names considered available.
 type catalogSnapshot struct {
@@ -132,8 +136,12 @@ func (c *modelCatalog) snapshot() catalogSnapshot {
 
 // compute derives the fresh catalog: every enabled adapter that is available
 // (command probe passes when wired, Describe succeeds) is advertised, sorted by
-// public model id.
+// public model id. The Resolve/Describe step is bounded so a slow or wedged
+// adapter can never stall /v1/models or the chat-request validation path.
 func (c *modelCatalog) compute() catalogSnapshot {
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+
 	snap := catalogSnapshot{adapters: make(map[string]bool)}
 	names := c.reg.List()
 	sort.Strings(names)
@@ -144,11 +152,11 @@ func (c *modelCatalog) compute() catalogSnapshot {
 		if !c.commandAvailable(name) {
 			continue
 		}
-		adapter, err := c.reg.Resolve(context.Background(), name)
+		adapter, err := c.reg.Resolve(ctx, name)
 		if err != nil {
 			continue
 		}
-		desc, err := adapter.Describe(context.Background())
+		desc, err := adapter.Describe(ctx)
 		if err != nil {
 			continue
 		}

@@ -80,6 +80,9 @@ func newTestSupervisor(t *testing.T, mutCfg func(*Config), opts ...Option) *Supe
 	cfg.Mode = config.ModeTest
 	cfg.Isolation = config.IsolationConfig{
 		Required: false,
+		// Per-jail PID namespace is a security boundary; keep it on by default
+		// so dev/prod overrides satisfy the fail-closed validation (F6).
+		CloneNewPID: true,
 		Mounts: config.MountsConfig{
 			WorkspaceDir: "/workspace",
 			AgentHomeDir: "/agent-home",
@@ -626,6 +629,27 @@ func TestSupervisor_SeccompOffRejectedOutsideTestProfile(t *testing.T) {
 	}
 }
 
+// TestSupervisor_CloneNewPIDRequiredOutsideTestProfile is a regression test for
+// the PID-namespace config hole (code-review F6): a directly-constructed
+// Supervisor must not silently disable the per-jail PID namespace in prod/dev.
+func TestSupervisor_CloneNewPIDRequiredOutsideTestProfile(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Mode = config.ModeProd
+	cfg.WorkspaceRoot = t.TempDir()
+	cfg.RuntimeDir = testRuntimeDir(t)
+	cfg.WorkerExec = stubWorkerBin
+	cfg.Isolation = config.IsolationConfig{
+		Required:   true,
+		BinaryPath: "/usr/local/bin/nsjail",
+		Seccomp:    config.SeccompConfig{Policy: config.SeccompKafel},
+	}
+	if _, err := NewSupervisor(cfg); err == nil {
+		t.Fatal("NewSupervisor must reject clone_newpid=false in prod mode")
+	} else if !strings.Contains(err.Error(), "clone_newpid") {
+		t.Errorf("clone_newpid rejection should mention clone_newpid, got %v", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Handshake failure and reaping
 // ---------------------------------------------------------------------------
@@ -1135,7 +1159,7 @@ events:
 func TestLocalExecutionBackend_PreflightFailClosed(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Mode = config.ModeDev
-	cfg.Isolation = config.IsolationConfig{Required: true, BinaryPath: filepath.Join(t.TempDir(), "missing")}
+	cfg.Isolation = config.IsolationConfig{Required: true, BinaryPath: filepath.Join(t.TempDir(), "missing"), CloneNewPID: true}
 	cfg.WorkspaceRoot = t.TempDir()
 	cfg.RuntimeDir = testRuntimeDir(t)
 	cfg.WorkerExec = stubWorkerBin

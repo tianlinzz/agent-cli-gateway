@@ -138,6 +138,12 @@ func (c Config) validate() error {
 	default:
 		return fmt.Errorf("worker: config: isolation.seccomp.policy %q invalid (want %q or %q)", c.Isolation.Seccomp.Policy, config.SeccompKafel, config.SeccompOff)
 	}
+	// Layered fail-closed for the PID namespace (code-review follow-up F6): the
+	// per-jail PID namespace is a security boundary, so a directly-constructed
+	// Supervisor must not silently disable it outside the test profile.
+	if !c.Isolation.CloneNewPID && c.Mode != config.ModeTest {
+		return fmt.Errorf("worker: config: isolation.clone_newpid=false is only allowed in mode %q; the per-jail PID namespace is a security boundary", config.ModeTest)
+	}
 	return nil
 }
 

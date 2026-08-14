@@ -486,6 +486,14 @@ func (c *GatewayConfig) Validate() error {
 		return fmt.Errorf("config: isolation.seccomp.policy %q invalid (want %q or %q)", c.Isolation.Seccomp.Policy, SeccompKafel, SeccompOff)
 	}
 
+	// The per-jail PID namespace is a security boundary: it makes a killed
+	// nsjail wrapper reap the whole tree and hides sibling sessions'/gateway
+	// PIDs from a compromised agent. It must not be silently disabled by an
+	// ordinary config outside the test profile (code-review follow-up F6).
+	if !c.Isolation.CloneNewPID && c.Mode != ModeTest {
+		return fmt.Errorf("config: isolation.clone_newpid=false is only allowed in the test profile; the per-jail PID namespace is a security boundary")
+	}
+
 	if strings.TrimSpace(c.Workspace.Root) == "" {
 		return fmt.Errorf("config: workspace.root must not be empty")
 	}
