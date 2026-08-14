@@ -928,6 +928,19 @@ func (ws *workerSession) terminate(err error) {
 		if ws.stopping != nil {
 			close(ws.stopping)
 		}
+		// Wait for the process tree to be reaped before removing runtime
+		// directories. A still-dying worker may hold the unix socket or
+		// worker.log, racing RemoveAll and leaving stale files that cause
+		// EADDRINUSE on the next StartSession (O-B5). monitor() and
+		// closeClaimed already close reaped before reaching here, so this
+		// wait is instant on those paths; heartbeat/bridge benefit from it.
+		if ws.reaped != nil {
+			select {
+			case <-ws.reaped:
+			case <-time.After(2 * time.Second):
+				slog.Warn("worker: process not reaped before cleanup", "session", ws.req.SessionID, "pid", ws.outerPID)
+			}
+		}
 		// Snapshot client under the lock: the monitor goroutine (started before
 		// handshake) can reach here while handshake is still assigning it.
 		ws.mu.Lock()
@@ -1004,6 +1017,8 @@ dial:
 	ws.client = c
 	ws.mu.Unlock()
 
+	retry := time.NewTicker(50 * time.Millisecond)
+	defer retry.Stop()
 	var lastErr error
 	for {
 		hctx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -1024,7 +1039,7 @@ dial:
 		case <-ctx.Done():
 			ws.clearClient(c)
 			return fmt.Errorf("health handshake failed: %v (last error: %v)", ctx.Err(), lastErr)
-		case <-time.After(50 * time.Millisecond):
+		case <-retry.C:
 		}
 	}
 

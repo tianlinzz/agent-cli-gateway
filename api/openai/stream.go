@@ -188,9 +188,17 @@ func (h *Handler) streamTurn(w http.ResponseWriter, r *http.Request, ctx context
 		completed  = make(map[string]struct{})
 	)
 	var grace <-chan time.Time
+	var graceTimer *time.Timer
+	defer func() {
+		if graceTimer != nil {
+			graceTimer.Stop()
+		}
+	}()
 	var timeout <-chan time.Time
 	if h.turnTimeout > 0 {
-		timeout = time.After(h.turnTimeout)
+		t := time.NewTimer(h.turnTimeout)
+		defer t.Stop()
+		timeout = t.C
 	}
 
 loop:
@@ -294,7 +302,11 @@ loop:
 				finish = ev.FinishReason
 				finishSeen = true
 				// Usage may arrive just after the finish marker; drain briefly.
-				grace = time.After(h.usageGrace)
+				if graceTimer != nil {
+					graceTimer.Stop()
+				}
+				graceTimer = time.NewTimer(h.usageGrace)
+				grace = graceTimer.C
 			}
 		case <-grace:
 			break loop

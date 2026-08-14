@@ -602,6 +602,12 @@ func (h *Handler) abortAndDrain(ctx context.Context, sessionID string, handle ru
 	settle := time.NewTimer(abortDrainTimeout)
 	defer settle.Stop()
 	var grace <-chan time.Time
+	var graceTimer *time.Timer
+	defer func() {
+		if graceTimer != nil {
+			graceTimer.Stop()
+		}
+	}()
 	terminalDrained := false
 	var abortErr error
 	for {
@@ -616,7 +622,11 @@ func (h *Handler) abortAndDrain(ctx context.Context, sessionID string, handle ru
 				continue
 			}
 			if ev.Type == runtime.EventFinish || ev.Type == runtime.EventError {
-				grace = time.After(h.usageGrace)
+				if graceTimer != nil {
+					graceTimer.Stop()
+				}
+				graceTimer = time.NewTimer(h.usageGrace)
+				grace = graceTimer.C
 			}
 		case err := <-abortDone:
 			abortErr = err

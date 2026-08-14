@@ -947,6 +947,57 @@ func TestWorkerDonePublishesAfterDeregisterAndRuntimeCleanup(t *testing.T) {
 	}
 }
 
+// TestTerminateWaitsForReapedBeforeDirCleanup_OB5 is a regression test for
+// O-B5: terminate must wait for the process tree to be reaped before removing
+// runtime directories, preventing a race where a still-dying worker holds the
+// unix socket or worker.log.
+func TestTerminateWaitsForReapedBeforeDirCleanup_OB5(t *testing.T) {
+	sessionDir := t.TempDir()
+	socketDir := t.TempDir()
+	// Create a sentinel file to prove the directory is not removed prematurely.
+	sentinel := filepath.Join(sessionDir, "alive")
+	if err := os.WriteFile(sentinel, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	sup := &Supervisor{sessions: make(map[string]*workerSession)}
+	ws := &workerSession{
+		sup: sup, req: testRequest("ob5-wait-reaped"), ctx: ctx, cancel: cancel,
+		state: stateRunning, done: make(chan struct{}),
+		reaped:     make(chan struct{}),
+		sessionDir: sessionDir, socketDir: socketDir,
+	}
+	sup.sessions[ws.req.SessionID] = ws
+
+	go ws.terminate(errors.New("test"))
+
+	// Give terminate time to reach the reaped wait. killGroup is a no-op
+	// (pgid=0) and removeSession/releaseSlot are instant, so after a brief
+	// sleep terminate is blocked on <-ws.reaped.
+	time.Sleep(100 * time.Millisecond)
+
+	// Directories must still exist while reaped is not closed.
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("session dir removed before process was reaped: %v", err)
+	}
+
+	// Simulate the process exiting: monitor closes reaped.
+	close(ws.reaped)
+
+	select {
+	case <-ws.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("terminate did not complete after reaped was closed")
+	}
+
+	if _, err := os.Stat(sessionDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("session dir still exists after terminate: %v", err)
+	}
+	if _, err := os.Stat(socketDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("socket dir still exists after terminate: %v", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Session bookkeeping and validation
 // ---------------------------------------------------------------------------

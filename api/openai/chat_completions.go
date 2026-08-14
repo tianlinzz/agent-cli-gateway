@@ -578,9 +578,17 @@ func (h *Handler) aggregateTurn(ctx context.Context, sessionID, callerID string,
 	var res turnResult
 	finishSeen := false
 	var grace <-chan time.Time
+	var graceTimer *time.Timer
+	defer func() {
+		if graceTimer != nil {
+			graceTimer.Stop()
+		}
+	}()
 	var timeout <-chan time.Time
 	if h.turnTimeout > 0 {
-		timeout = time.After(h.turnTimeout)
+		t := time.NewTimer(h.turnTimeout)
+		defer t.Stop()
+		timeout = t.C
 	}
 	for {
 		select {
@@ -633,7 +641,11 @@ func (h *Handler) aggregateTurn(ctx context.Context, sessionID, callerID string,
 				res.finishReason = ev.FinishReason
 				finishSeen = true
 				// Usage may arrive right after the finish marker; drain briefly.
-				grace = time.After(h.usageGrace)
+				if graceTimer != nil {
+					graceTimer.Stop()
+				}
+				graceTimer = time.NewTimer(h.usageGrace)
+				grace = graceTimer.C
 			}
 		case <-grace:
 			return res

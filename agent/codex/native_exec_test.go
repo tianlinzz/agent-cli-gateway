@@ -112,6 +112,92 @@ func TestAbortInterruptsTurnAndPreservesAppServer(t *testing.T) {
 	}
 }
 
+// TestAbortWaitsForTurnIDPublication_OB4 is a regression test for O-B4:
+// when Abort is called while the turn id has not yet been published (abort
+// racing turn-start), it must wait for publication and proceed with the
+// protocol-level interrupt instead of returning a hard error that causes the
+// caller to tear down the persistent app-server.
+func TestAbortWaitsForTurnIDPublication_OB4(t *testing.T) {
+	session := startTestSession(t, nil)
+
+	// Simulate abort racing turn-start: set up an active turn with no id.
+	turn := &activeTurn{
+		done:        make(chan struct{}),
+		idPublished: make(chan struct{}),
+		tools:       make(map[string]ToolCall),
+		results:     make(map[string]bool),
+	}
+	session.mu.Lock()
+	session.active = turn
+	session.mu.Unlock()
+	t.Cleanup(func() {
+		// Ensure the turn is cleared so it doesn't interfere with session.Close.
+		session.mu.Lock()
+		if session.active == turn {
+			session.active = nil
+		}
+		if !turn.closed {
+			turn.closed = true
+			close(turn.done)
+		}
+		session.mu.Unlock()
+	})
+
+	// Publish the turn id after a short delay (simulates turn/start response).
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		session.mu.Lock()
+		turn.publishID("turn-late")
+		session.mu.Unlock()
+	}()
+
+	// Abort must wait for publication, then send turn/interrupt.
+	// The fake CLI handles turn/interrupt generically and emits
+	// turn/completed(interrupted), which closes turn.done.
+	start := time.Now()
+	err := session.Abort(context.Background())
+	elapsed := time.Since(start)
+
+	if elapsed < 40*time.Millisecond {
+		t.Fatalf("Abort returned after %v — did not wait for turn id publication", elapsed)
+	}
+	if err != nil {
+		t.Fatalf("Abort returned error after waiting for publication: %v", err)
+	}
+	if !session.Alive() {
+		t.Fatal("app-server was killed by abort — should have been preserved")
+	}
+}
+
+// TestAbortEscalatesWhenTurnIDNeverPublished_OB4 verifies that Abort does
+// not block forever if the turn id is never published: it escalates to a
+// controlled teardown after CloseTimeout.
+func TestAbortEscalatesWhenTurnIDNeverPublished_OB4(t *testing.T) {
+	session := startTestSession(t, nil)
+
+	// Set up an active turn with no id and never publish it.
+	turn := &activeTurn{
+		done:        make(chan struct{}),
+		idPublished: make(chan struct{}),
+		tools:       make(map[string]ToolCall),
+		results:     make(map[string]bool),
+	}
+	session.mu.Lock()
+	session.active = turn
+	session.mu.Unlock()
+
+	err := session.Abort(context.Background())
+	if err == nil {
+		t.Fatal("Abort should have escalated when turn id was never published")
+	}
+	if !strings.Contains(err.Error(), "turn id not published") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if session.Alive() {
+		t.Fatal("app-server should have been killed by escalation")
+	}
+}
+
 func TestRealCodexAppServerTwoTurns(t *testing.T) {
 	if os.Getenv("CODEX_REAL_SMOKE") != "1" {
 		t.Skip("set CODEX_REAL_SMOKE=1 to use the installed authenticated Codex CLI")

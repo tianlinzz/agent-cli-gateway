@@ -20,13 +20,29 @@ import (
 const maxAppServerFrame = 10 * 1024 * 1024
 
 type activeTurn struct {
-	id      string
-	done    chan struct{}
-	usage   *Usage
-	tools   map[string]ToolCall
-	results map[string]bool
-	aborted bool
-	closed  bool
+	id   string
+	done chan struct{}
+	// idPublished is closed once when the native turn id is first set,
+	// unblocking an Abort caller that raced turn-start (O-B4).
+	idPublished chan struct{}
+	usage       *Usage
+	tools       map[string]ToolCall
+	results     map[string]bool
+	aborted     bool
+	closed      bool
+}
+
+// publishID records the native turn id and signals any Abort caller waiting
+// for it. Must be called with the parent Session's mutex held.
+func (t *activeTurn) publishID(id string) {
+	if id == "" || t.id != "" {
+		return
+	}
+	t.id = id
+	if t.idPublished != nil {
+		close(t.idPublished)
+		t.idPublished = nil // prevent double-close; id != "" guards re-entry
+	}
 }
 
 // Session owns one Codex app-server process and one native thread.
@@ -149,7 +165,7 @@ func (s *Session) Send(ctx context.Context, input Input) error {
 	if prompt == "" {
 		return protocolError("empty prompt")
 	}
-	turn := &activeTurn{done: make(chan struct{}), tools: make(map[string]ToolCall), results: make(map[string]bool)}
+	turn := &activeTurn{done: make(chan struct{}), idPublished: make(chan struct{}), tools: make(map[string]ToolCall), results: make(map[string]bool)}
 	s.mu.Lock()
 	if s.active != nil {
 		s.mu.Unlock()
@@ -177,8 +193,8 @@ func (s *Session) Send(ctx context.Context, input Input) error {
 		return protocolError("turn/start returned an empty turn id")
 	}
 	s.mu.Lock()
-	if s.active == turn && turn.id == "" {
-		turn.id = response.Turn.ID
+	if s.active == turn {
+		turn.publishID(response.Turn.ID)
 	}
 	s.mu.Unlock()
 	return nil
@@ -418,8 +434,8 @@ func (s *Session) setActiveTurnID(id string) {
 		return
 	}
 	s.mu.Lock()
-	if s.active != nil && s.active.id == "" {
-		s.active.id = id
+	if s.active != nil {
+		s.active.publishID(id)
 	}
 	s.mu.Unlock()
 }
@@ -507,6 +523,9 @@ func (s *Session) NativeSessionID() string {
 func (s *Session) Alive() bool { return s.alive.Load() }
 
 // Abort interrupts only the active turn and preserves the app-server process.
+// If the turn id has not yet been published (abort racing turn-start), Abort
+// waits for publication instead of hard-failing, then proceeds with the
+// protocol-level interrupt or escalates after a bounded timeout (O-B4).
 func (s *Session) Abort(ctx context.Context) error {
 	s.mu.Lock()
 	turn := s.active
@@ -517,9 +536,30 @@ func (s *Session) Abort(ctx context.Context) error {
 	turn.aborted = true
 	id := turn.id
 	done := turn.done
+	idPublished := turn.idPublished
 	s.mu.Unlock()
 	if id == "" {
-		return protocolError("abort: active turn has no native id")
+		// The turn id hasn't been published yet (abort concurrent with
+		// turn/start). Wait for publication rather than returning a hard
+		// error that would cause the caller to tear down the entire
+		// persistent app-server.
+		timer := time.NewTimer(s.opts.CloseTimeout)
+		defer timer.Stop()
+		select {
+		case <-idPublished:
+			s.mu.Lock()
+			id = turn.id
+			s.mu.Unlock()
+		case <-done:
+			return nil // turn completed before id was published
+		case <-ctx.Done():
+			return s.abortEscalation(ctx, fmt.Errorf("abort wait: %w", ctx.Err()))
+		case <-timer.C:
+			return s.abortEscalation(ctx, fmt.Errorf("abort: turn id not published within %s", s.opts.CloseTimeout))
+		}
+		if id == "" {
+			return nil // publication signalled but id still empty — nothing to cancel
+		}
 	}
 	if err := s.rpc.Call(ctx, "turn/interrupt", map[string]any{"threadId": s.NativeSessionID(), "turnId": id}, nil); err != nil {
 		return s.abortEscalation(ctx, fmt.Errorf("turn/interrupt: %w", err))
