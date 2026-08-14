@@ -57,6 +57,10 @@ type Config struct {
 	// Gateway/native session identity. Zero disables idle reclamation.
 	SessionIdleTimeout  time.Duration
 	SessionReapInterval time.Duration
+	// MaxWorkers caps the total number of live worker processes. 0 = unlimited.
+	MaxWorkers int
+	// MaxWorkerLogBytes caps each worker's on-disk log file. 0 = unlimited.
+	MaxWorkerLogBytes int64
 }
 
 // DefaultConfig returns the recommended supervisor config.
@@ -230,6 +234,11 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 	if _, ok := s.sessions[req.SessionID]; ok {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("worker: session %q already running", req.SessionID)
+	}
+	// Global worker cap (O-F10): reject before consuming a slot.
+	if s.cfg.MaxWorkers > 0 && len(s.sessions) >= s.cfg.MaxWorkers {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("worker: max_workers limit reached (%d)", s.cfg.MaxWorkers)
 	}
 	s.mu.Unlock()
 	slotHeld := false
@@ -410,6 +419,9 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 	go ws.bridge()
 	if s.cfg.HeartbeatInterval > 0 {
 		go ws.heartbeat()
+	}
+	if s.cfg.MaxWorkerLogBytes > 0 && ws.sessionDir != "" {
+		go ws.logCapLoop()
 	}
 
 	_, workerPID := ws.snapshotClient()
@@ -847,6 +859,56 @@ func (ws *workerSession) heartbeat() {
 			return
 		}
 	}
+}
+
+// logCapLoop periodically checks the on-disk worker.log size and truncates it
+// (keeping the tail) when it exceeds MaxWorkerLogBytes (O-F10). Best-effort:
+// the worker child writes with O_APPEND, so truncation is safe but a few
+// in-flight bytes may be lost — acceptable for a debug log.
+func (ws *workerSession) logCapLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ws.done:
+			return
+		case <-ws.stopping:
+			return
+		case <-ticker.C:
+			ws.capLogFile()
+		}
+	}
+}
+
+func (ws *workerSession) capLogFile() {
+	logPath := filepath.Join(ws.sessionDir, "worker.log")
+	info, err := os.Stat(logPath)
+	if err != nil || info.Size() <= ws.sup.cfg.MaxWorkerLogBytes {
+		return
+	}
+	cap := ws.sup.cfg.MaxWorkerLogBytes
+	tailSize := cap / 2
+	if tailSize < 1024 {
+		tailSize = 1024
+	}
+	tail := make([]byte, tailSize)
+	f, err := os.Open(logPath)
+	if err != nil {
+		return
+	}
+	if _, err := f.Seek(-int64(len(tail)), io.SeekEnd); err != nil {
+		f.Close()
+		return
+	}
+	_, _ = f.Read(tail)
+	f.Close()
+	f, err = os.OpenFile(logPath, os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "[log truncated: was %d bytes, keeping tail %d]\n", info.Size(), tailSize)
+	_, _ = f.Write(tail)
 }
 
 // bridge forwards canonical events from the worker's gRPC stream into the

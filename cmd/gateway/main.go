@@ -130,6 +130,8 @@ func main() {
 		HeartbeatFailures:   cfg.Worker.HeartbeatFailures,
 		SessionIdleTimeout:  cfg.Sessions.IdleTimeout,
 		SessionReapInterval: cfg.Sessions.ReapInterval,
+		MaxWorkers:          cfg.Limits.MaxWorkers,
+		MaxWorkerLogBytes:   cfg.Limits.MaxWorkerLogBytes,
 		Agents:              agentExecutionConfigs(cfg.Agents),
 	})
 	if err != nil {
@@ -159,9 +161,24 @@ func main() {
 
 	metricsReg := metrics.NewRegistry()
 
+	// Admission control (O-F10): the store is shared so session-count checks
+	// see the same records the handler manages.
+	sessionStore := runtime.NewMemorySessionStore()
+	admit := openai.NewAdmissionController(struct {
+		MaxActiveRuns             int
+		MaxActiveRunsPerCaller    int
+		MaxActiveRunsPerWorkspace int
+		MaxSessionsPerCaller      int
+	}{
+		MaxActiveRuns:             cfg.Limits.MaxActiveRuns,
+		MaxActiveRunsPerCaller:    cfg.Limits.MaxActiveRunsPerCaller,
+		MaxActiveRunsPerWorkspace: cfg.Limits.MaxActiveRunsPerWorkspace,
+		MaxSessionsPerCaller:      cfg.Limits.MaxSessionsPerCaller,
+	}, sessionStore, metricsReg.IncCounter)
+
 	handler := openai.NewHandler(openai.Options{
 		Registry:         reg,
-		Store:            runtime.NewMemorySessionStore(),
+		Store:            sessionStore,
 		Backend:          backend,
 		CallerTokens:     callerTokens,
 		SessionRecordTTL: cfg.Sessions.RecordTTL,
@@ -169,6 +186,14 @@ func main() {
 		Runs:             runtime.NewMemoryRunStore(),
 		Logger:           logger,
 		Metrics:          metricsReg,
+		Admission:        admit,
+		AdmissionLimits: openai.AdmissionLimits{
+			MaxActiveRuns:             cfg.Limits.MaxActiveRuns,
+			MaxActiveRunsPerCaller:    cfg.Limits.MaxActiveRunsPerCaller,
+			MaxActiveRunsPerWorkspace: cfg.Limits.MaxActiveRunsPerWorkspace,
+			MaxSessionsPerCaller:      cfg.Limits.MaxSessionsPerCaller,
+			MaxWorkers:                cfg.Limits.MaxWorkers,
+		},
 		Enabled: func(name string) bool {
 			agent, ok := cfg.Agents[name]
 			return !ok || agent.Enabled

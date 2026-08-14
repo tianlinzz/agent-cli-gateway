@@ -320,6 +320,26 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	runID := h.newRunID()
 	w.Header().Set(h.runHeader, runID)
 
+	// Admission control: check active-run/session limits before acquiring the
+	// turn (O-F10). The release is deferred so every terminal path decrements
+	// exactly once.
+	admitted := false
+	if h.admit != nil {
+		if err := h.admit.Acquire(r.Context(), callerID, workspaceID, h.admitLmt, created); err != nil {
+			var ae *ErrAdmissionRejected
+			if errors.As(err, &ae) {
+				if created {
+					h.deleteSession(r.Context(), sessionID, callerID)
+				}
+				writeRateLimited(w, rateLimited(string(ae.Scope), string(ae.Reason)))
+				return
+			}
+			writeError(w, http.StatusInternalServerError, serverError(err.Error()))
+			return
+		}
+		admitted = true
+	}
+
 	// Single active turn per session (the store's BeginTurn is the arbiter).
 	err = h.store.BeginTurn(r.Context(), sessionID, callerID)
 	if errors.Is(err, runtime.ErrSessionBusy) && h.awaitSettlingTurn(r.Context(), sessionID) {
@@ -369,6 +389,9 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	failed := false
 	defer func() {
 		h.clearTurn(sessionID, callerID, ts)
+		if admitted {
+			h.admit.Release(callerID, workspaceID)
+		}
 		if created && failed {
 			h.deleteSession(context.Background(), sessionID, callerID)
 		}

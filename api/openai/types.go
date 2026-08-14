@@ -106,6 +106,12 @@ type Options struct {
 	// Metrics records gateway observability counters/gauges/histograms.
 	// Defaults to NoopMetrics.
 	Metrics runtime.Metrics
+
+	// Admission is the admission controller for active-run/session limits.
+	// When nil, no admission control is applied.
+	Admission *AdmissionController
+	// AdmissionLimits configures the limits the Admission controller enforces.
+	AdmissionLimits AdmissionLimits
 }
 
 // Handler serves the OpenAI-compatible HTTP routes. All state is guarded for
@@ -122,9 +128,11 @@ type Handler struct {
 	workspaceHeader string
 	runHeader       string
 
-	runs    runtime.RunStore
-	logger  *slog.Logger
-	metrics runtime.Metrics
+	runs     runtime.RunStore
+	logger   *slog.Logger
+	metrics  runtime.Metrics
+	admit    *AdmissionController
+	admitLmt AdmissionLimits
 
 	turnTimeout time.Duration
 	usageGrace  time.Duration
@@ -351,6 +359,8 @@ func NewHandler(opts Options) *Handler {
 	} else {
 		h.metrics = runtime.NoopMetrics{}
 	}
+	h.admit = opts.Admission
+	h.admitLmt = opts.AdmissionLimits
 	h.catalog = &modelCatalog{reg: opts.Registry, enabled: opts.Enabled, models: opts.Models, commands: opts.Commands}
 	// stop is always created so Close can signal every background goroutine
 	// (prune loop + handle-termination watchers) even when record expiry is off.

@@ -33,6 +33,23 @@ reap_interval = "1m"
 # reclamation and can still resume. Default 168h.
 record_ttl = "168h"
 
+[limits]
+# Admission control and resource caps (O-F10). All default to 0 (unlimited).
+# Positive values reject excess work with HTTP 429 + Retry-After.
+# Global cap on live worker processes (one per session).
+# max_workers = 100
+# Global cap on concurrently executing turns across all callers.
+# max_active_runs = 100
+# Per-caller cap on live session records.
+# max_sessions_per_caller = 50
+# Per-caller cap on concurrently executing turns.
+# max_active_runs_per_caller = 10
+# Per-workspace cap on concurrently executing turns.
+# max_active_runs_per_workspace = 4
+# Per-worker on-disk log file cap. When exceeded the log is truncated with a
+# marker (best-effort, checked every 30s). Default 64 MiB.
+max_worker_log_bytes = 67108864
+
 [auth]
 # Tokens authenticate callers, not end users. Health probes are always
 # unauthenticated. Production requires at least one caller.

@@ -54,6 +54,7 @@ type GatewayConfig struct {
 	Server    ServerConfig    `toml:"server"`
 	Worker    WorkerConfig    `toml:"worker"`
 	Sessions  SessionsConfig  `toml:"sessions"`
+	Limits    LimitsConfig    `toml:"limits"`
 	Auth      AuthConfig      `toml:"auth"`
 	Workspace WorkspaceConfig `toml:"workspace"`
 	Isolation IsolationConfig `toml:"isolation"`
@@ -110,6 +111,31 @@ type SessionsConfig struct {
 	// record expiry (records persist indefinitely — not recommended for
 	// long-running deployments). Default 168h.
 	RecordTTL time.Duration `toml:"record_ttl"`
+}
+
+// LimitsConfig configures admission control and resource caps. All fields
+// default to 0 (unlimited); positive values are enforced as hard admission
+// limits that reject excess work with HTTP 429 (O-F10).
+type LimitsConfig struct {
+	// MaxWorkers caps the total number of live worker processes across all
+	// sessions and callers. 0 = unlimited.
+	MaxWorkers int `toml:"max_workers"`
+	// MaxActiveRuns caps the total number of concurrently executing turns
+	// across all callers. 0 = unlimited.
+	MaxActiveRuns int `toml:"max_active_runs"`
+	// MaxSessionsPerCaller caps the number of live sessions records a single
+	// caller may own. 0 = unlimited.
+	MaxSessionsPerCaller int `toml:"max_sessions_per_caller"`
+	// MaxActiveRunsPerCaller caps the number of concurrently executing turns
+	// for a single caller. 0 = unlimited.
+	MaxActiveRunsPerCaller int `toml:"max_active_runs_per_caller"`
+	// MaxActiveRunsPerWorkspace caps the number of concurrently executing
+	// turns targeting the same workspace. 0 = unlimited.
+	MaxActiveRunsPerWorkspace int `toml:"max_active_runs_per_workspace"`
+	// MaxWorkerLogBytes caps the size of each worker's on-disk log file
+	// (worker.log). When the cap is reached, the log is truncated with a
+	// marker. 0 = unlimited (64 MiB default in DefaultGatewayConfig).
+	MaxWorkerLogBytes int64 `toml:"max_worker_log_bytes"`
 }
 
 // AuthConfig configures HTTP API authentication. A token authenticates a
@@ -279,6 +305,9 @@ func DefaultGatewayConfig() GatewayConfig {
 			ReapInterval: time.Minute,
 			RecordTTL:    168 * time.Hour,
 		},
+		Limits: LimitsConfig{
+			MaxWorkerLogBytes: 64 << 20, // 64 MiB
+		},
 		Auth: AuthConfig{Required: true},
 		Workspace: WorkspaceConfig{
 			Root: "workspaces",
@@ -432,6 +461,11 @@ func (c *GatewayConfig) Validate() error {
 	}
 	if c.Sessions.RecordTTL > 0 && c.Sessions.IdleTimeout > 0 && c.Sessions.RecordTTL <= c.Sessions.IdleTimeout {
 		return fmt.Errorf("config: sessions.record_ttl must exceed idle_timeout so records survive worker reclamation")
+	}
+	if c.Limits.MaxWorkers < 0 || c.Limits.MaxActiveRuns < 0 ||
+		c.Limits.MaxSessionsPerCaller < 0 || c.Limits.MaxActiveRunsPerCaller < 0 ||
+		c.Limits.MaxActiveRunsPerWorkspace < 0 || c.Limits.MaxWorkerLogBytes < 0 {
+		return fmt.Errorf("config: limits values must not be negative")
 	}
 	if c.Isolation.Required {
 		if strings.TrimSpace(c.Isolation.NsjailVersion) == "" {

@@ -20,9 +20,10 @@ type errorBody struct {
 
 // Standard OpenAI error type strings.
 const (
-	errorTypeAuth    = "authentication_error"
-	errorTypeInvalid = "invalid_request_error"
-	errorTypeServer  = "server_error"
+	errorTypeAuth      = "authentication_error"
+	errorTypeInvalid   = "invalid_request_error"
+	errorTypeServer    = "server_error"
+	errorTypeRateLimit = "rate_limit_exceeded"
 )
 
 func apiErr(msg, typ, code string) apiError {
@@ -60,9 +61,26 @@ func serverError(msg string) apiError {
 	return apiErr(msg, errorTypeServer, "server_error")
 }
 
+// rateLimited builds a rate-limit-exceeded error for the given scope and
+// reason (O-F10). The caller writes it via writeRateLimited which sets the
+// Retry-After header.
+func rateLimited(scope, reason string) apiError {
+	return apiErr(
+		"rate limit exceeded: "+scope+" "+reason,
+		errorTypeRateLimit,
+		scope+"_"+reason,
+	)
+}
+
 // writeError writes the OpenAI error envelope with the given HTTP status.
 func writeError(w http.ResponseWriter, status int, ae apiError) {
 	writeJSON(w, status, errorBody{Error: ae})
+}
+
+// writeRateLimited writes a 429 with a Retry-After header (O-F10).
+func writeRateLimited(w http.ResponseWriter, ae apiError) {
+	w.Header().Set("Retry-After", "1")
+	writeJSON(w, http.StatusTooManyRequests, errorBody{Error: ae})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
