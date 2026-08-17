@@ -258,7 +258,7 @@ func TestJSONRPCOverflowNeverDropsCriticalNotifications(t *testing.T) {
 	var deliveredCritical atomic.Int64
 	client := NewJSONRPCClient(clientIn, clientOut, 1024, nil,
 		func(msg RPCMessage) {
-			if isCriticalTestNotification(msg.Method) {
+			if isCriticalTestNotification(msg) {
 				deliveredCritical.Add(1)
 				return // critical notifications are never stalled
 			}
@@ -292,7 +292,8 @@ func TestJSONRPCOverflowNeverDropsCriticalNotifications(t *testing.T) {
 	}
 }
 
-func isCriticalTestNotification(method string) bool {
+func isCriticalTestNotification(message RPCMessage) bool {
+	method := message.Method
 	return method == "turn/completed" || method == "thread/tokenUsage/updated"
 }
 

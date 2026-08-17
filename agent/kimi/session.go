@@ -4,16 +4,15 @@ package kimi
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
+	"log/slog"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	agentprocess "github.com/tianlinzz/agent-cli-gateway/agent/process"
 	agentprotocol "github.com/tianlinzz/agent-cli-gateway/agent/protocol"
+	"github.com/tianlinzz/agent-cli-gateway/agent/rpcsession"
 )
 
 const maxACPFrame = 10 * 1024 * 1024
@@ -28,49 +27,37 @@ type activePrompt struct {
 	completed bool
 }
 
+// Session owns one persistent Kimi ACP process. The mechanical lifecycle
+// (process, monitor/teardown, event channel, abort escalation, Close) lives in
+// the shared rpcsession.Core (D2); this file keeps only the ACP protocol
+// specifics.
 type Session struct {
-	opts    Options
-	process *agentprocess.Process
-	rpc     *agentprotocol.JSONRPCClient
-	events  chan Event
-	ctx     context.Context
-	cancel  context.CancelFunc
-	done    chan struct{}
+	core *rpcsession.Core
+	opts Options
 
-	sessionID atomic.Value
-	alive     atomic.Bool
-	closing   atomic.Bool
-	close     sync.Once
-	wg        sync.WaitGroup
-	mu        sync.Mutex
-	active    *activePrompt
+	wg sync.WaitGroup
+
+	mu     sync.Mutex
+	active *activePrompt
 }
 
 func Start(ctx context.Context, options Options) (*Session, error) {
-	if ctx == nil {
-		return nil, protocolError("nil context")
-	}
 	opts := NormalizeOptions(options)
-	sessionCtx, cancel := context.WithCancel(ctx)
+	s := &Session{core: rpcsession.New("kimi", "ACP", opts.CloseTimeout, protocolError), opts: opts}
+	// monitor waits for in-flight prompt goroutines before the terminal-error
+	// decision, so completePrompt always finalizes the active turn even when
+	// the process dies mid-prompt.
+	s.core.BeforeExit = s.wg.Wait
 	command := append([]string(nil), opts.Command...)
 	command = append(command, BuildArgs(opts, "", opts.ResumeID)...)
-	proc, err := agentprocess.Start(sessionCtx, agentprocess.Spec{Command: command, Dir: opts.WorkDir, Env: opts.Env, Stdin: true})
-	if err != nil {
-		cancel()
-		return nil, protocolError("start ACP: %w", err)
-	}
-	s := &Session{opts: opts, process: proc, events: make(chan Event, 64), ctx: sessionCtx, cancel: cancel, done: make(chan struct{})}
-	s.sessionID.Store("")
-	// Kimi's turn completion is RPC-response-driven (session/prompt), not
-	// notification-driven, so no notification is control-critical. Pass nil so
-	// all notifications use the display path (overflow drop+marker).
-	s.rpc = agentprotocol.NewJSONRPCClient(proc.Stdin(), proc.Stdout(), maxACPFrame, s.handleReverse, s.handleNotification, s.onNotifyOverflow, nil)
-	if err := s.initialize(ctx); err != nil {
-		s.cleanupFailedStart()
+	if err := s.core.Launch(ctx, agentprocess.Spec{Command: command, Dir: opts.WorkDir, Env: opts.Env, Stdin: true}, maxACPFrame, s.handleReverse, s.handleNotification, isCriticalKimiNotification); err != nil {
 		return nil, err
 	}
-	s.alive.Store(true)
-	go s.monitor()
+	if err := s.initialize(ctx); err != nil {
+		s.core.CleanupFailedStart()
+		return nil, err
+	}
+	s.core.FinishStart()
 	return s, nil
 }
 
@@ -78,7 +65,7 @@ func (s *Session) initialize(ctx context.Context) error {
 	var initialized struct {
 		ProtocolVersion int `json:"protocolVersion"`
 	}
-	if err := s.rpc.Call(ctx, "initialize", map[string]any{"protocolVersion": 1, "clientCapabilities": map[string]any{}}, &initialized); err != nil {
+	if err := s.core.RPC().Call(ctx, "initialize", map[string]any{"protocolVersion": 1, "clientCapabilities": map[string]any{}}, &initialized); err != nil {
 		return protocolError("initialize ACP: %w", err)
 	}
 	params := map[string]any{"cwd": s.opts.WorkDir, "mcpServers": []any{}}
@@ -90,19 +77,19 @@ func (s *Session) initialize(ctx context.Context) error {
 	var response struct {
 		SessionID string `json:"sessionId"`
 	}
-	if err := s.rpc.Call(ctx, method, params, &response); err != nil {
+	if err := s.core.RPC().Call(ctx, method, params, &response); err != nil {
 		return protocolError("%s: %w", method, err)
 	}
 	if strings.TrimSpace(response.SessionID) == "" {
 		return protocolError("%s returned an empty session id", method)
 	}
-	s.sessionID.Store(response.SessionID)
-	s.emit(Event{Kind: EventNativeSession, NativeSessionID: response.SessionID})
+	s.core.SetNativeID(response.SessionID)
+	s.core.Emit(Event{Kind: EventNativeSession, NativeSessionID: response.SessionID})
 	return nil
 }
 
 func (s *Session) Send(_ context.Context, input Input) error {
-	if !s.alive.Load() {
+	if !s.core.Alive() {
 		return protocolError("session is closed")
 	}
 	prompt := strings.TrimSpace(input.Prompt)
@@ -112,7 +99,7 @@ func (s *Session) Send(_ context.Context, input Input) error {
 	// No native turn deadline (O-F09b): the worker boundary owns the per-turn
 	// deadline and aborts this session when it fires. The turn context exists
 	// only so a completed/aborted prompt releases its resources.
-	turnCtx, cancel := context.WithCancel(s.ctx)
+	turnCtx, cancel := context.WithCancel(s.core.Ctx())
 	turn := &activePrompt{done: make(chan struct{}), cancel: cancel, tools: make(map[string]ToolCall), results: make(map[string]bool)}
 	s.mu.Lock()
 	if s.active != nil {
@@ -134,7 +121,7 @@ func (s *Session) runPrompt(ctx context.Context, turn *activePrompt, prompt stri
 	var response struct {
 		StopReason string `json:"stopReason"`
 	}
-	err := s.rpc.Call(ctx, "session/prompt", map[string]any{
+	err := s.core.RPC().Call(ctx, "session/prompt", map[string]any{
 		"sessionId": s.NativeSessionID(),
 		"prompt":    []map[string]any{{"type": "text", "text": prompt}},
 	}, &response)
@@ -152,7 +139,7 @@ func (s *Session) completePrompt(turn *activePrompt, stopReason string, promptEr
 	// consumer), so drain those notifications BEFORE finalizing the turn: later
 	// handlers (e.g. tool_call_update) consult s.active, which is cleared below,
 	// and the consumer reads events up to the finish we emit last.
-	s.rpc.Sync()
+	s.core.RPC().Sync()
 	s.mu.Lock()
 	if turn.completed {
 		s.mu.Unlock()
@@ -168,17 +155,40 @@ func (s *Session) completePrompt(turn *activePrompt, stopReason string, promptEr
 	close(turn.done)
 	s.mu.Unlock()
 	if promptErr != nil && !aborted {
-		s.emit(Event{Kind: EventError, Err: promptErr})
+		s.core.Emit(Event{Kind: EventError, Err: promptErr})
 		return
+	}
+	// Converged abort semantics (D2): an aborted turn ALWAYS ends with
+	// finish("cancelled"); a prompt error on an aborted turn is the cancel's
+	// side effect and is logged, never emitted as an error event.
+	if promptErr != nil {
+		slog.Warn("kimi: prompt failed after abort", "session_id", s.NativeSessionID(), "error", promptErr)
 	}
 	reason := normalizeStopReason(stopReason)
 	if aborted {
 		reason = "cancelled"
 	}
-	s.emit(Event{Kind: EventFinish, FinishReason: reason, NativeSessionID: s.NativeSessionID()})
+	s.core.Emit(Event{Kind: EventFinish, FinishReason: reason, NativeSessionID: s.NativeSessionID()})
 	if usage != nil {
-		s.emit(Event{Kind: EventUsage, Usage: usage, NativeSessionID: s.NativeSessionID()})
+		s.core.Emit(Event{Kind: EventUsage, Usage: usage, NativeSessionID: s.NativeSessionID()})
 	}
+}
+
+// isCriticalKimiNotification routes usage updates through the never-dropped
+// critical queue (converged with codex's tokenUsage classification, D2): a
+// turn's usage arrives only as a session/update notification and has no
+// fallback, so a stalled consumer must not be able to lose it. Everything else
+// in session/update is display telemetry.
+func isCriticalKimiNotification(message agentprotocol.RPCMessage) bool {
+	if message.Method != "session/update" {
+		return false
+	}
+	var probe struct {
+		Update struct {
+			SessionUpdate string `json:"sessionUpdate"`
+		} `json:"update"`
+	}
+	return json.Unmarshal(message.Params, &probe) == nil && probe.Update.SessionUpdate == "usage_update"
 }
 
 func (s *Session) handleNotification(message agentprotocol.RPCMessage) {
@@ -195,14 +205,14 @@ func (s *Session) handleNotification(message agentprotocol.RPCMessage) {
 		content := objectValue(update["content"])
 		if stringValue(content["type"]) == "text" {
 			if text := stringValue(content["text"]); text != "" {
-				s.emit(Event{Kind: EventText, Text: text})
+				s.core.Emit(Event{Kind: EventText, Text: text})
 			}
 		}
 	case "agent_thought_chunk":
 		content := objectValue(update["content"])
 		if stringValue(content["type"]) == "text" {
 			if text := stringValue(content["text"]); text != "" {
-				s.emit(Event{Kind: EventReasoning, Reasoning: &Reasoning{Text: text}})
+				s.core.Emit(Event{Kind: EventReasoning, Reasoning: &Reasoning{Text: text}})
 			}
 		}
 	case "tool_call":
@@ -210,6 +220,9 @@ func (s *Session) handleNotification(message agentprotocol.RPCMessage) {
 	case "tool_call_update":
 		s.handleToolUpdate(update)
 	case "usage_update":
+		// Native limitation (documented): ACP carries no turn id in
+		// usage_update, so usage is attributed to the session's active turn
+		// only; a late update arriving between turns is dropped.
 		used := intValue(update["used"])
 		if used > 0 {
 			s.mu.Lock()
@@ -238,7 +251,7 @@ func (s *Session) handleToolStart(update map[string]any) {
 	}
 	turn.tools[tool.ID] = tool
 	s.mu.Unlock()
-	s.emit(Event{Kind: EventToolUse, Tool: &tool})
+	s.core.Emit(Event{Kind: EventToolUse, Tool: &tool})
 }
 
 func (s *Session) handleToolUpdate(update map[string]any) {
@@ -267,11 +280,11 @@ func (s *Session) handleToolUpdate(update map[string]any) {
 	if !started {
 		copy := tool
 		copy.Result = ""
-		s.emit(Event{Kind: EventToolUse, Tool: &copy})
+		s.core.Emit(Event{Kind: EventToolUse, Tool: &copy})
 	}
 	tool.Result = toolContent(update["content"])
 	tool.IsError = status == "failed"
-	s.emit(Event{Kind: EventToolResult, Tool: &tool})
+	s.core.Emit(Event{Kind: EventToolResult, Tool: &tool})
 }
 
 func (s *Session) handleReverse(_ context.Context, message agentprotocol.RPCMessage) (any, *agentprotocol.RPCError) {
@@ -282,7 +295,7 @@ func (s *Session) handleReverse(_ context.Context, message agentprotocol.RPCMess
 	_ = json.Unmarshal(message.Params, &params)
 	toolCall := objectValue(params["toolCall"])
 	id := stringValue(toolCall["toolCallId"])
-	s.emit(Event{Kind: EventPermission, Permission: &PermissionRequest{ID: id, Action: stringValue(toolCall["title"]), Detail: toolContent(toolCall["content"])}})
+	s.core.Emit(Event{Kind: EventPermission, Permission: &PermissionRequest{ID: id, Action: stringValue(toolCall["title"]), Detail: toolContent(toolCall["content"])}})
 	if s.opts.Permission == "auto" {
 		if option := allowedOption(params["options"]); option != "" {
 			return map[string]any{"outcome": map[string]any{"outcome": "selected", "optionId": option}}, nil
@@ -301,119 +314,25 @@ func (s *Session) Abort(ctx context.Context) error {
 	turn.aborted = true
 	done := turn.done
 	s.mu.Unlock()
-	if err := s.rpc.Notify(ctx, "session/cancel", map[string]any{"sessionId": s.NativeSessionID()}); err != nil {
-		return s.abortEscalation(fmt.Errorf("session/cancel: %w", err))
+	if err := s.core.RPC().Notify(ctx, "session/cancel", map[string]any{"sessionId": s.NativeSessionID()}); err != nil {
+		return s.core.AbortEscalation(fmt.Errorf("session/cancel: %w", err))
 	}
-	timer := time.NewTimer(s.opts.CloseTimeout)
+	timer := time.NewTimer(s.core.CloseTimeout)
 	defer timer.Stop()
 	select {
 	case <-done:
 		return nil
 	case <-ctx.Done():
-		return s.abortEscalation(fmt.Errorf("cancel wait: %w", ctx.Err()))
+		return s.core.AbortEscalation(fmt.Errorf("cancel wait: %w", ctx.Err()))
 	case <-timer.C:
-		return s.abortEscalation(fmt.Errorf("cancel timed out after %s", s.opts.CloseTimeout))
+		return s.core.AbortEscalation(fmt.Errorf("cancel timed out after %s", s.core.CloseTimeout))
 	}
 }
 
-func (s *Session) abortEscalation(cause error) error {
-	s.closing.Store(true)
-	s.alive.Store(false)
-	s.cancel()
-	_ = s.rpc.Close()
-	_ = s.process.ForceKill()
-	_ = s.process.Wait()
-	return protocolError("abort: %w", cause)
-}
-
-func (s *Session) monitor() {
-	<-s.rpc.Done()
-	waitErr := s.process.Wait()
-	s.wg.Wait()
-	s.alive.Store(false)
-	if !s.closing.Load() {
-		message := strings.TrimSpace(s.process.StderrString())
-		if message == "" {
-			if waitErr != nil {
-				message = waitErr.Error()
-			} else if err := s.rpc.Err(); err != nil && !errors.Is(err, io.EOF) {
-				message = err.Error()
-			}
-		}
-		if message != "" {
-			s.emit(Event{Kind: EventError, Err: protocolError("ACP exited: %s", message)})
-		}
-	}
-	s.close.Do(func() {
-		// Cancel first so any emitter blocked in emit's select returns, then
-		// wait for the JSON-RPC notification drain goroutine to stop calling
-		// notify before closing s.events. Otherwise a drain mid-emit would
-		// send on a closed channel.
-		s.cancel()
-		if ch := s.rpc.NotifyDone(); ch != nil {
-			<-ch
-		}
-		close(s.events)
-		close(s.done)
-	})
-}
-
-func (s *Session) cleanupFailedStart() {
-	s.closing.Store(true)
-	s.cancel()
-	_ = s.rpc.Close()
-	_ = s.process.ForceKill()
-	_ = s.process.Wait()
-}
-
-func (s *Session) emit(event Event) {
-	select {
-	case s.events <- event:
-	case <-s.ctx.Done():
-	}
-}
-
-// onNotifyOverflow surfaces a notification-truncation marker when the JSON-RPC
-// reader dropped notifications because a stalled consumer saturated the queue.
-func (s *Session) onNotifyOverflow(dropped int) {
-	s.emit(Event{Kind: EventReasoning, Reasoning: &Reasoning{Text: fmt.Sprintf("[%d notifications truncated]", dropped)}})
-}
-
-func (s *Session) Events() <-chan Event { return s.events }
+func (s *Session) Events() <-chan Event { return s.core.Events() }
 func (s *Session) NativeSessionID() string {
-	value, _ := s.sessionID.Load().(string)
-	return value
+	return s.core.NativeID()
 }
-func (s *Session) Alive() bool { return s.alive.Load() }
+func (s *Session) Alive() bool { return s.core.Alive() }
 
-func (s *Session) Close(ctx context.Context) error {
-	if !s.alive.Swap(false) {
-		select {
-		case <-s.done:
-			return nil
-		default:
-		}
-	}
-	s.closing.Store(true)
-	s.cancel()
-	_ = s.rpc.Close()
-	timer := time.NewTimer(s.opts.CloseTimeout)
-	defer timer.Stop()
-	select {
-	case <-s.done:
-		return nil
-	case <-ctx.Done():
-		_ = s.process.ForceKill()
-		return protocolError("close wait: %w", ctx.Err())
-	case <-timer.C:
-		_ = s.process.ForceKill()
-		reapTimer := time.NewTimer(s.opts.CloseTimeout)
-		defer reapTimer.Stop()
-		select {
-		case <-s.done:
-			return nil
-		case <-reapTimer.C:
-			return protocolError("close timed out after %s", 2*s.opts.CloseTimeout)
-		}
-	}
-}
+func (s *Session) Close(ctx context.Context) error { return s.core.Close(ctx) }

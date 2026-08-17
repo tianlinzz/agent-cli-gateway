@@ -54,16 +54,18 @@ type rpcResult struct {
 // drain (but never the reader loop).
 type OverflowHandler func(dropped int)
 
-// NotifyClassifier reports whether a notification method is critical (must never
-// be dropped to overflow) or display (may be dropped and marked). Critical
+// NotifyClassifier reports whether a notification is critical (must never be
+// dropped to overflow) or display (may be dropped and marked). Critical
 // notifications — turn completion, native session/thread identity, usage — drive
 // the Gateway state machine; losing them would leave a turn unfinished or a
 // resume ID unsaved. Display notifications — text deltas, tool progress,
 // reasoning — are telemetry and may be truncated under sustained backpressure.
+// The classifier receives the full message so protocols that multiplex
+// payloads over one method (kimi's session/update) can classify by payload.
 // Returning true routes the notification through a dedicated blocking queue
 // (done-guarded, never dropped); false routes it through the non-blocking
 // display queue (overflow drops with a truncation marker).
-type NotifyClassifier func(method string) bool
+type NotifyClassifier func(message RPCMessage) bool
 
 // JSONRPCClient owns bounded JSONL framing, request correlation, and reverse
 // message dispatch for one stdio JSON-RPC connection.
@@ -172,7 +174,7 @@ func (c *JSONRPCClient) drainCritical() {
 // dropped. Display notifications go through a non-blocking send — dropped and
 // counted on overflow.
 func (c *JSONRPCClient) enqueueNotify(msg RPCMessage) {
-	if c.classify != nil && c.classify(msg.Method) {
+	if c.classify != nil && c.classify(msg) {
 		select {
 		case c.criticalQueue <- msg:
 		case <-c.done:

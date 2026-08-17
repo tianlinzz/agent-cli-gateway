@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	agentprotocol "github.com/tianlinzz/agent-cli-gateway/agent/protocol"
 )
 
 func TestBuildArgsUsesPersistentACP(t *testing.T) {
@@ -132,7 +134,7 @@ func TestRealKimiACPPersistentProcessTwoTurns(t *testing.T) {
 	}
 	defer session.Close(context.Background())
 
-	pid := session.process.PID()
+	pid := session.core.PID()
 	nativeID := session.NativeSessionID()
 	if nativeID == "" {
 		t.Fatal("Kimi ACP returned an empty native session ID")
@@ -145,8 +147,8 @@ func TestRealKimiACPPersistentProcessTwoTurns(t *testing.T) {
 		if findKimiEvent(events, EventFinish) == nil || findKimiEvent(events, EventError) != nil {
 			t.Fatalf("events = %#v", events)
 		}
-		if session.process.PID() != pid || session.NativeSessionID() != nativeID || !session.Alive() {
-			t.Fatalf("ACP lifecycle changed after turn: pid=%d current=%d native_id=%q current_native_id=%q alive=%v", pid, session.process.PID(), nativeID, session.NativeSessionID(), session.Alive())
+		if session.core.PID() != pid || session.NativeSessionID() != nativeID || !session.Alive() {
+			t.Fatalf("ACP lifecycle changed after turn: pid=%d current=%d native_id=%q current_native_id=%q alive=%v", pid, session.core.PID(), nativeID, session.NativeSessionID(), session.Alive())
 		}
 	}
 }
@@ -268,6 +270,7 @@ func TestKimiACPHelper(t *testing.T) {
 	}
 	scanner := bufio.NewScanner(os.Stdin)
 	turn := 0
+	stuck := false
 	var blockedID json.RawMessage
 	for scanner.Scan() {
 		var request struct {
@@ -302,14 +305,17 @@ func TestKimiACPHelper(t *testing.T) {
 			if len(params.Prompt) > 0 {
 				prompt = params.Prompt[0].Text
 			}
-			if prompt == "block" {
+			if prompt == "block" || prompt == "block-stuck" {
+				if prompt == "block-stuck" {
+					stuck = true
+				}
 				blockedID = append(json.RawMessage(nil), request.ID...)
 				_ = os.WriteFile(os.Getenv("KIMI_TEST_READY"), []byte("ready"), 0o600)
 				continue
 			}
 			go emitKimiTurn(request.ID, turn, prompt, "end_turn")
 		case "session/cancel":
-			if len(blockedID) > 0 {
+			if len(blockedID) > 0 && !stuck {
 				emitKimiResult(blockedID, map[string]any{"stopReason": "cancelled"})
 				blockedID = nil
 			}
@@ -360,4 +366,59 @@ func emitKimi(value any) {
 	kimiHelperWriteMu.Lock()
 	defer kimiHelperWriteMu.Unlock()
 	_, _ = fmt.Fprintln(os.Stdout, string(data))
+}
+
+// TestUsageUpdateIsCriticalNotification_D2 pins the converged notification
+// classification: a turn's usage arrives only as a session/update payload with
+// no fallback, so it must route through the never-dropped critical queue —
+// exactly like codex classifies thread/tokenUsage/updated by method.
+func TestUsageUpdateIsCriticalNotification_D2(t *testing.T) {
+	update := func(sessionUpdate string) json.RawMessage {
+		data, _ := json.Marshal(map[string]any{"sessionId": "session-native-1", "update": map[string]any{"sessionUpdate": sessionUpdate}})
+		return data
+	}
+	cases := []struct {
+		name string
+		msg  agentprotocol.RPCMessage
+		crit bool
+	}{
+		{"usage update", agentprotocol.RPCMessage{Method: "session/update", Params: update("usage_update")}, true},
+		{"text delta", agentprotocol.RPCMessage{Method: "session/update", Params: update("agent_message_chunk")}, false},
+		{"tool progress", agentprotocol.RPCMessage{Method: "session/update", Params: update("tool_call_update")}, false},
+		{"other method", agentprotocol.RPCMessage{Method: "session/something"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isCriticalKimiNotification(tc.msg); got != tc.crit {
+				t.Fatalf("isCriticalKimiNotification(%s) = %v, want %v", tc.name, got, tc.crit)
+			}
+		})
+	}
+}
+
+// TestAbortEscalatesWithinCloseTimeout_D2 pins the converged abort settle
+// budget: a native session that ignores session/cancel must be killed within
+// CloseTimeout (not the pre-D2 30-minute prompt timeout), with the process
+// reaped and the session dead.
+func TestAbortEscalatesWithinCloseTimeout_D2(t *testing.T) {
+	ready := filepath.Join(t.TempDir(), "ready")
+	session := startKimiTestSession(t, Options{CloseTimeout: 500 * time.Millisecond}, map[string]string{"KIMI_TEST_READY": ready})
+
+	if err := session.Send(context.Background(), Input{Prompt: "block-stuck"}); err != nil {
+		t.Fatal(err)
+	}
+	waitKimiFile(t, ready)
+
+	start := time.Now()
+	err := session.Abort(context.Background())
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Abort of a stuck session must return the escalation error")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("Abort took %s — the CloseTimeout settle budget was not honored", elapsed)
+	}
+	if session.Alive() {
+		t.Fatal("stuck session must be dead after abort escalation")
+	}
 }

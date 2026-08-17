@@ -64,7 +64,7 @@ cmd/gateway → config/, runtime/, api/openai/, worker/
 cmd/gateway-worker → adapters/*, runtime/
 api/openai → runtime/   (never adapters/, worker/, or config/)
 adapters/<name> → agent/<name>, runtime/ (never api/, worker/, or another agent)
-agent/<name> → agent/events, agent/process, agent/protocol, stdlib only
+agent/<name> → agent/events, agent/process, agent/protocol, agent/rpcsession, stdlib only
 worker/     → runtime/, workspace/, config/ (never adapters/ or api/)
 workspace/  → stdlib only
 runtime/    → stdlib only
@@ -72,7 +72,8 @@ runtime/    → stdlib only
 
 `agent/events` is the single canonical native event contract (D1): every
 `agent/<name>` package re-exports it via type aliases instead of carrying its
-own copy.
+own copy. `agent/rpcsession` is the shared JSON-RPC session lifecycle skeleton
+(D2): codex and kimi embed it and keep only their protocol specifics.
 
 ### Core Interfaces
 

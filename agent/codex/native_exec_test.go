@@ -209,7 +209,7 @@ func TestRealCodexAppServerTwoTurns(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.Close(context.Background())
-	pid := session.process.PID()
+	pid := session.core.PID()
 	for _, prompt := range []string{"Reply with exactly: turn-one", "Reply with exactly: turn-two"} {
 		if err := session.Send(ctx, Input{Prompt: prompt}); err != nil {
 			t.Fatal(err)
@@ -218,8 +218,8 @@ func TestRealCodexAppServerTwoTurns(t *testing.T) {
 		if eventOfKind(events, EventFinish) == nil || eventOfKind(events, EventError) != nil {
 			t.Fatalf("events = %#v", events)
 		}
-		if session.process.PID() != pid || !session.Alive() {
-			t.Fatalf("app-server changed after turn: pid=%d current=%d alive=%v", pid, session.process.PID(), session.Alive())
+		if session.core.PID() != pid || !session.Alive() {
+			t.Fatalf("app-server changed after turn: pid=%d current=%d alive=%v", pid, session.core.PID(), session.Alive())
 		}
 	}
 }
@@ -363,6 +363,7 @@ func TestCodexAppServerHelper(t *testing.T) {
 	}
 	scanner := bufio.NewScanner(os.Stdin)
 	turn := 0
+	blockedPrompt := ""
 	for scanner.Scan() {
 		var request struct {
 			ID     json.RawMessage `json:"id"`
@@ -402,7 +403,8 @@ func TestCodexAppServerHelper(t *testing.T) {
 				prompt = params.Input[0].Text
 			}
 			emitRPCNotification("turn/started", map[string]any{"threadId": "thread-native-1", "turn": map[string]any{"id": turnID}})
-			if prompt == "block" {
+			if prompt == "block" || prompt == "block-fail" {
+				blockedPrompt = prompt
 				_ = os.WriteFile(os.Getenv("CODEX_TEST_READY"), []byte("ready"), 0o600)
 				continue
 			}
@@ -413,7 +415,17 @@ func TestCodexAppServerHelper(t *testing.T) {
 			}
 			_ = json.Unmarshal(request.Params, &params)
 			emitRPCResult(request.ID, map[string]any{})
-			emitRPCNotification("turn/completed", map[string]any{"threadId": "thread-native-1", "turn": map[string]any{"id": params.TurnID, "status": "interrupted"}})
+			status := "interrupted"
+			completed := map[string]any{"id": params.TurnID, "status": status}
+			if blockedPrompt == "block-fail" {
+				// Simulate a native turn that FAILS as a side effect of the
+				// interrupt (the D2 abort-convergence scenario).
+				status = "failed"
+				completed["status"] = status
+				completed["error"] = map[string]any{"message": "interrupted mid-tool"}
+				blockedPrompt = ""
+			}
+			emitRPCNotification("turn/completed", map[string]any{"threadId": "thread-native-1", "turn": completed})
 		default:
 			emitRPCError(request.ID, -32601, "method not found")
 		}
@@ -463,4 +475,36 @@ func emitRPCNotification(method string, params any) {
 func emitRPC(value any) {
 	data, _ := json.Marshal(value)
 	_, _ = fmt.Fprintln(os.Stdout, string(data))
+}
+
+// TestAbortedTurnFailingAfterInterruptEndsCancelled_D2 pins the converged
+// abort semantics: when a native turn FAILS as a side effect of the interrupt,
+// the turn still ends with finish("cancelled") and the failure is logged, not
+// emitted as an error event (which the API would record as RunFailed). Before
+// D2 this path emitted EventError without a finish marker.
+func TestAbortedTurnFailingAfterInterruptEndsCancelled_D2(t *testing.T) {
+	ready := filepath.Join(t.TempDir(), "ready")
+	session := startTestSession(t, map[string]string{"CODEX_TEST_READY": ready})
+
+	if err := session.Send(context.Background(), Input{Prompt: "block-fail"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFile(t, ready)
+	if err := session.Abort(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	events := readCodexTurn(t, session.Events())
+	finish := eventOfKind(events, EventFinish)
+	if finish == nil {
+		t.Fatalf("no finish event after aborted turn: %#v", events)
+	}
+	if finish.FinishReason != "cancelled" {
+		t.Fatalf("finish reason = %q, want cancelled (converged abort semantics)", finish.FinishReason)
+	}
+	if failure := eventOfKind(events, EventError); failure != nil {
+		t.Fatalf("abort side-effect failure must be logged, not emitted: %#v", failure)
+	}
+	if !session.Alive() {
+		t.Fatal("app-server was killed by an interrupt that the native side answered")
+	}
 }

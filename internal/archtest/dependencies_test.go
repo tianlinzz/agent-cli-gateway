@@ -37,14 +37,15 @@ func TestDependencyRules(t *testing.T) {
 			case "agent":
 				rejectImport(t, relative, path, "runtime", "adapters", "worker", "api", "config")
 				// agent/<name> packages may only share code through the
-				// sanctioned agent/* foundations: events (D1), process, and
-				// protocol. One agent importing another is forbidden.
+				// sanctioned agent/* foundations: events (D1), process,
+				// protocol, and rpcsession (D2). One agent importing another
+				// is forbidden.
 				if seg := agentSubPackage(relative); seg != "" {
 					if path == modulePath+"/agent" || strings.HasPrefix(path, modulePath+"/agent/") {
 						switch path {
-						case modulePath + "/agent/process", modulePath + "/agent/protocol", modulePath + "/agent/events":
+						case modulePath + "/agent/process", modulePath + "/agent/protocol", modulePath + "/agent/events", modulePath + "/agent/rpcsession":
 						default:
-							t.Errorf("forbidden dependency: %s imports %s (agent/<name> may only import agent/events, agent/process, agent/protocol, stdlib)", relative, path)
+							t.Errorf("forbidden dependency: %s imports %s (agent/<name> may only import agent/events, agent/process, agent/protocol, agent/rpcsession, stdlib)", relative, path)
 						}
 					}
 				}
@@ -66,7 +67,7 @@ func agentSubPackage(relative string) string {
 		return ""
 	}
 	switch parts[1] {
-	case "process", "protocol", "events":
+	case "process", "protocol", "events", "rpcsession":
 		return ""
 	}
 	return parts[1]

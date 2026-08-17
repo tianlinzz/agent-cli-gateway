@@ -4,17 +4,15 @@ package codex
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	agentprocess "github.com/tianlinzz/agent-cli-gateway/agent/process"
 	agentprotocol "github.com/tianlinzz/agent-cli-gateway/agent/protocol"
+	"github.com/tianlinzz/agent-cli-gateway/agent/rpcsession"
 )
 
 const maxAppServerFrame = 10 * 1024 * 1024
@@ -45,20 +43,13 @@ func (t *activeTurn) publishID(id string) {
 	}
 }
 
-// Session owns one Codex app-server process and one native thread.
+// Session owns one Codex app-server process and one native thread. The
+// mechanical lifecycle (process, monitor/teardown, event channel, abort
+// escalation, Close) lives in the shared rpcsession.Core (D2); this file
+// keeps only the Codex protocol specifics.
 type Session struct {
-	opts    Options
-	process *agentprocess.Process
-	rpc     *agentprotocol.JSONRPCClient
-	events  chan Event
-	ctx     context.Context
-	cancel  context.CancelFunc
-	done    chan struct{}
-
-	threadID atomic.Value
-	alive    atomic.Bool
-	closing  atomic.Bool
-	close    sync.Once
+	core *rpcsession.Core
+	opts Options
 
 	mu     sync.Mutex
 	active *activeTurn
@@ -66,42 +57,30 @@ type Session struct {
 
 // Start launches and initializes a persistent Codex app-server.
 func Start(ctx context.Context, options Options) (*Session, error) {
-	if ctx == nil {
-		return nil, protocolError("nil context")
-	}
 	opts := NormalizeOptions(options)
-	sessionCtx, cancel := context.WithCancel(ctx)
+	s := &Session{core: rpcsession.New("codex", "app-server", opts.CloseTimeout, protocolError), opts: opts}
 	command := append([]string(nil), opts.Command...)
 	command = append(command, BuildArgs(opts, opts.ResumeID)...)
-	proc, err := agentprocess.Start(sessionCtx, agentprocess.Spec{
-		Command: command, Dir: opts.WorkDir, Env: opts.Env, Stdin: true,
-	})
-	if err != nil {
-		cancel()
-		return nil, protocolError("start app-server: %w", err)
-	}
-
-	s := &Session{opts: opts, process: proc, events: make(chan Event, 64), ctx: sessionCtx, cancel: cancel, done: make(chan struct{})}
-	s.threadID.Store("")
-	s.rpc = agentprotocol.NewJSONRPCClient(proc.Stdin(), proc.Stdout(), maxAppServerFrame, s.handleReverse, s.handleNotification, s.onNotifyOverflow, isCriticalCodexNotification)
-	if err := s.initialize(ctx); err != nil {
-		s.cleanupFailedStart()
+	if err := s.core.Launch(ctx, agentprocess.Spec{Command: command, Dir: opts.WorkDir, Env: opts.Env, Stdin: true}, maxAppServerFrame, s.handleReverse, s.handleNotification, isCriticalCodexNotification); err != nil {
 		return nil, err
 	}
-	s.alive.Store(true)
-	go s.monitor()
+	if err := s.initialize(ctx); err != nil {
+		s.core.CleanupFailedStart()
+		return nil, err
+	}
+	s.core.FinishStart()
 	return s, nil
 }
 
 func (s *Session) initialize(ctx context.Context) error {
 	var initialized map[string]any
-	if err := s.rpc.Call(ctx, "initialize", map[string]any{
+	if err := s.core.RPC().Call(ctx, "initialize", map[string]any{
 		"clientInfo":   map[string]any{"name": "agent-cli-gateway", "title": "Agent CLI Gateway", "version": "dev"},
 		"capabilities": map[string]any{"experimentalApi": true},
 	}, &initialized); err != nil {
 		return protocolError("initialize app-server: %w", err)
 	}
-	if err := s.rpc.Notify(ctx, "initialized", map[string]any{}); err != nil {
+	if err := s.core.RPC().Notify(ctx, "initialized", map[string]any{}); err != nil {
 		return protocolError("notify initialized: %w", err)
 	}
 
@@ -116,14 +95,14 @@ func (s *Session) initialize(ctx context.Context) error {
 			ID string `json:"id"`
 		} `json:"thread"`
 	}
-	if err := s.rpc.Call(ctx, method, params, &response); err != nil {
+	if err := s.core.RPC().Call(ctx, method, params, &response); err != nil {
 		return protocolError("%s: %w", method, err)
 	}
 	if strings.TrimSpace(response.Thread.ID) == "" {
 		return protocolError("%s returned an empty thread id", method)
 	}
-	s.threadID.Store(response.Thread.ID)
-	s.emit(Event{Kind: EventNativeSession, NativeSessionID: response.Thread.ID})
+	s.core.SetNativeID(response.Thread.ID)
+	s.core.Emit(Event{Kind: EventNativeSession, NativeSessionID: response.Thread.ID})
 	return nil
 }
 
@@ -158,7 +137,7 @@ func putNonEmpty(values map[string]any, key, value string) {
 
 // Send starts one turn on the existing native thread.
 func (s *Session) Send(ctx context.Context, input Input) error {
-	if !s.alive.Load() {
+	if !s.core.Alive() {
 		return protocolError("session is closed")
 	}
 	prompt := strings.TrimSpace(input.Prompt)
@@ -184,7 +163,7 @@ func (s *Session) Send(ctx context.Context, input Input) error {
 			ID string `json:"id"`
 		} `json:"turn"`
 	}
-	if err := s.rpc.Call(ctx, "turn/start", params, &response); err != nil {
+	if err := s.core.RPC().Call(ctx, "turn/start", params, &response); err != nil {
 		s.clearActive(turn)
 		return protocolError("turn/start: %w", err)
 	}
@@ -200,12 +179,12 @@ func (s *Session) Send(ctx context.Context, input Input) error {
 	return nil
 }
 
-// isCriticalCodexNotification reports whether a notification method drives the
+// isCriticalCodexNotification reports whether a notification drives the
 // Gateway state machine (turn lifecycle, thread/session identity, usage) and
 // must never be dropped to queue overflow. Display notifications (text deltas,
 // tool progress) may be truncated under sustained backpressure.
-func isCriticalCodexNotification(method string) bool {
-	switch method {
+func isCriticalCodexNotification(message agentprotocol.RPCMessage) bool {
+	switch message.Method {
 	case "turn/started", "turn/completed",
 		"thread/started", "thread/tokenUsage/updated":
 		return true
@@ -230,7 +209,7 @@ func (s *Session) handleNotification(message agentprotocol.RPCMessage) {
 	case "item/agentMessage/delta":
 		if s.notificationForActive(params) {
 			if delta := stringValue(params["delta"]); delta != "" {
-				s.emit(Event{Kind: EventText, Text: delta})
+				s.core.Emit(Event{Kind: EventText, Text: delta})
 			}
 		}
 	case "item/started":
@@ -254,14 +233,14 @@ func (s *Session) handleReverse(_ context.Context, message agentprotocol.RPCMess
 	switch message.Method {
 	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval":
 		id := stringValue(params["itemId"])
-		s.emit(Event{Kind: EventPermission, Permission: &PermissionRequest{ID: id, Action: message.Method, Detail: approvalDetail(params)}})
+		s.core.Emit(Event{Kind: EventPermission, Permission: &PermissionRequest{ID: id, Action: message.Method, Detail: approvalDetail(params)}})
 		decision := "decline"
 		if s.opts.Permission == "auto" {
 			decision = "acceptForSession"
 		}
 		return map[string]any{"decision": decision}, nil
 	case "item/tool/requestUserInput":
-		s.emit(Event{Kind: EventError, Err: protocolError("interactive user input is disabled in unattended gateway mode")})
+		s.core.Emit(Event{Kind: EventError, Err: protocolError("interactive user input is disabled in unattended gateway mode")})
 		return map[string]any{"answers": map[string]any{}}, nil
 	default:
 		return nil, &agentprotocol.RPCError{Code: -32601, Message: "unsupported server request"}
@@ -280,7 +259,7 @@ func approvalDetail(params map[string]any) string {
 func (s *Session) handleItemStarted(item map[string]any) {
 	if stringValue(item["type"]) == "reasoning" {
 		if text := reasoningSummary(item["summary"]); text != "" {
-			s.emit(Event{Kind: EventReasoning, Reasoning: &Reasoning{ID: stringValue(item["id"]), Text: text}})
+			s.core.Emit(Event{Kind: EventReasoning, Reasoning: &Reasoning{ID: stringValue(item["id"]), Text: text}})
 		}
 		return
 	}
@@ -300,7 +279,7 @@ func (s *Session) handleItemStarted(item map[string]any) {
 	}
 	turn.tools[tool.ID] = tool
 	s.mu.Unlock()
-	s.emit(Event{Kind: EventToolUse, Tool: &tool})
+	s.core.Emit(Event{Kind: EventToolUse, Tool: &tool})
 }
 
 func reasoningSummary(value any) string {
@@ -345,10 +324,10 @@ func (s *Session) handleItemCompleted(item map[string]any) {
 		start := tool
 		start.Result = ""
 		start.IsError = false
-		s.emit(Event{Kind: EventToolUse, Tool: &start})
+		s.core.Emit(Event{Kind: EventToolUse, Tool: &start})
 	}
 	tool.Result, tool.IsError = toolResult(item)
-	s.emit(Event{Kind: EventToolResult, Tool: &tool})
+	s.core.Emit(Event{Kind: EventToolResult, Tool: &tool})
 }
 
 func (s *Session) recordUsage(params map[string]any) {
@@ -373,7 +352,7 @@ func (s *Session) completeTurn(params map[string]any) {
 	// processed on a separate goroutine from the display drain. Wait for the
 	// display queue to flush the turn's item events before finalizing, so
 	// finish never precedes tool/text events the consumer reads up to finish.
-	s.rpc.Sync()
+	s.core.RPC().Sync()
 	turnValue := objectValue(params["turn"])
 	id := stringValue(turnValue["id"])
 	s.mu.Lock()
@@ -400,17 +379,29 @@ func (s *Session) completeTurn(params map[string]any) {
 	close(turn.done)
 	s.mu.Unlock()
 
+	// Converged abort semantics (D2): an aborted turn ALWAYS ends with
+	// finish("cancelled"). A native failure on an aborted turn is the
+	// interrupt's side effect, not a reportable run error — log it, never
+	// emit an error event (which the API would record as RunFailed).
 	if status == "failed" {
-		s.emit(Event{Kind: EventError, Err: protocolError("turn failed: %s", turnError(turnValue))})
+		if aborted {
+			slog.Warn("codex: turn failed after abort", "thread_id", s.NativeSessionID(), "detail", turnError(turnValue))
+			s.core.Emit(Event{Kind: EventFinish, FinishReason: "cancelled", NativeSessionID: s.NativeSessionID()})
+			if usage != nil {
+				s.core.Emit(Event{Kind: EventUsage, Usage: usage, NativeSessionID: s.NativeSessionID()})
+			}
+			return
+		}
+		s.core.Emit(Event{Kind: EventError, Err: protocolError("turn failed: %s", turnError(turnValue))})
 		return
 	}
 	reason := "end_turn"
 	if aborted || status == "interrupted" {
 		reason = "cancelled"
 	}
-	s.emit(Event{Kind: EventFinish, FinishReason: reason, NativeSessionID: s.NativeSessionID()})
+	s.core.Emit(Event{Kind: EventFinish, FinishReason: reason, NativeSessionID: s.NativeSessionID()})
 	if usage != nil {
-		s.emit(Event{Kind: EventUsage, Usage: usage, NativeSessionID: s.NativeSessionID()})
+		s.core.Emit(Event{Kind: EventUsage, Usage: usage, NativeSessionID: s.NativeSessionID()})
 	}
 }
 
@@ -454,73 +445,16 @@ func (s *Session) clearActive(turn *activeTurn) {
 
 func (s *Session) updateThreadID(id string) {
 	if id != "" && id != s.NativeSessionID() {
-		s.threadID.Store(id)
-		s.emit(Event{Kind: EventNativeSession, NativeSessionID: id})
+		s.core.SetNativeID(id)
+		s.core.Emit(Event{Kind: EventNativeSession, NativeSessionID: id})
 	}
 }
 
-func (s *Session) emit(event Event) {
-	select {
-	case s.events <- event:
-	case <-s.ctx.Done():
-	}
-}
+func (s *Session) Events() <-chan Event { return s.core.Events() }
 
-// onNotifyOverflow surfaces a notification-truncation marker when the JSON-RPC
-// reader dropped notifications because a stalled consumer saturated the queue.
-// It is best-effort: if the consumer is still stalled the marker waits (done-
-// guarded) like any other event.
-func (s *Session) onNotifyOverflow(dropped int) {
-	s.emit(Event{Kind: EventReasoning, Reasoning: &Reasoning{Text: fmt.Sprintf("[%d notifications truncated]", dropped)}})
-}
+func (s *Session) NativeSessionID() string { return s.core.NativeID() }
 
-func (s *Session) monitor() {
-	<-s.rpc.Done()
-	waitErr := s.process.Wait()
-	s.alive.Store(false)
-	if !s.closing.Load() {
-		message := strings.TrimSpace(s.process.StderrString())
-		if message == "" {
-			if waitErr != nil {
-				message = waitErr.Error()
-			} else if err := s.rpc.Err(); err != nil && !errors.Is(err, io.EOF) {
-				message = err.Error()
-			}
-		}
-		if message != "" {
-			s.emit(Event{Kind: EventError, Err: protocolError("app-server exited: %s", message)})
-		}
-	}
-	s.close.Do(func() {
-		// Cancel first so any emitter blocked in emit's select returns, then
-		// wait for the JSON-RPC notification drain goroutine to stop calling
-		// notify before closing s.events. Otherwise a drain mid-emit would
-		// send on a closed channel.
-		s.cancel()
-		if ch := s.rpc.NotifyDone(); ch != nil {
-			<-ch
-		}
-		close(s.events)
-		close(s.done)
-	})
-}
-
-func (s *Session) cleanupFailedStart() {
-	s.closing.Store(true)
-	s.cancel()
-	_ = s.rpc.Close()
-	_ = s.process.ForceKill()
-	_ = s.process.Wait()
-}
-
-func (s *Session) Events() <-chan Event { return s.events }
-
-func (s *Session) NativeSessionID() string {
-	id, _ := s.threadID.Load().(string)
-	return id
-}
-
-func (s *Session) Alive() bool { return s.alive.Load() }
+func (s *Session) Alive() bool { return s.core.Alive() }
 
 // Abort interrupts only the active turn and preserves the app-server process.
 // If the turn id has not yet been published (abort racing turn-start), Abort
@@ -543,7 +477,7 @@ func (s *Session) Abort(ctx context.Context) error {
 		// turn/start). Wait for publication rather than returning a hard
 		// error that would cause the caller to tear down the entire
 		// persistent app-server.
-		timer := time.NewTimer(s.opts.CloseTimeout)
+		timer := time.NewTimer(s.core.CloseTimeout)
 		defer timer.Stop()
 		select {
 		case <-idPublished:
@@ -553,71 +487,31 @@ func (s *Session) Abort(ctx context.Context) error {
 		case <-done:
 			return nil // turn completed before id was published
 		case <-ctx.Done():
-			return s.abortEscalation(ctx, fmt.Errorf("abort wait: %w", ctx.Err()))
+			return s.core.AbortEscalation(fmt.Errorf("abort wait: %w", ctx.Err()))
 		case <-timer.C:
-			return s.abortEscalation(ctx, fmt.Errorf("abort: turn id not published within %s", s.opts.CloseTimeout))
+			return s.core.AbortEscalation(fmt.Errorf("abort: turn id not published within %s", s.core.CloseTimeout))
 		}
 		if id == "" {
 			return nil // publication signalled but id still empty — nothing to cancel
 		}
 	}
-	if err := s.rpc.Call(ctx, "turn/interrupt", map[string]any{"threadId": s.NativeSessionID(), "turnId": id}, nil); err != nil {
-		return s.abortEscalation(ctx, fmt.Errorf("turn/interrupt: %w", err))
+	if err := s.core.RPC().Call(ctx, "turn/interrupt", map[string]any{"threadId": s.NativeSessionID(), "turnId": id}, nil); err != nil {
+		return s.core.AbortEscalation(fmt.Errorf("turn/interrupt: %w", err))
 	}
-	timer := time.NewTimer(s.opts.CloseTimeout)
+	timer := time.NewTimer(s.core.CloseTimeout)
 	defer timer.Stop()
 	select {
 	case <-done:
 		return nil
 	case <-ctx.Done():
-		return s.abortEscalation(ctx, fmt.Errorf("interrupt wait: %w", ctx.Err()))
+		return s.core.AbortEscalation(fmt.Errorf("interrupt wait: %w", ctx.Err()))
 	case <-timer.C:
-		return s.abortEscalation(ctx, fmt.Errorf("interrupt timed out after %s", s.opts.CloseTimeout))
+		return s.core.AbortEscalation(fmt.Errorf("interrupt timed out after %s", s.core.CloseTimeout))
 	}
-}
-
-func (s *Session) abortEscalation(_ context.Context, cause error) error {
-	s.closing.Store(true)
-	s.alive.Store(false)
-	s.cancel()
-	_ = s.rpc.Close()
-	_ = s.process.ForceKill()
-	_ = s.process.Wait()
-	return protocolError("abort: %w", cause)
 }
 
 // Close terminates and reaps the persistent app-server once.
-func (s *Session) Close(ctx context.Context) error {
-	if !s.alive.Swap(false) {
-		select {
-		case <-s.done:
-			return nil
-		default:
-		}
-	}
-	s.closing.Store(true)
-	s.cancel()
-	_ = s.rpc.Close()
-	timer := time.NewTimer(s.opts.CloseTimeout)
-	defer timer.Stop()
-	select {
-	case <-s.done:
-		return nil
-	case <-ctx.Done():
-		_ = s.process.ForceKill()
-		return protocolError("close wait: %w", ctx.Err())
-	case <-timer.C:
-		_ = s.process.ForceKill()
-		reapTimer := time.NewTimer(s.opts.CloseTimeout)
-		defer reapTimer.Stop()
-		select {
-		case <-s.done:
-			return nil
-		case <-reapTimer.C:
-			return protocolError("close timed out after %s", 2*s.opts.CloseTimeout)
-		}
-	}
-}
+func (s *Session) Close(ctx context.Context) error { return s.core.Close(ctx) }
 
 func objectValue(value any) map[string]any {
 	result, _ := value.(map[string]any)
