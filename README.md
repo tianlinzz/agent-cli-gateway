@@ -205,6 +205,7 @@ See [`config.example.toml`](config.example.toml) for a full annotated example.
 | `[server]` | `listen_addr` | `:4096` | HTTP listen address |
 | `[server]` | `drain_timeout` | `30s` | HTTP request drain bound during Gateway shutdown |
 | `[server]` | `read_header_timeout` / `idle_timeout` / `max_header_bytes` | `10s` / `60s` / `1048576` | Slow-header / keep-alive / header-size bounds (no `WriteTimeout` so SSE survives) |
+| `[server]` | `turn_timeout` | `10m` | Gateway run deadline per turn (`0` = disabled); enforced at the worker boundary and presented uniformly (HTTP 504 / SSE error frame, code `turn_timeout`) |
 | `[worker]` | `stop_grace_period` | `10s` | CloseSession/SIGTERM grace before SIGKILL |
 | `[worker]` | `heartbeat_interval` / `heartbeat_timeout` / `heartbeat_failures` | `15s` / `3s` / `3` | Runtime Worker failure detection |
 | `[sessions]` | `idle_timeout` / `reap_interval` | `2h` / `1m` | Idle Worker reclamation; conversation/native session identity is retained |
@@ -218,8 +219,9 @@ See [`config.example.toml`](config.example.toml) for a full annotated example.
 | `[isolation.user_namespace]` | `enabled`, `uid`, `gid` | `true`, `65532`, `65532` | Unprivileged user namespace |
 | `[isolation.seccomp]` | `policy` | `kafel` | `kafel` or `off` (test only); policy arch is selected from `GOARCH` |
 | `[agents.<id>]` | `enabled` | `false` | Whether the agent is available (see "Installing and enabling an agent") |
-| `[agents.<id>]` | `command` | *(empty)* | CLI executable name/path; probed before the agent is advertised |
+| `[agents.<id>]` | `command` | *(empty)* | CLI command as an argv array (`command = ["codex"]`), executed verbatim (no shell); the executable is probed before the agent is advertised. A plain string is accepted for one deprecation window |
 | `[agents.<id>]` | `permission` | `auto` | `auto` / `ask` / `deny` |
+| `[agents.<id>]` | `timeout` | *(falls back to `server.turn_timeout`)* | Per-agent turn deadline; honored by every adapter at the worker boundary |
 | `[agents.<id>]` | `inject_system_prompt` | `false` | Forward caller `system` role messages into the native prompt each turn |
 
 Agent settings are passed to the single-session worker over the canonical RPC
@@ -233,9 +235,9 @@ so `/v1/models` advertises nothing out of the box. To make an agent available:
 1. install its CLI, then
 2. set `[agents.<id>] enabled = true` and `command` to the installed binary.
 
-Model discovery probes that `command` (`exec.LookPath`) and only advertises an
-agent whose CLI is actually installed, so the image can never claim an agent it
-cannot run. This is a **presence check**, not a version/health probe: it does
+Model discovery probes the command's executable (`exec.LookPath` on `argv[0]`)
+and only advertises an agent whose CLI is actually installed, so the image can
+never claim an agent it cannot run. This is a **presence check**, not a version/health probe: it does
 not execute the CLI or validate its version (the API process never launches an
 Agent CLI; version/readiness probing is deferred to Phase 5, where Workers
 advertise their native CLI versions). The three CLIs are Node packages:
@@ -256,7 +258,7 @@ make image-product CODEX_VERSION=... CLAUDE_VERSION=...
 
 `docker/Dockerfile.agents` layers Node.js and the pinned npm packages onto the
 base image, then mount (or let the entrypoint write) a config that enables
-them, e.g. `[agents.codex] enabled = true` + `command = "codex"`.
+them, e.g. `[agents.codex] enabled = true` + `command = ["codex"]`.
 
 > **The provided product image ships two agents (Codex + Claude Code).** Kimi's
 > published npm package name is not pinned in this repository, so it is not
@@ -296,7 +298,10 @@ cmd/gateway  (API process + worker Supervisor)
               ▼
 cmd/gateway-worker   (one per session; the ONLY process that runs agent CLIs)
   └── adapters/{codex,claudecode,kimi}   runtime/native mapping only
+        │   (shared wrapper + turn-deadline enforcement: adapters/internal/bridge)
         └── agent/{codex,claudecode,kimi} native execution + protocol
+              (shared event contract: agent/events; shared JSON-RPC session
+               lifecycle: agent/rpcsession)
 ```
 
 - The API process **never** launches an agent CLI — every execution flows
@@ -304,6 +309,14 @@ cmd/gateway-worker   (one per session; the ONLY process that runs agent CLIs)
 - Native packages cannot import `runtime`, adapters, Worker, API, or config.
   Adapters cannot launch processes or parse raw Agent protocols. Worker and API
   packages never contain concrete Agent protocol knowledge.
+- Per-agent deployment config reaches adapter factories as typed
+  `runtime.AdapterConfig` — there is no environment-variable roundtrip.
+- Turn deadlines are a three-layer contract: HTTP transport bounds headers/idle
+  only (SSE is never cut by a write deadline); the gateway run deadline
+  (`server.turn_timeout`, `agents.<id>.timeout`) is enforced at the worker
+  boundary (the bridge aborts the native turn) and presented uniformly by the
+  API (504 / SSE error frame, code `turn_timeout`); native sessions bound only
+  their settle/teardown waits (`CloseTimeout`).
 
 ## Docker
 
