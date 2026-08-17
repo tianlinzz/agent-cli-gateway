@@ -20,9 +20,10 @@ var (
 )
 
 // RunStore is the metadata store for gateway runs (individual Agent turns).
-// The in-memory implementation (NewMemoryRunStore) is the phase-2 store; a
-// future persistent store (Redis/DB) replaces this interface without touching
-// the API or worker layers. Every read returns a deep copy.
+// The in-memory implementation (NewMemoryRunStore) is the volatile default;
+// the bbolt-backed persistent implementation lives in package store. Both
+// satisfy this interface without touching the API or worker layers. Every
+// read returns a deep copy.
 type RunStore interface {
 	// Create stores a new run record. Fails with ErrRunExists if the ID is
 	// already taken and ErrInvalidRun if the record is malformed.
@@ -49,6 +50,16 @@ type RunStore interface {
 	// Prune deletes every run that reached a terminal status before maxAge and
 	// returns the count removed. Non-terminal runs are never pruned.
 	Prune(ctx context.Context, now time.Time, maxAge time.Duration) (int, error)
+}
+
+// RunEnumerator is an OPTIONAL extension implemented by stores that can
+// enumerate every run record. It is deliberately NOT part of RunStore: only
+// the trusted gateway startup path (crash/restart reconciliation, which must
+// find every non-terminal run) uses it. Both the in-memory store below and
+// the bbolt store (package store) implement it.
+type RunEnumerator interface {
+	// ListAllRuns returns deep copies of every stored run record.
+	ListAllRuns(ctx context.Context) ([]RunRecord, error)
 }
 
 // NewMemoryRunStore returns the in-memory RunStore implementation.
@@ -134,6 +145,17 @@ func (s *memRunStore) Delete(_ context.Context, id string) error {
 	}
 	delete(s.byID, id)
 	return nil
+}
+
+// ListAllRuns implements RunEnumerator. Trusted startup reconcile only.
+func (s *memRunStore) ListAllRuns(_ context.Context) ([]RunRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]RunRecord, 0, len(s.byID))
+	for _, rec := range s.byID {
+		out = append(out, rec)
+	}
+	return out, nil
 }
 
 func (s *memRunStore) Prune(_ context.Context, now time.Time, maxAge time.Duration) (int, error) {

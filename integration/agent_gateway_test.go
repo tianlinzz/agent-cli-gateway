@@ -40,6 +40,7 @@ import (
 	"github.com/tianlinzz/agent-cli-gateway/config"
 	"github.com/tianlinzz/agent-cli-gateway/metrics"
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
+	"github.com/tianlinzz/agent-cli-gateway/store"
 	"github.com/tianlinzz/agent-cli-gateway/worker"
 )
 
@@ -1034,5 +1035,174 @@ func TestIntegration_OverloadFairnessAndFaultStress(t *testing.T) {
 	}
 	if !strings.Contains(text, `status="outcome_unknown"`) {
 		t.Errorf("unknown outcomes were not recorded:\n%s", text)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Restart recovery with the bbolt metadata store (PR 1, ROADMAP §4.3)
+// ---------------------------------------------------------------------------
+
+// TestIntegration_BoltStoreSurvivesRestart proves the restart contract over
+// the real HTTP API: with the bbolt store driver, a session created before a
+// graceful gateway stop is still resumable after a "restart" (new handler +
+// new supervisor over the reopened database), and a run that was still in
+// starting when the process stopped is reconciled to outcome_unknown instead
+// of being replayed.
+func TestIntegration_BoltStoreSurvivesRestart(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "gateway.db")
+
+	// gatewayPhase is one "process lifetime": backend + handler + HTTP server.
+	type gatewayPhase struct {
+		ts  *httptest.Server
+		h   *openai.Handler
+		sup *worker.Supervisor
+	}
+	startPhase := func(t *testing.T, sessions runtime.SessionStore, runs runtime.RunStore) *gatewayPhase {
+		t.Helper()
+		runtimeDir, err := os.MkdirTemp(os.TempDir(), "gwint-b-")
+		if err != nil {
+			t.Fatalf("mkdir runtime dir: %v", err)
+		}
+		backend, err := worker.NewLocalExecutionBackend(worker.Config{
+			Mode:            config.ModeTest,
+			Isolation:       config.IsolationConfig{Required: false},
+			WorkspaceRoot:   t.TempDir(),
+			RuntimeDir:      runtimeDir,
+			WorkerExec:      stubWorkerBin,
+			StartTimeout:    10 * time.Second,
+			StopGracePeriod: 5 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("NewLocalExecutionBackend: %v", err)
+		}
+		reg := runtime.NewRegistry()
+		registerFake(t, reg, "codex", "Codex")
+		h := openai.NewHandler(openai.Options{
+			Registry:     reg,
+			Store:        sessions,
+			Runs:         runs,
+			Backend:      backend,
+			CallerTokens: map[string]string{intToken: "integration-caller"},
+			TurnTimeout:  15 * time.Second,
+			UsageGrace:   40 * time.Millisecond,
+			Enabled:      func(name string) bool { return true },
+		})
+		return &gatewayPhase{ts: httptest.NewServer(h.Routes()), h: h, sup: backend.Supervisor()}
+	}
+	// stopPhase is a graceful stop: drain the API, close the handler, reap
+	// workers — but NOT the metadata store (the caller closes it explicitly).
+	stopPhase := func(t *testing.T, p *gatewayPhase) {
+		t.Helper()
+		p.ts.Close()
+		p.h.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := p.sup.Close(ctx); err != nil {
+			t.Fatalf("supervisor close: %v", err)
+		}
+	}
+	post := func(t *testing.T, ts *httptest.Server, sessionID string) *http.Response {
+		t.Helper()
+		body, err := json.Marshal(chatBody("codex", false, "ws-1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, err := http.NewRequest("POST", ts.URL+"/v1/chat/completions", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+intToken)
+		req.Header.Set("X-User-Id", intOwner)
+		req.Header.Set("Content-Type", "application/json")
+		if sessionID != "" {
+			req.Header.Set("X-Gateway-Session-Id", sessionID)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+
+	// --- Phase 1: serve one turn with the bbolt store, then stop.
+	bs, err := store.OpenBolt(dbPath, runtime.SessionLimits{})
+	if err != nil {
+		t.Fatalf("OpenBolt: %v", err)
+	}
+	p1 := startPhase(t, bs, bs.Runs())
+	resp1 := post(t, p1.ts, "")
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("phase 1 turn status = %d (body %s)", resp1.StatusCode, readBody(t, resp1))
+	}
+	sid := resp1.Header.Get("X-Gateway-Session-Id")
+	if sid == "" {
+		t.Fatal("no X-Gateway-Session-Id in phase 1 response")
+	}
+	// Simulate a run that was still in flight when the process stopped.
+	if err := bs.Runs().Create(context.Background(), runtime.RunRecord{
+		ID: "run-in-flight", SessionID: sid, CallerID: "integration-caller", Status: runtime.RunStarting,
+	}); err != nil {
+		t.Fatalf("inject in-flight run: %v", err)
+	}
+	stopPhase(t, p1)
+	if err := bs.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	// --- Phase 2: reopen the same database, reconcile (startup recovery),
+	// then serve again.
+	bs2, err := store.OpenBolt(dbPath, runtime.SessionLimits{})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	report, err := store.Reconcile(context.Background(), bs2, bs2.Runs(), time.Now())
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if report.RunsMarkedUnknown != 1 {
+		t.Fatalf("RunsMarkedUnknown = %d, want 1", report.RunsMarkedUnknown)
+	}
+	run, err := bs2.Runs().Get(context.Background(), "run-in-flight")
+	if err != nil {
+		t.Fatalf("get in-flight run after reconcile: %v", err)
+	}
+	if run.Status != runtime.RunOutcomeUnknown || run.ErrorCode != store.RestartErrorCode || run.FinishedAt.IsZero() {
+		t.Fatalf("in-flight run after restart = %+v, want outcome_unknown/gateway_restart/stamped", run)
+	}
+	// The persisted session record survived the restart with its metadata.
+	persisted, err := bs2.Get(context.Background(), sid, "integration-caller")
+	if err != nil {
+		t.Fatalf("session %q lost across restart: %v", sid, err)
+	}
+	if persisted.Status != runtime.SessionActive {
+		t.Fatalf("session status after restart = %q, want active", persisted.Status)
+	}
+
+	p2 := startPhase(t, bs2, bs2.Runs())
+	defer func() {
+		p2.ts.Close()
+		p2.h.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := p2.sup.Close(ctx); err != nil {
+			t.Errorf("supervisor close: %v", err)
+		}
+		if err := bs2.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
+
+	// The same session id must NOT 404: the gateway resumes the persisted
+	// session on a fresh worker execution.
+	resp2 := post(t, p2.ts, sid)
+	if resp2.StatusCode == http.StatusNotFound {
+		t.Fatalf("session %q returned 404 after restart (body %s)", sid, readBody(t, resp2))
+	}
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("resumed turn status = %d (body %s)", resp2.StatusCode, readBody(t, resp2))
+	}
+	if got := resp2.Header.Get("X-Gateway-Session-Id"); got != sid {
+		t.Fatalf("resumed session id = %q, want %q", got, sid)
 	}
 }

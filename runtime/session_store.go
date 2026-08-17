@@ -37,9 +37,10 @@ var (
 )
 
 // SessionStore is the metadata store for gateway sessions. The in-memory
-// implementation (NewMemorySessionStore) is the phase-1 store; a future
-// PersistentSessionStore (Redis/DB) replaces this interface without touching
-// the API or worker layers. Every read returns a deep copy, and every
+// implementation (NewMemorySessionStore) is the volatile default; the
+// bbolt-backed persistent implementation lives in package store and survives
+// gateway restarts. Both satisfy this interface without touching the API or
+// worker layers. Every read returns a deep copy, and every
 // operation is scoped to the owner so one tenant can never observe another's
 // sessions.
 type SessionStore interface {
@@ -86,6 +87,19 @@ type SessionStore interface {
 	// for the evicted sessions; they carry no cross-tenant information beyond
 	// what the gateway already owns.
 	Prune(ctx context.Context, now time.Time) ([]string, error)
+}
+
+// SessionEnumerator is an OPTIONAL extension implemented by stores that can
+// enumerate every record regardless of owner. It is deliberately NOT part of
+// SessionStore: the API layer must never enumerate across owners. Only the
+// trusted gateway startup path (crash/restart reconciliation, which must
+// inspect turn_active sessions of every owner) uses it. Both the in-memory
+// store below and the bbolt store (package store) implement it, so a single
+// reconcile routine handles every backend.
+type SessionEnumerator interface {
+	// ListAllSessions returns deep copies of every stored session record,
+	// including expired and turn-active ones, regardless of owner.
+	ListAllSessions(ctx context.Context) ([]SessionRecord, error)
 }
 
 // NewMemorySessionStore returns the in-memory SessionStore implementation. It
@@ -303,6 +317,18 @@ func (s *memSessionStore) Prune(ctx context.Context, now time.Time) ([]string, e
 		removed = append(removed, id)
 	}
 	return removed, nil
+}
+
+// ListAllSessions implements SessionEnumerator. Trusted startup reconcile
+// only; never expose to request paths.
+func (s *memSessionStore) ListAllSessions(_ context.Context) ([]SessionRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]SessionRecord, 0, len(s.byID))
+	for _, rec := range s.byID {
+		out = append(out, rec)
+	}
+	return out, nil
 }
 
 // lookupLocked resolves and owner-checks a session. The caller must hold s.mu.

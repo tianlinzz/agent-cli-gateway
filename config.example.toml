@@ -82,6 +82,26 @@ callers = [{ id = "example-client", tokens = ["change-me"] }]
 # path; clients reference workspaces by opaque ID and can never inject a path.
 root = "/srv/workspaces"
 
+[store]
+# Session/run metadata backend. "memory" (default) is volatile: records die
+# with the process. "bbolt" persists records in one embedded database file so
+# sessions (and their native resume IDs) survive a gateway restart; on boot
+# the gateway reconciles restart damage (sessions stuck in turn_active return
+# to active; runs stuck in starting/running are marked outcome_unknown with
+# error code "gateway_restart" and are NEVER replayed). bbolt allows exactly
+# ONE writer process per file — it is single-node persistence, not
+# multi-replica coordination (no cross-replica CAS; that needs a
+# PostgreSQL/Redis-class backend).
+# driver = "memory"
+# Path to the bbolt database file; REQUIRED when driver = "bbolt". The gateway
+# creates the parent directory (0700) and the file (0600).
+# path = "/var/lib/agent-gateway/meta.db"
+# How long an Idempotency-Key record is retained. While retained, a duplicate
+# chat-completions request with the same key is rejected (409 in-progress /
+# conflict) or replays the stored non-streaming response instead of starting a
+# second turn; after expiry the key may be claimed again. Default "24h".
+# idempotency_ttl = "24h"
+
 [isolation]
 # nsjail sandbox boundary (phase 1). The gateway forks one nsjail-wrapped
 # worker per session; nsjail runs unprivileged via user namespaces (no

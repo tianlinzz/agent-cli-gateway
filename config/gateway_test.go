@@ -506,3 +506,122 @@ worker_log_check_interval = "7s"
 		t.Fatalf("worker_log_check_interval = %s, want 7s", cfg.Limits.WorkerLogCheckInterval)
 	}
 }
+
+// TestLoadGateway_StoreDefaultsToMemory pins the zero-breakage contract: a
+// config without any [store] section loads with the volatile memory driver.
+func TestLoadGateway_StoreDefaultsToMemory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gw.toml")
+	if err := os.WriteFile(path, []byte(`
+mode = "test"
+
+[isolation]
+required = false
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadGateway(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Store.Driver != StoreDriverMemory {
+		t.Fatalf("store.driver = %q, want %q", cfg.Store.Driver, StoreDriverMemory)
+	}
+	if cfg.Store.Path != "" {
+		t.Fatalf("store.path = %q, want empty for memory driver", cfg.Store.Path)
+	}
+}
+
+// TestGatewayConfig_StoreDriverValidation rejects unknown drivers and a bbolt
+// driver without a database path, and accepts the valid combinations.
+func TestGatewayConfig_StoreDriverValidation(t *testing.T) {
+	base := DefaultGatewayConfig()
+	base.Mode = ModeTest
+	base.Isolation.Required = false
+	base.Auth.Required = false
+
+	unknown := base
+	unknown.Store.Driver = "redis"
+	if err := unknown.Validate(); err == nil || !strings.Contains(err.Error(), "store.driver") {
+		t.Fatalf("unknown driver: got %v, want store.driver rejection", err)
+	}
+
+	noPath := base
+	noPath.Store.Driver = StoreDriverBbolt
+	if err := noPath.Validate(); err == nil || !strings.Contains(err.Error(), "store.path") {
+		t.Fatalf("bbolt without path: got %v, want store.path rejection", err)
+	}
+
+	ok := base
+	ok.Store.Driver = StoreDriverBbolt
+	ok.Store.Path = "/var/lib/gateway/meta.db"
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("valid bbolt config: %v", err)
+	}
+
+	if err := base.Validate(); err != nil {
+		t.Fatalf("memory default: %v", err)
+	}
+}
+
+// TestLoadGateway_StoreBoltConfigParses verifies the [store] section parses
+// end to end.
+func TestLoadGateway_StoreBoltConfigParses(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gw.toml")
+	if err := os.WriteFile(path, []byte(`
+mode = "test"
+
+[isolation]
+required = false
+
+[store]
+driver = "bbolt"
+path = "/data/gateway.db"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadGateway(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Store.Driver != StoreDriverBbolt || cfg.Store.Path != "/data/gateway.db" {
+		t.Fatalf("store = %+v, want bbolt at /data/gateway.db", cfg.Store)
+	}
+}
+
+// TestLoadGateway_StoreIdempotencyTTL pins the retention contract: absent
+// means the 24h default, an explicit value parses, and a negative value is
+// rejected.
+func TestLoadGateway_StoreIdempotencyTTL(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	const prefix = "mode = \"test\"\n\n[isolation]\nrequired = false\n"
+
+	cfg, err := LoadGateway(write("default.toml", prefix))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Store.IdempotencyTTL != 24*time.Hour {
+		t.Fatalf("default store.idempotency_ttl = %s, want 24h", cfg.Store.IdempotencyTTL)
+	}
+
+	cfg, err = LoadGateway(write("explicit.toml", prefix+"\n[store]\nidempotency_ttl = \"2h\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Store.IdempotencyTTL != 2*time.Hour {
+		t.Fatalf("store.idempotency_ttl = %s, want 2h", cfg.Store.IdempotencyTTL)
+	}
+
+	if _, err := LoadGateway(write("negative.toml", prefix+"\n[store]\nidempotency_ttl = \"-1h\"\n")); err == nil ||
+		!strings.Contains(err.Error(), "idempotency_ttl") {
+		t.Fatalf("negative ttl: got %v, want idempotency_ttl rejection", err)
+	}
+}

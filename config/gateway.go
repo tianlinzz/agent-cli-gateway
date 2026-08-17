@@ -32,6 +32,14 @@ const (
 	SeccompOff   = "off"
 )
 
+// Store drivers for StoreConfig.Driver. The memory driver is volatile
+// (process-lifetime); the bbolt driver persists session/run metadata in one
+// embedded database file so sessions survive a gateway restart.
+const (
+	StoreDriverMemory = "memory"
+	StoreDriverBbolt  = "bbolt"
+)
+
 // GatewayConfig is the agent-gateway configuration. Clients only ever submit
 // an opaque workspace_id; the server resolves it to a directory under
 // Workspace.Root. There is deliberately no client-controllable workDir anywhere
@@ -49,6 +57,7 @@ type GatewayConfig struct {
 	Auth      AuthConfig      `toml:"auth"`
 	Workspace WorkspaceConfig `toml:"workspace"`
 	Isolation IsolationConfig `toml:"isolation"`
+	Store     StoreConfig     `toml:"store"`
 
 	// Agents configures individual agents, keyed by model/agent ID
 	// (e.g. "codex", "claude-code", "kimi").
@@ -302,6 +311,25 @@ type AgentConfig struct {
 	InjectSystemPrompt bool `toml:"inject_system_prompt"`
 }
 
+// StoreConfig selects the session/run metadata backend.
+type StoreConfig struct {
+	// Driver is "memory" (default; volatile, process-lifetime metadata) or
+	// "bbolt" (embedded single-file database; session and run metadata
+	// survive a gateway restart). bbolt allows exactly one writer process
+	// per database file, so it does not provide multi-replica coordination.
+	Driver string `toml:"driver"`
+	// Path is the bbolt database file. Required when Driver is "bbolt";
+	// ignored for "memory". The gateway creates the parent directory (0700)
+	// and the file (0600) at startup.
+	Path string `toml:"path"`
+	// IdempotencyTTL is how long an Idempotency-Key record is retained before
+	// it expires (and is reaped by the prune loop). Zero uses the default
+	// (24h). While a key is retained, a duplicate request is rejected with a
+	// conflict/in-progress response or replays the stored non-streaming
+	// response body instead of starting a second turn.
+	IdempotencyTTL time.Duration `toml:"idempotency_ttl"`
+}
+
 // DefaultGatewayConfig returns the recommended defaults. nsjail
 // isolation is required for prod and dev; only the test profile may disable
 // it. The three first-generation agents default to enabled with auto
@@ -335,6 +363,10 @@ func DefaultGatewayConfig() GatewayConfig {
 		Auth: AuthConfig{Required: true},
 		Workspace: WorkspaceConfig{
 			Root: "workspaces",
+		},
+		Store: StoreConfig{
+			Driver:         StoreDriverMemory,
+			IdempotencyTTL: 24 * time.Hour,
 		},
 		Isolation: IsolationConfig{
 			Required:      true,
@@ -423,6 +455,11 @@ func (c *GatewayConfig) normalize() {
 	if c.Isolation.Seccomp.Policy == "" {
 		c.Isolation.Seccomp.Policy = SeccompKafel
 	}
+	c.Store.Driver = strings.ToLower(strings.TrimSpace(c.Store.Driver))
+	if c.Store.Driver == "" {
+		c.Store.Driver = StoreDriverMemory
+	}
+	c.Store.Path = strings.TrimSpace(c.Store.Path)
 	for name, agent := range c.Agents {
 		seen := make(map[string]bool)
 		models := make([]string, 0, len(agent.Models))
@@ -536,6 +573,19 @@ func (c *GatewayConfig) Validate() error {
 
 	if strings.TrimSpace(c.Workspace.Root) == "" {
 		return fmt.Errorf("config: workspace.root must not be empty")
+	}
+
+	switch c.Store.Driver {
+	case StoreDriverMemory:
+	case StoreDriverBbolt:
+		if c.Store.Path == "" {
+			return fmt.Errorf("config: store.path must not be empty when store.driver is %q", StoreDriverBbolt)
+		}
+	default:
+		return fmt.Errorf("config: store.driver %q invalid (want %q or %q)", c.Store.Driver, StoreDriverMemory, StoreDriverBbolt)
+	}
+	if c.Store.IdempotencyTTL < 0 {
+		return fmt.Errorf("config: store.idempotency_ttl must not be negative")
 	}
 
 	for name, agent := range c.Agents {
