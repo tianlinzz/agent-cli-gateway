@@ -23,8 +23,10 @@ type Options struct {
 	WorkDir    string
 	Model      string
 	Mode       string
-	Timeout    time.Duration
 	Permission string
+	// TurnTimeout is the per-turn deadline enforced at the worker boundary
+	// (O-F09b); 0 disables it.
+	TurnTimeout time.Duration
 	// InjectSystemPrompt forwards caller-supplied system role messages into the
 	// native prompt at each turn.
 	InjectSystemPrompt bool
@@ -54,7 +56,7 @@ func optionsFromConfig(cfg runtime.AdapterConfig) Options {
 		WorkDir:            cfg.WorkspaceDir,
 		Model:              cfg.Execution.DefaultModel,
 		Mode:               "default",
-		Timeout:            cfg.Execution.TurnTimeout,
+		TurnTimeout:        cfg.Execution.TurnTimeout,
 		Permission:         cfg.Execution.Permission,
 		InjectSystemPrompt: cfg.Execution.InjectSystemPrompt,
 	}
@@ -107,12 +109,11 @@ func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.
 		Command: append([]string(nil), a.opts.Command...),
 		Env:     append([]string(nil), a.opts.Env...), WorkDir: a.opts.WorkDir,
 		Model: a.opts.Model, Mode: a.opts.Mode, Permission: a.opts.Permission, ResumeID: resumeID,
-		Timeout: a.opts.Timeout,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return bridge.Wrap(session, bridge.WrapOptions{Adapter: "kimi", InjectSystemPrompt: a.opts.InjectSystemPrompt}), nil
+	return bridge.Wrap(session, bridge.WrapOptions{Adapter: "kimi", InjectSystemPrompt: a.opts.InjectSystemPrompt, TurnTimeout: a.opts.TurnTimeout}), nil
 }
 
 // envSlice renders a config env map as the K=V slice the native process spec

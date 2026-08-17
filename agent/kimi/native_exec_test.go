@@ -27,8 +27,8 @@ func TestBuildArgsPassesConfiguredModelToACP(t *testing.T) {
 	}
 }
 
-func TestNormalizeOptionsUsesThirtyMinuteDefaultTurnTimeout(t *testing.T) {
-	if got := NormalizeOptions(Options{}).Timeout; got != 30*time.Minute {
+func TestNormalizeOptionsUsesDefaultCloseTimeout(t *testing.T) {
+	if got := NormalizeOptions(Options{}).CloseTimeout; got != 8*time.Second {
 		t.Fatalf("timeout = %s, want 30m", got)
 	}
 }
@@ -122,10 +122,10 @@ func TestRealKimiACPPersistentProcessTwoTurns(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	session, err := Start(ctx, Options{
-		Command:    []string{command},
-		WorkDir:    t.TempDir(),
-		Permission: "auto",
-		Timeout:    2 * time.Minute,
+		Command:      []string{command},
+		WorkDir:      t.TempDir(),
+		Permission:   "auto",
+		CloseTimeout: 2 * time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -160,7 +160,7 @@ func startKimiTestSession(t *testing.T, options Options, extra map[string]string
 	options.Command = []string{os.Args[0], "-test.run=TestKimiACPHelper", "--"}
 	options.Env = env
 	options.WorkDir = t.TempDir()
-	options.Timeout = time.Second
+	options.CloseTimeout = time.Second
 	session, err := Start(context.Background(), options)
 	if err != nil {
 		t.Fatal(err)

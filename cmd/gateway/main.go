@@ -35,7 +35,19 @@ var (
 	buildTime = "unknown"
 )
 
-func agentExecutionConfigs(in map[string]config.AgentConfig) map[string]runtime.AgentExecutionConfig {
+// effectiveTurnTimeout resolves the per-turn deadline every layer fires for
+// one agent (O-F09b): the per-agent timeout when configured, else the global
+// server default. The same value is handed to the workers (worker-boundary
+// enforcement) and the API handler (presentation + safety net) so both layers
+// fire the same deadline.
+func effectiveTurnTimeout(agent, global time.Duration) time.Duration {
+	if agent > 0 {
+		return agent
+	}
+	return global
+}
+
+func agentExecutionConfigs(in map[string]config.AgentConfig, defaultTurnTimeout time.Duration) map[string]runtime.AgentExecutionConfig {
 	out := make(map[string]runtime.AgentExecutionConfig, len(in))
 	for name, c := range in {
 		env := make(map[string]string, len(c.Env))
@@ -43,8 +55,25 @@ func agentExecutionConfigs(in map[string]config.AgentConfig) map[string]runtime.
 			env[k] = v
 		}
 		out[name] = runtime.AgentExecutionConfig{Command: c.Command.Argv(), DefaultModel: c.DefaultModel,
-			Permission: c.Permission, TurnTimeout: c.Timeout, MaxConcurrency: c.MaxConcurrency, Env: env,
+			Permission: c.Permission, TurnTimeout: effectiveTurnTimeout(c.Timeout, defaultTurnTimeout),
+			MaxConcurrency: c.MaxConcurrency, Env: env,
 			InjectSystemPrompt: c.InjectSystemPrompt}
+	}
+	return out
+}
+
+// agentTurnTimeouts derives the per-adapter deadline map for the API layer:
+// only agents with a configured per-agent timeout get an entry; the rest use
+// the global server.turn_timeout.
+func agentTurnTimeouts(in map[string]config.AgentConfig) map[string]time.Duration {
+	var out map[string]time.Duration
+	for name, c := range in {
+		if c.Timeout > 0 {
+			if out == nil {
+				out = make(map[string]time.Duration)
+			}
+			out[name] = c.Timeout
+		}
 	}
 	return out
 }
@@ -165,7 +194,7 @@ func main() {
 		SessionReapInterval: cfg.Sessions.ReapInterval,
 		MaxWorkers:          cfg.Limits.MaxWorkers,
 		MaxWorkerLogBytes:   cfg.Limits.MaxWorkerLogBytes,
-		Agents:              agentExecutionConfigs(cfg.Agents),
+		Agents:              agentExecutionConfigs(cfg.Agents, cfg.Server.TurnTimeout),
 		Metrics:             metricsReg,
 	})
 	if err != nil {
@@ -220,6 +249,10 @@ func main() {
 		Logger:           logger,
 		Metrics:          metricsReg,
 		Admission:        admit,
+		// The gateway run deadline (O-F09b): the API layer fires the same
+		// effective per-agent deadline the worker boundary enforces.
+		TurnTimeout:  cfg.Server.TurnTimeout,
+		TurnTimeouts: agentTurnTimeouts(cfg.Agents),
 		Enabled: func(name string) bool {
 			agent, ok := cfg.Agents[name]
 			return !ok || agent.Enabled

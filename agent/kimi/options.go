@@ -13,7 +13,11 @@ type Options struct {
 	Mode       string
 	Permission string
 	ResumeID   string
-	Timeout    time.Duration
+	// CloseTimeout bounds how long Abort and Close wait for an in-flight
+	// prompt to settle before escalating to a process kill. It is NOT a turn
+	// deadline: the per-turn deadline is enforced at the worker boundary
+	// (O-F09b); the native session only bounds its settle/teardown waits.
+	CloseTimeout time.Duration
 }
 
 func NormalizeOptions(opts Options) Options {
@@ -38,8 +42,8 @@ func NormalizeOptions(opts Options) Options {
 	default:
 		opts.Permission = "auto"
 	}
-	if opts.Timeout <= 0 {
-		opts.Timeout = 30 * time.Minute
+	if opts.CloseTimeout <= 0 {
+		opts.CloseTimeout = 8 * time.Second
 	}
 	return opts
 }

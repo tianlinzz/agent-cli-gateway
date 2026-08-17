@@ -26,15 +26,6 @@ const (
 	PermissionDeny = "deny"
 )
 
-// agentsHonoringTurnTimeout lists the adapters that currently consume the
-// per-agent agents.<id>.timeout setting as a native turn bound. Other adapters
-// silently ignore it today, so a configured timeout on them is a
-// misconfiguration that fails closed at startup. This set is removed once the
-// unified turn-deadline contract (O-F09b) makes every adapter honor it.
-var agentsHonoringTurnTimeout = map[string]bool{
-	"kimi": true,
-}
-
 // Seccomp policy modes for IsolationConfig.Seccomp.Policy.
 const (
 	SeccompKafel = "kafel"
@@ -79,6 +70,14 @@ type ServerConfig struct {
 	// MaxHeaderBytes caps the total size of all request headers. 0 means the
 	// net/http default (1 MiB).
 	MaxHeaderBytes int `toml:"max_header_bytes"`
+	// TurnTimeout is the gateway run deadline for a single turn: the bound
+	// every agent honors when agents.<id>.timeout does not override it
+	// (O-F09b). When it fires, the worker aborts the native turn and the API
+	// presents a unified timeout error (stream and non-stream alike). 0
+	// disables the deadline for agents without a per-agent timeout. Default
+	// 10m. Deliberately independent of the HTTP transport timeouts above —
+	// SSE responses must never be cut by a server-wide write deadline.
+	TurnTimeout time.Duration `toml:"turn_timeout"`
 }
 
 // WorkerConfig controls disposable Worker process lifecycle. These settings
@@ -289,7 +288,9 @@ type AgentConfig struct {
 	DefaultModel string `toml:"default_model"`
 	// Permission is "auto", "ask", or "deny". Empty defaults to "auto".
 	Permission string `toml:"permission"`
-	// Timeout bounds a single turn; zero means the adapter default.
+	// Timeout bounds a single turn for every adapter (the unified turn-deadline
+	// contract, O-F09b); zero falls back to server.turn_timeout. When the
+	// deadline fires the worker aborts the native turn.
 	Timeout time.Duration `toml:"timeout"`
 	// MaxConcurrency caps concurrent sessions for this agent; 0 = unlimited.
 	MaxConcurrency int `toml:"max_concurrency"`
@@ -315,6 +316,7 @@ func DefaultGatewayConfig() GatewayConfig {
 			ReadHeaderTimeout: 10 * time.Second,
 			IdleTimeout:       60 * time.Second,
 			MaxHeaderBytes:    1 << 20, // 1 MiB (net/http default)
+			TurnTimeout:       10 * time.Minute,
 		},
 		Worker: WorkerConfig{
 			StopGracePeriod:   10 * time.Second,
@@ -470,6 +472,9 @@ func (c *GatewayConfig) Validate() error {
 	if c.Server.MaxHeaderBytes < 0 {
 		return fmt.Errorf("config: server.max_header_bytes must not be negative")
 	}
+	if c.Server.TurnTimeout < 0 {
+		return fmt.Errorf("config: server.turn_timeout must not be negative")
+	}
 	if c.Worker.StopGracePeriod <= 0 {
 		return fmt.Errorf("config: worker.stop_grace_period must be positive")
 	}
@@ -544,12 +549,8 @@ func (c *GatewayConfig) Validate() error {
 			return fmt.Errorf("config: agents.%s.permission %q invalid (want %q, %q, or %q)",
 				name, agent.Permission, PermissionAuto, PermissionAsk, PermissionDeny)
 		}
-		// Per-agent timeout is consumed by only some adapters today; the rest
-		// silently ignore it. Fail closed so an operator never configures a
-		// safety bound that is then dropped. Removed by the unified
-		// turn-deadline contract (O-F09b).
-		if agent.Timeout > 0 && !agentsHonoringTurnTimeout[name] {
-			return fmt.Errorf("config: agents.%s.timeout is not honored by this adapter (only the kimi adapter consumes per-agent timeout today); remove this setting", name)
+		if agent.Timeout < 0 {
+			return fmt.Errorf("config: agents.%s.timeout must not be negative", name)
 		}
 	}
 	if c.Mode == ModeProd {

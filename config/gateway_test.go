@@ -307,40 +307,38 @@ func TestGatewayConfig_InvalidPermissionRejected(t *testing.T) {
 	}
 }
 
-// TestGatewayConfig_PerAgentTimeoutFailClosed is a regression test for the
-// silent-misconfiguration bug (O-F09a): agents.<id>.timeout was consumed only
-// by the kimi adapter and silently ignored by the others, so an operator could
-// configure a turn bound that was then dropped. A non-kimi agent with a
-// timeout must now fail closed at startup; kimi is accepted.
-func TestGatewayConfig_PerAgentTimeoutFailClosed(t *testing.T) {
+// TestGatewayConfig_PerAgentTimeoutHonoredByAllAdapters is the O-F09b
+// successor of the O-F09a fail-closed stopgap: the unified turn-deadline
+// contract makes agents.<id>.timeout a bound every adapter honors at the
+// worker boundary, so a timeout on ANY agent is valid configuration. Negative
+// durations still fail validation.
+func TestGatewayConfig_PerAgentTimeoutHonoredByAllAdapters(t *testing.T) {
 	base := func() GatewayConfig {
 		c := DefaultGatewayConfig()
 		c.Mode = ModeTest // bypass the prod auth-caller requirement
 		return c
 	}
-	// codex with a timeout is rejected.
+	for _, name := range []string{"codex", "claude-code", "kimi"} {
+		c := base()
+		c.Agents[name] = AgentConfig{Enabled: true, Permission: PermissionAuto, Timeout: 60 * time.Second}
+		if err := c.Validate(); err != nil {
+			t.Errorf("%s timeout: expected no error under the unified deadline contract, got %v", name, err)
+		}
+	}
+	// Negative timeouts remain invalid.
 	c := base()
-	c.Agents["codex"] = AgentConfig{Enabled: true, Permission: PermissionAuto, Timeout: 60 * time.Second}
+	c.Agents["codex"] = AgentConfig{Enabled: true, Permission: PermissionAuto, Timeout: -time.Second}
 	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "codex.timeout") {
-		t.Errorf("codex timeout: want error mentioning codex.timeout, got %v", err)
+		t.Errorf("negative codex timeout: want error mentioning codex.timeout, got %v", err)
 	}
-	// claude-code with a timeout is rejected.
-	c = base()
-	c.Agents["claude-code"] = AgentConfig{Enabled: true, Permission: PermissionAuto, Timeout: 60 * time.Second}
-	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "claude-code.timeout") {
-		t.Errorf("claude-code timeout: want error mentioning claude-code.timeout, got %v", err)
+	// server.turn_timeout defaults positive and negative values are rejected.
+	if d := DefaultGatewayConfig().Server.TurnTimeout; d != 10*time.Minute {
+		t.Errorf("default server.turn_timeout = %s, want 10m", d)
 	}
-	// kimi with a timeout is accepted (the only adapter that honors it today).
 	c = base()
-	c.Agents["kimi"] = AgentConfig{Enabled: true, Permission: PermissionAuto, Timeout: 60 * time.Second}
-	if err := c.Validate(); err != nil {
-		t.Errorf("kimi timeout: expected no error, got %v", err)
-	}
-	// A disabled agent with a timeout does not trigger the check.
-	c = base()
-	c.Agents["codex"] = AgentConfig{Enabled: false, Timeout: 60 * time.Second}
-	if err := c.Validate(); err != nil {
-		t.Errorf("disabled codex timeout: expected no error, got %v", err)
+	c.Server.TurnTimeout = -time.Second
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "turn_timeout") {
+		t.Errorf("negative server.turn_timeout: want error mentioning turn_timeout, got %v", err)
 	}
 }
 

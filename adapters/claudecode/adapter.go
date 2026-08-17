@@ -6,6 +6,7 @@ import (
 	"context"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/tianlinzz/agent-cli-gateway/adapters/internal/bridge"
 	native "github.com/tianlinzz/agent-cli-gateway/agent/claudecode"
@@ -32,6 +33,9 @@ type Options struct {
 	AllowedTools       []string
 	DisallowedTools    []string
 	MaxContextTokens   int
+	// TurnTimeout is the per-turn deadline enforced at the worker boundary
+	// (O-F09b); 0 disables it.
+	TurnTimeout time.Duration
 	// InjectSystemPrompt forwards caller-supplied system role messages into the
 	// native prompt at each turn.
 	InjectSystemPrompt bool
@@ -62,6 +66,7 @@ func optionsFromConfig(cfg runtime.AdapterConfig) Options {
 		Model:              cfg.Execution.DefaultModel,
 		Mode:               "default",
 		Permission:         cfg.Execution.Permission,
+		TurnTimeout:        cfg.Execution.TurnTimeout,
 		InjectSystemPrompt: cfg.Execution.InjectSystemPrompt,
 	}
 }
@@ -127,7 +132,7 @@ func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.
 	if err != nil {
 		return nil, err
 	}
-	return bridge.Wrap(session, bridge.WrapOptions{Adapter: "claudecode", InjectSystemPrompt: a.opts.InjectSystemPrompt}), nil
+	return bridge.Wrap(session, bridge.WrapOptions{Adapter: "claudecode", InjectSystemPrompt: a.opts.InjectSystemPrompt, TurnTimeout: a.opts.TurnTimeout}), nil
 }
 
 // envSlice renders a config env map as the K=V slice the native process spec

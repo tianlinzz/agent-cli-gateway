@@ -133,11 +133,16 @@ func (c streamChunk) withChoices(choices ...streamChoice) streamChunk {
 // and terminate the stream. A closed events channel (execution terminated)
 // drops the dead handle so a later resume starts fresh.
 //
+// adapterID selects the effective per-agent deadline (O-F09b). A turn that
+// exceeds its deadline is presented as an SSE error frame with the unified
+// turn_timeout code — never as a normal completion chunk with
+// finish_reason:"length" (a deadline is not a token-length limit).
+//
 // The returned status is a CONFIRMED terminal state only: a cancelled or
 // timed-out stream whose interrupt did not settle (abort RPC failed or the
 // terminal event never drained) returns RunOutcomeUnknown instead of
 // RunCancelled/RunTimedOut (final review P1).
-func (h *Handler) streamTurn(w http.ResponseWriter, r *http.Request, ctx context.Context, model, sessionID, callerID string, handle runtime.ExecutionHandle, includeUsage bool) (runStatus runtime.RunStatus) {
+func (h *Handler) streamTurn(w http.ResponseWriter, r *http.Request, ctx context.Context, model, adapterID, sessionID, callerID string, handle runtime.ExecutionHandle, includeUsage bool) (runStatus runtime.RunStatus) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, serverError("streaming not supported by the response writer"))
@@ -205,8 +210,8 @@ func (h *Handler) streamTurn(w http.ResponseWriter, r *http.Request, ctx context
 		}
 	}()
 	var timeout <-chan time.Time
-	if h.turnTimeout > 0 {
-		t := time.NewTimer(h.turnTimeout)
+	if d := h.turnDeadline(adapterID); d > 0 {
+		t := time.NewTimer(d)
 		defer t.Stop()
 		timeout = t.C
 	}
@@ -307,6 +312,16 @@ loop:
 					usage = usageFromRuntime(ev.Usage)
 				}
 			case runtime.EventError:
+				// A worker-boundary deadline whose abort did not settle: the
+				// turn's completion outcome is unknown. Present the unified
+				// timeout error; the worker already aborted (and escalated)
+				// natively, so no further API-side abort is needed.
+				if ev.Error == runtime.TurnDeadlineExceeded {
+					status = "timeout"
+					runStatus = runtime.RunOutcomeUnknown
+					deferredAbort = false
+					break loop
+				}
 				if err := writeSSEJSON(w, flusher, errorBody{Error: serverError(ev.Error)}); err != nil {
 					return runStatus
 				}
@@ -316,6 +331,14 @@ loop:
 			case runtime.EventFinish:
 				if ev.NativeSessionID != "" {
 					_, _ = h.store.Update(context.Background(), sessionID, callerID, func(rec *runtime.SessionRecord) { rec.NativeSessionID = ev.NativeSessionID })
+				}
+				// The worker boundary aborted this turn at its deadline and
+				// the abort settled: a confirmed timeout, never a completion.
+				if ev.FinishReason == runtime.FinishReasonTimeout {
+					status = "timeout"
+					runStatus = runtime.RunTimedOut
+					deferredAbort = false
+					break loop
 				}
 				finish = ev.FinishReason
 				finishSeen = true
@@ -329,7 +352,6 @@ loop:
 		case <-grace:
 			break loop
 		case <-timeout:
-			finish = "length"
 			status = "timeout"
 			h.markTurnSettling(sessionID)
 			settled := h.abortAndDrain(context.Background(), sessionID, handle)
@@ -343,7 +365,7 @@ loop:
 		}
 	}
 
-	if status != "error" {
+	if status == "normal" {
 		// Final chunk with the mapped finish reason.
 		fr := mapFinishReason(finish)
 		if err := writeChunk(base.withChoices(streamChoice{
@@ -361,10 +383,17 @@ loop:
 				return runStatus
 			}
 		}
+	} else if status == "timeout" {
+		// Unified timeout presentation (O-F09b): the same error shape the
+		// non-streaming surface returns with HTTP 504. Never a normal
+		// completion chunk — a deadline is not a token-length limit.
+		if err := writeSSEJSON(w, flusher, errorBody{Error: turnTimeoutError()}); err != nil {
+			return runStatus
+		}
 	}
-	// On a clean finish or a worker-reported error the turn is over on the
-	// worker side, so nothing is left to kill. A timeout means the agent may
-	// still be running: the deferred abort kills it after the stream ends.
+	// A timeout via the API timer has already drained and disabled the
+	// deferred abort in its branch; the worker-reported timeout paths set
+	// deferredAbort=false for the same reason. Nothing is left to kill.
 	if status != "timeout" {
 		deferredAbort = false
 	}

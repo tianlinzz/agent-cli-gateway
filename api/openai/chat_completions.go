@@ -515,11 +515,11 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 	if req.Stream {
 		includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
-		status := h.streamTurn(w, r, turnCtx, req.Model, sessionID, callerID, handle, includeUsage)
+		status := h.streamTurn(w, r, turnCtx, req.Model, route.AdapterID, sessionID, callerID, handle, includeUsage)
 		h.finishRun(runID, route.AdapterID, reqID, traceID, sessionID, callerID, workspaceID, workerStateOf(handle), runStartedAt, status, nil, "")
 		return
 	}
-	res := h.aggregateTurn(turnCtx, sessionID, callerID, handle)
+	res := h.aggregateTurn(turnCtx, sessionID, callerID, route.AdapterID, handle)
 	h.writeCompletion(w, r, req.Model, res)
 	h.finishRun(runID, route.AdapterID, reqID, traceID, sessionID, callerID, workspaceID, workerStateOf(handle), runStartedAt, runStatusFromTurnResult(res), res.usage, "")
 }
@@ -706,7 +706,9 @@ type turnResult struct {
 // into an OpenAI-shaped completion result. A closed events channel means the
 // execution terminated; the dead handle is dropped so a later resume starts a
 // fresh execution instead of calling Send on a dead session.
-func (h *Handler) aggregateTurn(ctx context.Context, sessionID, callerID string, handle runtime.ExecutionHandle) turnResult {
+//
+// adapterID selects the effective per-agent deadline (O-F09b).
+func (h *Handler) aggregateTurn(ctx context.Context, sessionID, callerID, adapterID string, handle runtime.ExecutionHandle) turnResult {
 	var res turnResult
 	finishSeen := false
 	var grace <-chan time.Time
@@ -717,8 +719,8 @@ func (h *Handler) aggregateTurn(ctx context.Context, sessionID, callerID string,
 		}
 	}()
 	var timeout <-chan time.Time
-	if h.turnTimeout > 0 {
-		t := time.NewTimer(h.turnTimeout)
+	if d := h.turnDeadline(adapterID); d > 0 {
+		t := time.NewTimer(d)
 		defer t.Stop()
 		timeout = t.C
 	}
@@ -765,6 +767,15 @@ func (h *Handler) aggregateTurn(ctx context.Context, sessionID, callerID string,
 					res.usage = usageFromRuntime(ev.Usage)
 				}
 			case runtime.EventError:
+				// A worker-boundary deadline whose abort did not settle: the
+				// turn's completion outcome is unknown. Present the unified
+				// timeout error and record RunOutcomeUnknown
+				// (timeoutSettled=false).
+				if ev.Error == runtime.TurnDeadlineExceeded {
+					res.timedOut = true
+					res.timeoutSettled = false
+					return res
+				}
 				res.failed = true
 				res.errMsg = ev.Error
 				return res
@@ -772,10 +783,17 @@ func (h *Handler) aggregateTurn(ctx context.Context, sessionID, callerID string,
 				if ev.NativeSessionID != "" {
 					_, _ = h.store.Update(context.Background(), sessionID, callerID, func(rec *runtime.SessionRecord) { rec.NativeSessionID = ev.NativeSessionID })
 				}
+				// The worker boundary aborted this turn at its deadline and
+				// the abort settled: a confirmed timeout, never a completion.
+				if ev.FinishReason == runtime.FinishReasonTimeout {
+					res.timedOut = true
+					res.timeoutSettled = true
+					return res
+				}
 				res.finishReason = ev.FinishReason
 				finishSeen = true
 				res.finished = true
-				// Usage may arrive right after the finish marker; drain briefly.
+				// Usage may arrive just after the finish marker; drain briefly.
 				if graceTimer != nil {
 					graceTimer.Stop()
 				}
@@ -786,7 +804,6 @@ func (h *Handler) aggregateTurn(ctx context.Context, sessionID, callerID string,
 			return res
 		case <-timeout:
 			res.timedOut = true
-			res.finishReason = "length"
 			h.markTurnSettling(sessionID)
 			// Settle and drain the timed-out turn before this session is
 			// reused; only a settled interrupt counts as a confirmed timeout.
@@ -948,7 +965,10 @@ type chatCompletionMessage struct {
 }
 
 // writeCompletion writes the aggregated non-streaming result. Agent errors use
-// the OpenAI error envelope rather than a raw 500 body.
+// the OpenAI error envelope rather than a raw 500 body. A timed-out turn is
+// HTTP 504 with the unified turn_timeout code (O-F09b) — the same error shape
+// the streaming surface emits as an SSE error frame, and never a fake
+// finish_reason:"length" completion.
 func (h *Handler) writeCompletion(w http.ResponseWriter, r *http.Request, model string, res turnResult) {
 	if res.aborted {
 		return // the client is gone or the turn was aborted; nothing to send
@@ -958,7 +978,7 @@ func (h *Handler) writeCompletion(w http.ResponseWriter, r *http.Request, model 
 		return
 	}
 	if res.timedOut {
-		writeError(w, http.StatusInternalServerError, serverError("agent turn timed out"))
+		writeError(w, http.StatusGatewayTimeout, turnTimeoutError())
 		return
 	}
 

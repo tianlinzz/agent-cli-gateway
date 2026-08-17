@@ -75,10 +75,19 @@ type Options struct {
 	// installed.
 	Commands map[string][]string
 
-	// TurnTimeout bounds a single turn. Zero means no hard API-side bound
-	// (the adapter/worker own their timeouts). NewHandler defaults this to a
-	// generous safety net.
+	// TurnTimeout is the gateway run deadline for a single turn (O-F09b):
+	// the bound used when TurnTimeouts has no entry for the request's
+	// adapter. It is the API-side twin of the same effective deadline the
+	// worker enforces (agents.<id>.timeout, else server.turn_timeout), kept
+	// here as a presentation-and-safety net. Zero disables the API-side
+	// deadline (the worker boundary still enforces the turn deadline).
 	TurnTimeout time.Duration
+	// TurnTimeouts maps adapter id -> the effective per-turn deadline. An
+	// entry for the request's adapter overrides TurnTimeout for that turn
+	// (the per-agent timeout when configured). The production gateway wires
+	// the same effective values it sends to the workers so both layers fire
+	// the same deadline.
+	TurnTimeouts map[string]time.Duration
 	// UsageGrace is how long the aggregator keeps draining events after an
 	// EventFinish, because usage may arrive after the finish marker. Default
 	// 250ms.
@@ -142,8 +151,9 @@ type Handler struct {
 	queuedRuns atomic.Int64 // turns waiting for a settling predecessor, published as gateway_queued_runs
 	runTTL     time.Duration
 
-	turnTimeout time.Duration
-	usageGrace  time.Duration
+	turnTimeout  time.Duration
+	turnTimeouts map[string]time.Duration
+	usageGrace   time.Duration
 
 	newID func() string
 	now   func() time.Time
@@ -321,9 +331,6 @@ func NewHandler(opts Options) *Handler {
 	if opts.RunHeader == "" {
 		opts.RunHeader = "X-Gateway-Run-Id"
 	}
-	if opts.TurnTimeout <= 0 {
-		opts.TurnTimeout = 10 * time.Minute
-	}
 	if opts.UsageGrace <= 0 {
 		opts.UsageGrace = 250 * time.Millisecond
 	}
@@ -349,6 +356,7 @@ func NewHandler(opts Options) *Handler {
 		workspaceHeader: opts.WorkspaceHeader,
 		runHeader:       opts.RunHeader,
 		turnTimeout:     opts.TurnTimeout,
+		turnTimeouts:    opts.TurnTimeouts,
 		usageGrace:      opts.UsageGrace,
 		newID:           newRandomID,
 		now:             now,
@@ -787,6 +795,17 @@ complete:
 	}
 	h.dropHandle(sessionID, handle)
 	return false
+}
+
+// turnDeadline returns the effective gateway run deadline for a turn on the
+// given adapter (O-F09b): the per-agent timeout when wired, else the global
+// default. Both layers fire the same effective deadline — the worker boundary
+// aborts the native turn, the API timer is the presentation-and-safety net.
+func (h *Handler) turnDeadline(adapterID string) time.Duration {
+	if d, ok := h.turnTimeouts[adapterID]; ok {
+		return d
+	}
+	return h.turnTimeout
 }
 
 // newRandomID returns a random 24-hex-char id (used for chat completion ids).

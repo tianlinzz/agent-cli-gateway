@@ -246,3 +246,112 @@ func TestSendIsSerialized(t *testing.T) {
 		t.Fatal("second Send never reached the native session after the first turn ended")
 	}
 }
+
+// deadlineNative is a fake native session whose turn never completes on its
+// own; only Abort produces a terminal.
+type deadlineNative struct {
+	fakeNative
+	aborted chan struct{}
+	onAbort func()
+}
+
+func newDeadlineNative() *deadlineNative {
+	return &deadlineNative{fakeNative: fakeNative{src: make(chan events.Event, 8)}, aborted: make(chan struct{}, 4)}
+}
+
+func (d *deadlineNative) Abort(ctx context.Context) error {
+	d.fakeNative.Abort(ctx)
+	if d.onAbort != nil {
+		d.onAbort()
+	}
+	d.aborted <- struct{}{}
+	return nil
+}
+
+// TestTurnDeadlineSettlesToFinishTimeout_OF09b pins the worker-boundary
+// enforcement: when the deadline fires, the watcher aborts the native turn;
+// once the native terminal settles, the wrapper emits the synthesized
+// finish(timeout) INSTEAD of the native terminal (which is only the abort's
+// confirmation).
+func TestTurnDeadlineSettlesToFinishTimeout_OF09b(t *testing.T) {
+	native := newDeadlineNative()
+	native.onAbort = func() { native.src <- events.Event{Kind: events.EventFinish, FinishReason: "cancelled"} }
+	session := Wrap(native, WrapOptions{Adapter: "codex", TurnTimeout: 50 * time.Millisecond})
+
+	if err := session.Send(context.Background(), runtime.Input{Messages: []runtime.Message{{Role: "user", Content: "work"}}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-native.aborted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deadline watcher never aborted the native turn")
+	}
+	ev := <-session.Events()
+	if ev.Type != runtime.EventFinish || ev.FinishReason != runtime.FinishReasonTimeout {
+		t.Fatalf("terminal event = %#v, want synthesized finish(timeout)", ev)
+	}
+}
+
+// TestTurnDeadlineUnsettledEmitsSentinel_OF09b pins the unsettled path: when
+// the deadline abort produces no native terminal within the settle bound, the
+// wrapper emits runtime.TurnDeadlineExceeded — the API records
+// RunOutcomeUnknown for it.
+func TestTurnDeadlineUnsettledEmitsSentinel_OF09b(t *testing.T) {
+	native := newDeadlineNative() // Abort produces no terminal
+	session := Wrap(native, WrapOptions{Adapter: "codex", TurnTimeout: 30 * time.Millisecond})
+	session.settleBound = 50 * time.Millisecond // set before Send: no watcher is running yet
+
+	if err := session.Send(context.Background(), runtime.Input{Messages: []runtime.Message{{Role: "user", Content: "work"}}}); err != nil {
+		t.Fatal(err)
+	}
+	ev := <-session.Events()
+	if ev.Type != runtime.EventError || ev.Error != runtime.TurnDeadlineExceeded {
+		t.Fatalf("event = %#v, want sentinel error %q", ev, runtime.TurnDeadlineExceeded)
+	}
+}
+
+// TestTurnDeadlineNotFiredLeavesTerminalIntact_OF09b guards the happy path:
+// a turn that finishes before the deadline must forward its native terminal
+// untouched and never run an abort.
+func TestTurnDeadlineNotFiredLeavesTerminalIntact_OF09b(t *testing.T) {
+	native := newDeadlineNative()
+	session := Wrap(native, WrapOptions{Adapter: "codex", TurnTimeout: 5 * time.Second})
+
+	if err := session.Send(context.Background(), runtime.Input{Messages: []runtime.Message{{Role: "user", Content: "work"}}}); err != nil {
+		t.Fatal(err)
+	}
+	native.src <- events.Event{Kind: events.EventText, Text: "answer"}
+	native.src <- events.Event{Kind: events.EventFinish, FinishReason: "end_turn"}
+
+	first := <-session.Events()
+	if first.Type != runtime.EventText || first.Text != "answer" {
+		t.Fatalf("first event = %#v", first)
+	}
+	second := <-session.Events()
+	if second.Type != runtime.EventFinish || second.FinishReason != "end_turn" {
+		t.Fatalf("terminal = %#v, want native end_turn forwarded intact", second)
+	}
+	select {
+	case <-native.aborted:
+		t.Fatal("abort ran although the turn finished in time")
+	default:
+	}
+}
+
+// TestTurnDeadlineNoTimeoutMeansNoWatcher_OF09b: TurnTimeout=0 disables the
+// watcher entirely — a hanging turn produces no synthesized events.
+func TestTurnDeadlineNoTimeoutMeansNoWatcher_OF09b(t *testing.T) {
+	native := newDeadlineNative()
+	session := Wrap(native, WrapOptions{Adapter: "codex", TurnTimeout: 0})
+
+	if err := session.Send(context.Background(), runtime.Input{Messages: []runtime.Message{{Role: "user", Content: "work"}}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ev := <-session.Events():
+		t.Fatalf("no event expected without a deadline, got %#v", ev)
+	case <-native.aborted:
+		t.Fatal("abort ran without a configured deadline")
+	case <-time.After(100 * time.Millisecond):
+	}
+}

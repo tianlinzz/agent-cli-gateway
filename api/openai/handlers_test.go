@@ -1427,7 +1427,7 @@ func TestStreamRecordsServerToolBeforeClientWriteFailure(t *testing.T) {
 	handle.emit(runtime.Event{Type: runtime.EventToolResult, Tool: &runtime.ToolCall{ID: "tool-before-write", Name: "Bash", Result: "ok"}})
 	w := &failAfterResponseWriter{header: make(http.Header), failAt: 2}
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	h.streamTurn(w, req, context.Background(), "codex", "write-failure-session", testOwner, handle, false)
+	h.streamTurn(w, req, context.Background(), "codex", "codex", "write-failure-session", testOwner, handle, false)
 	if !h.isServerToolID("write-failure-session", "tool-before-write") {
 		t.Fatal("server tool ID was lost when its display chunk could not be written")
 	}
@@ -2485,5 +2485,119 @@ func TestRunStatusFromTurnResult_OF11(t *testing.T) {
 				t.Errorf("got %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unified turn-deadline contract (O-F09b)
+// ---------------------------------------------------------------------------
+
+// TestTurnTimeout_NonStreamReturns504UnifiedError_OF09b pins the unified
+// presentation: a turn that exceeds its deadline returns HTTP 504 with error
+// code "turn_timeout" — never the old HTTP 500, and never a normal completion
+// pretending finish_reason:"length".
+func TestTurnTimeout_NonStreamReturns504UnifiedError_OF09b(t *testing.T) {
+	ts, _, backend := newTestServer(t, func(o *Options) {
+		o.TurnTimeout = 250 * time.Millisecond
+	})
+	backend.withScript(func(h *fakeHandle) {}) // emits nothing: the turn blocks
+
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, chatReq("codex", false, defaultMessages()))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504 (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	ae := decodeError(t, resp)
+	if ae.Code != "turn_timeout" {
+		t.Fatalf("error code = %q, want turn_timeout", ae.Code)
+	}
+}
+
+// TestTurnTimeout_StreamEmitsUnifiedErrorFrame_OF09b pins the streaming half
+// of the contract: the stream ends with an SSE error frame carrying code
+// "turn_timeout" and a [DONE] terminator, and NEVER a final completion chunk
+// with finish_reason:"length".
+func TestTurnTimeout_StreamEmitsUnifiedErrorFrame_OF09b(t *testing.T) {
+	ts, _, backend := newTestServer(t, func(o *Options) {
+		o.TurnTimeout = 250 * time.Millisecond
+	})
+	backend.withScript(func(h *fakeHandle) {}) // emits nothing: the turn blocks
+
+	resp := doAuthJSONH(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, chatReq("codex", true, defaultMessages()), nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for SSE", resp.StatusCode)
+	}
+	b := string(readBody(t, resp))
+	if !strings.Contains(b, "turn_timeout") {
+		t.Fatalf("stream body missing turn_timeout error frame: %q", b)
+	}
+	if strings.Contains(b, `"finish_reason":"length"`) {
+		t.Fatalf("stream body must not fake finish_reason:length on a deadline: %q", b)
+	}
+	if !strings.Contains(b, "[DONE]") {
+		t.Fatalf("stream body missing [DONE]: %q", b)
+	}
+}
+
+// TestTurnTimeout_PerAgentOverride_OF09b proves the per-agent deadline
+// overrides the global default at the API layer: a 200ms per-agent timeout
+// fires even though the global default would allow far longer.
+func TestTurnTimeout_PerAgentOverride_OF09b(t *testing.T) {
+	ts, _, backend := newTestServer(t, func(o *Options) {
+		o.TurnTimeout = time.Hour
+		o.TurnTimeouts = map[string]time.Duration{"codex": 200 * time.Millisecond}
+	})
+	backend.withScript(func(h *fakeHandle) {})
+
+	started := time.Now()
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, chatReq("codex", false, defaultMessages()))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504 via per-agent deadline (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	if elapsed := time.Since(started); elapsed > 30*time.Second {
+		t.Fatalf("per-agent deadline did not fire: elapsed %s", elapsed)
+	}
+}
+
+// TestTurnTimeout_WorkerReportedFinishTimeout_OF09b covers the worker
+// boundary's settled deadline report: the bridge emits
+// finish_reason:"timeout" after its abort settles, and the API presents the
+// unified timeout error with RunTimedOut.
+func TestTurnTimeout_WorkerReportedFinishTimeout_OF09b(t *testing.T) {
+	ts, _, backend := newTestServer(t, func(o *Options) { o.TurnTimeout = time.Hour })
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(runtime.Event{Type: runtime.EventText, Text: "partial"})
+		h.emit(runtime.Event{Type: runtime.EventFinish, FinishReason: runtime.FinishReasonTimeout})
+	})
+
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, chatReq("codex", false, defaultMessages()))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504 for worker-reported deadline (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	if ae := decodeError(t, resp); ae.Code != "turn_timeout" {
+		t.Fatalf("error code = %q, want turn_timeout", ae.Code)
+	}
+}
+
+// TestTurnTimeout_WorkerReportedUnsettledDeadline_OF09b covers the worker
+// boundary's UNSETTLED deadline report (runtime.TurnDeadlineExceeded): the
+// presentation is still the unified timeout error, and the run is recorded as
+// RunOutcomeUnknown because the turn's completion outcome is unknown.
+func TestTurnTimeout_WorkerReportedUnsettledDeadline_OF09b(t *testing.T) {
+	ts, _, backend := newTestServer(t, func(o *Options) { o.TurnTimeout = time.Hour })
+	backend.withScript(func(h *fakeHandle) {
+		h.emit(runtime.Event{Type: runtime.EventError, Error: runtime.TurnDeadlineExceeded})
+	})
+
+	resp := doAuthJSON(t, "POST", ts.URL+"/v1/chat/completions", testToken, testOwner, chatReq("codex", false, defaultMessages()))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504 for unsettled deadline (body %s)", resp.StatusCode, readBody(t, resp))
+	}
+	if ae := decodeError(t, resp); ae.Code != "turn_timeout" {
+		t.Fatalf("error code = %q, want turn_timeout", ae.Code)
 	}
 }

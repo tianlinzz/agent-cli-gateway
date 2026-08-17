@@ -1,6 +1,8 @@
 // Package bridge holds the behavior that is contractually identical across
 // every adapter (D3): the runtime session wrapper around a native session
-// (event mapping, prompt assembly, resume-ID lookup, turn serialization).
+// (event mapping, prompt assembly, resume-ID lookup, turn serialization) and
+// the worker-boundary turn-deadline enforcement (O-F09b).
+//
 // Native protocol logic — launch, framing, abort mechanics, usage decoding —
 // stays in agent/<name>; an adapter package contributes only its Options,
 // descriptor, and native-options construction.
@@ -9,16 +11,35 @@
 // (claudecode's pre-bridge wrapper omitted it) and maps the shared native
 // event contract (agent/events) onto runtime.Event, the only shape that
 // crosses the API boundary.
+//
+// Turn deadline (O-F09b): when WrapOptions.TurnTimeout is positive, every
+// Send starts a deadline watcher. On expiry the watcher aborts the native
+// turn; if the native terminal settles within the settle bound the wrapper
+// synthesizes finish(timeout) in place of the native terminal, otherwise it
+// emits the runtime.TurnDeadlineExceeded error sentinel (outcome unknown).
+// This is the single enforcement point shared by ALL agents — native abort
+// differences stay inside each agent/<name> Session.
 package bridge
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/tianlinzz/agent-cli-gateway/agent/events"
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
+)
+
+// Default bounds for the deadline watcher. The native sessions bound their
+// own settle/escalation internally (CloseTimeout), so abortBound is only a
+// backstop. Each Session snapshots them at Wrap time (tests may shorten the
+// per-session copies).
+const (
+	defaultAbortBound  = 30 * time.Second
+	defaultSettleBound = 30 * time.Second
 )
 
 // NativeSession is the adapter-facing view of a native agent session. The
@@ -40,6 +61,9 @@ type WrapOptions struct {
 	// the native prompt at each turn. Default false: system messages are
 	// ignored so a client cannot pollute the agent's own tool/skill surface.
 	InjectSystemPrompt bool
+	// TurnTimeout is the per-turn deadline enforced at this worker boundary
+	// (O-F09b). Zero disables the watcher (no bound).
+	TurnTimeout time.Duration
 }
 
 // Session adapts one native session to the runtime contract. It owns a
@@ -50,10 +74,33 @@ type Session struct {
 	events       chan runtime.Event
 	adapter      string
 	injectSystem bool
+	turnTimeout  time.Duration
 
 	// mu serializes Send: the runtime contract is one active turn per
 	// session.
 	mu sync.Mutex
+
+	// turnMu guards the active turn watch. t.done is closed exactly once, by
+	// whoever clears s.turn under turnMu.
+	turnMu sync.Mutex
+	turn   *turnWatch
+
+	// emitMu serializes event emission against channel close so the deadline
+	// watcher can never send on a closed channel.
+	emitMu       sync.Mutex
+	eventsClosed bool
+
+	// abortBound/settleBound bound the deadline watcher; snapshotted at Wrap
+	// so tests can shorten them per session.
+	abortBound  time.Duration
+	settleBound time.Duration
+}
+
+// turnWatch tracks the active turn for deadline enforcement.
+type turnWatch struct {
+	done  chan struct{}
+	timer *time.Timer
+	fired bool // deadline fired (guarded by turnMu)
 }
 
 // Wrap starts the event forwarder around native and returns the runtime
@@ -64,11 +111,21 @@ func Wrap(native NativeSession, opts WrapOptions) *Session {
 		events:       make(chan runtime.Event, 64),
 		adapter:      opts.Adapter,
 		injectSystem: opts.InjectSystemPrompt,
+		turnTimeout:  opts.TurnTimeout,
+		abortBound:   defaultAbortBound,
+		settleBound:  defaultSettleBound,
 	}
 	go func() {
-		defer close(s.events)
+		defer s.closeEvents()
+		// Runs before closeEvents (LIFO): release the active watch without
+		// synthesizing an event when the native stream ends.
+		defer s.endTurnSilently()
 		for event := range native.Events() {
-			s.events <- MapEvent(event, opts.Adapter)
+			if isTerminal(event) {
+				s.emitEvent(s.terminalEvent(event))
+				continue
+			}
+			s.emitEvent(MapEvent(event, opts.Adapter))
 		}
 	}()
 	return s
@@ -77,12 +134,142 @@ func Wrap(native NativeSession, opts WrapOptions) *Session {
 func (s *Session) Send(ctx context.Context, input runtime.Input) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.turnTimeout > 0 {
+		s.beginTurn()
+	}
 	return s.native.Send(ctx, events.Input{Prompt: PromptForNative(input, s.injectSystem)})
 }
 
 func (s *Session) Events() <-chan runtime.Event    { return s.events }
 func (s *Session) Abort(ctx context.Context) error { return s.native.Abort(ctx) }
 func (s *Session) Close(ctx context.Context) error { return s.native.Close(ctx) }
+
+// beginTurn arms the deadline watch for a new turn. Called with s.mu held.
+func (s *Session) beginTurn() {
+	s.turnMu.Lock()
+	if s.turn != nil {
+		// One active turn per session is enforced upstream; a stale watch
+		// means a contract violation. Replace it and let its watcher exit.
+		slog.Warn("bridge: replacing still-active turn watch (turn overlap is a contract violation)", "adapter", s.adapter)
+		s.clearTurnLocked()
+	}
+	t := &turnWatch{done: make(chan struct{}), timer: time.NewTimer(s.turnTimeout)}
+	s.turn = t
+	s.turnMu.Unlock()
+	go s.watchTurn(t)
+}
+
+// clearTurnLocked releases the active watch. Caller holds turnMu.
+func (s *Session) clearTurnLocked() {
+	t := s.turn
+	if t == nil {
+		return
+	}
+	s.turn = nil
+	t.timer.Stop()
+	close(t.done)
+}
+
+// endTurnSilently releases the active watch when the native stream ends
+// without synthesizing an event.
+func (s *Session) endTurnSilently() {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	s.clearTurnLocked()
+}
+
+// terminalEvent maps the turn's terminal native event. When the deadline
+// fired, the native terminal is only the abort's confirmation and is replaced
+// by the synthesized finish(timeout).
+func (s *Session) terminalEvent(event events.Event) runtime.Event {
+	s.turnMu.Lock()
+	t := s.turn
+	if t == nil {
+		s.turnMu.Unlock()
+		return MapEvent(event, s.adapter)
+	}
+	s.turn = nil
+	fired := t.fired
+	if !fired {
+		t.timer.Stop()
+	}
+	close(t.done)
+	s.turnMu.Unlock()
+	if fired {
+		return runtime.Event{Type: runtime.EventFinish, FinishReason: runtime.FinishReasonTimeout}
+	}
+	return MapEvent(event, s.adapter)
+}
+
+// watchTurn enforces the deadline for one turn: on expiry it aborts the
+// native turn (which settles or escalates internally), waits for the
+// terminal, and only declares an unsettled deadline via the sentinel error.
+func (s *Session) watchTurn(t *turnWatch) {
+	defer t.timer.Stop()
+	select {
+	case <-t.done:
+		return
+	case <-t.timer.C:
+	}
+	s.turnMu.Lock()
+	if s.turn != t {
+		s.turnMu.Unlock()
+		return
+	}
+	t.fired = true
+	s.turnMu.Unlock()
+
+	abortCtx, cancel := context.WithTimeout(context.Background(), s.abortBound)
+	abortErr := s.native.Abort(abortCtx)
+	cancel()
+
+	settle := time.NewTimer(s.settleBound)
+	defer settle.Stop()
+	select {
+	case <-t.done:
+		// The forwarder handled the terminal and emitted finish(timeout).
+		return
+	case <-settle.C:
+	}
+
+	s.turnMu.Lock()
+	if s.turn != t {
+		s.turnMu.Unlock()
+		return
+	}
+	s.turn = nil
+	close(t.done)
+	s.turnMu.Unlock()
+
+	if abortErr != nil {
+		slog.Warn("bridge: turn deadline abort failed", "adapter", s.adapter, "error", abortErr)
+	}
+	// The turn's true completion outcome is unknown; surface the sentinel so
+	// the API records RunOutcomeUnknown and presents the unified timeout
+	// error.
+	s.emitEvent(runtime.Event{Type: runtime.EventError, Error: runtime.TurnDeadlineExceeded})
+}
+
+func isTerminal(event events.Event) bool {
+	return event.Kind == events.EventFinish || event.Kind == events.EventError
+}
+
+// emitEvent sends one runtime event, never racing the channel close.
+func (s *Session) emitEvent(event runtime.Event) {
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
+	if s.eventsClosed {
+		return
+	}
+	s.events <- event
+}
+
+func (s *Session) closeEvents() {
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
+	s.eventsClosed = true
+	close(s.events)
+}
 
 // ResumeID extracts the server-owned native session ID from start metadata
 // (O-F03): client metadata is sanitized upstream, so the only legitimate

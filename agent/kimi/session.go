@@ -109,7 +109,10 @@ func (s *Session) Send(_ context.Context, input Input) error {
 	if prompt == "" {
 		return protocolError("empty prompt")
 	}
-	turnCtx, cancel := context.WithTimeout(s.ctx, s.opts.Timeout)
+	// No native turn deadline (O-F09b): the worker boundary owns the per-turn
+	// deadline and aborts this session when it fires. The turn context exists
+	// only so a completed/aborted prompt releases its resources.
+	turnCtx, cancel := context.WithCancel(s.ctx)
 	turn := &activePrompt{done: make(chan struct{}), cancel: cancel, tools: make(map[string]ToolCall), results: make(map[string]bool)}
 	s.mu.Lock()
 	if s.active != nil {
@@ -301,7 +304,7 @@ func (s *Session) Abort(ctx context.Context) error {
 	if err := s.rpc.Notify(ctx, "session/cancel", map[string]any{"sessionId": s.NativeSessionID()}); err != nil {
 		return s.abortEscalation(fmt.Errorf("session/cancel: %w", err))
 	}
-	timer := time.NewTimer(s.opts.Timeout)
+	timer := time.NewTimer(s.opts.CloseTimeout)
 	defer timer.Stop()
 	select {
 	case <-done:
@@ -309,7 +312,7 @@ func (s *Session) Abort(ctx context.Context) error {
 	case <-ctx.Done():
 		return s.abortEscalation(fmt.Errorf("cancel wait: %w", ctx.Err()))
 	case <-timer.C:
-		return s.abortEscalation(fmt.Errorf("cancel timed out after %s", s.opts.Timeout))
+		return s.abortEscalation(fmt.Errorf("cancel timed out after %s", s.opts.CloseTimeout))
 	}
 }
 
@@ -394,7 +397,7 @@ func (s *Session) Close(ctx context.Context) error {
 	s.closing.Store(true)
 	s.cancel()
 	_ = s.rpc.Close()
-	timer := time.NewTimer(s.opts.Timeout)
+	timer := time.NewTimer(s.opts.CloseTimeout)
 	defer timer.Stop()
 	select {
 	case <-s.done:
@@ -404,13 +407,13 @@ func (s *Session) Close(ctx context.Context) error {
 		return protocolError("close wait: %w", ctx.Err())
 	case <-timer.C:
 		_ = s.process.ForceKill()
-		reapTimer := time.NewTimer(s.opts.Timeout)
+		reapTimer := time.NewTimer(s.opts.CloseTimeout)
 		defer reapTimer.Stop()
 		select {
 		case <-s.done:
 			return nil
 		case <-reapTimer.C:
-			return protocolError("close timed out after %s", 2*s.opts.Timeout)
+			return protocolError("close timed out after %s", 2*s.opts.CloseTimeout)
 		}
 	}
 }

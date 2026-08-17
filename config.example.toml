@@ -15,6 +15,11 @@ drain_timeout = "30s"
 read_header_timeout = "10s"
 idle_timeout = "60s"
 max_header_bytes = 1048576
+# Gateway run deadline for a single turn (O-F09b): the default bound honored
+# by every adapter unless agents.<id>.timeout overrides it. When it fires the
+# worker aborts the native turn and the API presents a unified timeout error
+# (HTTP 504 / SSE error frame, code "turn_timeout"). 0 disables it. Default 10m.
+# turn_timeout = "10m"
 
 [worker]
 stop_grace_period = "10s"
@@ -148,9 +153,10 @@ models = ["sonnet", "opus", "haiku"]
 enabled = false
 command = ["kimi"]
 permission = "auto"
-# Per-agent turn bound. Only the kimi adapter honors agents.<id>.timeout today;
-# configuring it on codex or claude-code fails closed at startup until the
-# unified turn-deadline contract lands.
+# Per-agent turn bound (O-F09b): honored by EVERY adapter at the worker
+# boundary. Zero falls back to server.turn_timeout. When the deadline fires
+# the worker aborts the native turn and the API answers with a unified
+# timeout error (HTTP 504 / SSE error frame, code "turn_timeout").
 timeout = "30m"
 models = ["kimi-k3", "deepseek-v4-flash"]
 # inject_system_prompt = false

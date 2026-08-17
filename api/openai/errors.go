@@ -61,6 +61,14 @@ func serverError(msg string) apiError {
 	return apiErr(msg, errorTypeServer, "server_error")
 }
 
+// turnTimeoutError is the unified timeout presentation (O-F09b): a turn that
+// exceeded its deadline and was aborted. Streaming and non-streaming surfaces
+// carry the same code; the non-streaming form uses HTTP 504. A deadline is
+// never presented as a normal completion with finish_reason "length".
+func turnTimeoutError() apiError {
+	return apiErr("agent turn exceeded its deadline and was aborted", errorTypeServer, "turn_timeout")
+}
+
 // rateLimited builds a rate-limit-exceeded error for the given scope and
 // reason (O-F10). The caller writes it via writeRateLimited which sets the
 // Retry-After header.

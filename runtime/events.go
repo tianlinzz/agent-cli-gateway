@@ -27,6 +27,19 @@ const (
 	EventReasoning EventType = "reasoning"
 )
 
+// FinishReasonTimeout is the synthesized finish reason for a turn ended by
+// the gateway turn deadline (O-F09b). Native agents never produce it; the
+// worker boundary emits it after a deadline abort settled. The OpenAI surface
+// must present it as a timeout error — never as a normal completion with
+// finish_reason "length" (a deadline is not a token-length limit).
+const FinishReasonTimeout = "timeout"
+
+// TurnDeadlineExceeded is the EventError message the worker boundary emits
+// when a turn deadline fired and the native abort did NOT settle: the turn's
+// true completion outcome is unknown. The API layer matches this sentinel to
+// present the unified timeout error and record RunOutcomeUnknown.
+const TurnDeadlineExceeded = "runtime: turn deadline exceeded (abort did not settle)"
+
 // Event is the canonical runtime event emitted by sessions and executions.
 // It is the only event shape that crosses the API boundary; worker RPC frames
 // (a worker-layer concern) are defined elsewhere and converted to and from

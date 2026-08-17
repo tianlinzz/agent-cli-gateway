@@ -40,7 +40,7 @@ func TestNewConsumesTypedConfigDirectly_OF08(t *testing.T) {
 		},
 		WorkspaceDir: "/ws",
 	})
-	if !slicesEqual(opts.Command, []string{"/opt/tools/kimi"}) || opts.Model != "kimi-k3" || opts.Permission != "deny" || opts.Timeout != 90*time.Second || !opts.InjectSystemPrompt {
+	if !slicesEqual(opts.Command, []string{"/opt/tools/kimi"}) || opts.Model != "kimi-k3" || opts.Permission != "deny" || opts.TurnTimeout != 90*time.Second || !opts.InjectSystemPrompt {
 		t.Fatalf("options = %#v", opts)
 	}
 	if opts.WorkDir != "/ws" {
@@ -69,13 +69,13 @@ func TestStartPassesArgvVerbatim_OF14(t *testing.T) {
 func TestAdapterMapsTrustedOptions(t *testing.T) {
 	capture := &captureStarter{session: newFakeSession("native-1")}
 	adapter := newAdapter(Options{
-		Command:    []string{"kimi", "--debug"},
-		Env:        []string{"KIMI_API_KEY=secret"},
-		WorkDir:    "/workspace",
-		Model:      "kimi-k2",
-		Mode:       "plan",
-		Timeout:    30 * time.Second,
-		Permission: "deny",
+		Command:     []string{"kimi", "--debug"},
+		Env:         []string{"KIMI_API_KEY=secret"},
+		WorkDir:     "/workspace",
+		Model:       "kimi-k2",
+		Mode:        "plan",
+		TurnTimeout: 30 * time.Second,
+		Permission:  "deny",
 	}, capture.Start)
 
 	_, err := adapter.Start(context.Background(), runtime.StartRequest{
@@ -87,7 +87,7 @@ func TestAdapterMapsTrustedOptions(t *testing.T) {
 	if got := strings.Join(capture.options.Command, " "); got != "kimi --debug" {
 		t.Fatalf("command = %q", got)
 	}
-	if capture.options.ResumeID != "resume-1" || capture.options.WorkDir != "/workspace" || capture.options.Model != "kimi-k2" || capture.options.Mode != "plan" || capture.options.Permission != "deny" || capture.options.Timeout != 30*time.Second {
+	if capture.options.ResumeID != "resume-1" || capture.options.WorkDir != "/workspace" || capture.options.Model != "kimi-k2" || capture.options.Mode != "plan" || capture.options.Permission != "deny" {
 		t.Fatalf("options = %#v", capture.options)
 	}
 	if len(capture.options.Env) != 1 || capture.options.Env[0] != "KIMI_API_KEY=secret" {
