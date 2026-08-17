@@ -144,6 +144,9 @@ type LimitsConfig struct {
 	// (worker.log). When the cap is reached, the log is truncated with a
 	// marker. 0 = unlimited (64 MiB default in DefaultGatewayConfig).
 	MaxWorkerLogBytes int64 `toml:"max_worker_log_bytes"`
+	// WorkerLogCheckInterval is how often the worker log cap is enforced.
+	// Zero uses the default (5s).
+	WorkerLogCheckInterval time.Duration `toml:"worker_log_check_interval"`
 }
 
 // AuthConfig configures HTTP API authentication. A token authenticates a
@@ -187,8 +190,6 @@ type IsolationConfig struct {
 	NsjailSource string `toml:"nsjail_source"`
 	// BinaryPath is the path to the nsjail executable.
 	BinaryPath string `toml:"binary_path"`
-	// ProfileOverride, when set, replaces the generated nsjail config file.
-	ProfileOverride string `toml:"profile_override"`
 
 	// Mounts configures the sandbox mount layout.
 	Mounts MountsConfig `toml:"mounts"`
@@ -268,8 +269,6 @@ type SeccompConfig struct {
 	// Policy is "kafel" (default) or "off". "off" is only honored for the
 	// "test" runtime mode.
 	Policy string `toml:"policy"`
-	// ProfileFile, when set, overrides the generated Kafel policy.
-	ProfileFile string `toml:"profile_file"`
 }
 
 // AgentConfig configures one agent adapter.

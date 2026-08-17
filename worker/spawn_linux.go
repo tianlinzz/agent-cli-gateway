@@ -20,6 +20,6 @@ func spawnJailed(ctx context.Context, spec spawnSpec) (*exec.Cmd, error) {
 	if err := nsjail.ValidateBinary(spec.nsjailBinary); err != nil {
 		return nil, err
 	}
-	argv := buildNsjailCommand(spec.nsjailBinary, spec.profilePath, spec.workerExe, spec.workerArgs)
+	argv := buildNsjailCommand(spec.nsjailBinary, spec.profilePath, spec.workerExe)
 	return startCommand(ctx, argv, spec.env, spec.logPath)
 }

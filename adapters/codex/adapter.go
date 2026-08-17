@@ -23,7 +23,6 @@ type Options struct {
 	CodexHome       string
 	Model           string
 	ReasoningEffort string
-	Mode            string
 	Permission      string
 	SystemPrompt    string
 	AppendPrompt    string
@@ -58,7 +57,6 @@ func optionsFromConfig(cfg runtime.AdapterConfig) Options {
 		WorkDir:            cfg.WorkspaceDir,
 		CodexHome:          cfg.AgentHome,
 		Model:              cfg.Execution.DefaultModel,
-		Mode:               "full-auto",
 		Permission:         cfg.Execution.Permission,
 		TurnTimeout:        cfg.Execution.TurnTimeout,
 		InjectSystemPrompt: cfg.Execution.InjectSystemPrompt,
@@ -108,7 +106,7 @@ func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.
 	}
 	nativeSession, err := start(ctx, native.Options{
 		Command: append([]string(nil), a.opts.Command...), Env: env, WorkDir: a.opts.WorkDir,
-		Model: a.opts.Model, ReasoningEffort: a.opts.ReasoningEffort, Mode: a.opts.Mode, Permission: a.opts.Permission,
+		Model: a.opts.Model, ReasoningEffort: a.opts.ReasoningEffort, Permission: a.opts.Permission,
 		ResumeID: resumeID, SystemPrompt: a.opts.SystemPrompt, AppendSystemPrompt: a.opts.AppendPrompt,
 	})
 	if err != nil {

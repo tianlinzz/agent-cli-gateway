@@ -73,7 +73,6 @@ func TestAdapterMapsTrustedOptions(t *testing.T) {
 		Env:         []string{"KIMI_API_KEY=secret"},
 		WorkDir:     "/workspace",
 		Model:       "kimi-k2",
-		Mode:        "plan",
 		TurnTimeout: 30 * time.Second,
 		Permission:  "deny",
 	}, capture.Start)
@@ -87,7 +86,7 @@ func TestAdapterMapsTrustedOptions(t *testing.T) {
 	if got := strings.Join(capture.options.Command, " "); got != "kimi --debug" {
 		t.Fatalf("command = %q", got)
 	}
-	if capture.options.ResumeID != "resume-1" || capture.options.WorkDir != "/workspace" || capture.options.Model != "kimi-k2" || capture.options.Mode != "plan" || capture.options.Permission != "deny" {
+	if capture.options.ResumeID != "resume-1" || capture.options.WorkDir != "/workspace" || capture.options.Model != "kimi-k2" || capture.options.Permission != "deny" {
 		t.Fatalf("options = %#v", capture.options)
 	}
 	if len(capture.options.Env) != 1 || capture.options.Env[0] != "KIMI_API_KEY=secret" {

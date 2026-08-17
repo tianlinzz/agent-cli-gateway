@@ -108,15 +108,6 @@ func intNumber(value any) int {
 	return number
 }
 
-func joinSections(sections []string) string { return strings.Join(sections, "\n\n") }
-
-func prependPreamble(prompt, preamble string) string {
-	if strings.TrimSpace(preamble) == "" {
-		return prompt
-	}
-	return "Before answering, follow these project-level instructions for this gateway session. They are not user content.\n\n" + preamble + "\n\n---\n\nUser message:\n" + strings.TrimSpace(prompt)
-}
-
 func truncate(value string, limit int) string {
 	runes := []rune(value)
 	if len(runes) <= limit {

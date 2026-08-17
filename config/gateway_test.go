@@ -458,3 +458,51 @@ func TestGatewayConfig_MaxSessionsValidation(t *testing.T) {
 		t.Fatal("negative max_sessions must be rejected")
 	}
 }
+
+// TestLoadGateway_RemovedDeadIsolationKeysRejected_U2 pins the dead-config
+// removal: profile_override and seccomp.profile_file were parsed but never
+// consumed anywhere; after U2 they are unknown keys and fail closed instead of
+// silently configuring nothing.
+func TestLoadGateway_RemovedDeadIsolationKeysRejected_U2(t *testing.T) {
+	for _, key := range []string{
+		`profile_override = "/tmp/x.cfg"`,
+		`[isolation.seccomp]
+profile_file = "/tmp/p.kafel"`,
+	} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "gw.toml")
+		body := "mode = \"test\"\n\n[isolation]\nrequired = false\n" + key + "\n"
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadGateway(path); err == nil {
+			t.Errorf("dead key %q must fail closed as an unknown key", key)
+		}
+	}
+}
+
+// TestLoadGateway_WorkerLogCheckIntervalParses_U2 pins the previously
+// documented-but-unparsable limits.worker_log_check_interval: the key now maps
+// to a real field wired into the supervisor's log-cap loop.
+func TestLoadGateway_WorkerLogCheckIntervalParses_U2(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gw.toml")
+	if err := os.WriteFile(path, []byte(`
+mode = "test"
+
+[isolation]
+required = false
+
+[limits]
+worker_log_check_interval = "7s"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadGateway(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Limits.WorkerLogCheckInterval != 7*time.Second {
+		t.Fatalf("worker_log_check_interval = %s, want 7s", cfg.Limits.WorkerLogCheckInterval)
+	}
+}

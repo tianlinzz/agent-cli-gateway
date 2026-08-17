@@ -22,7 +22,6 @@ type Options struct {
 	Env        []string
 	WorkDir    string
 	Model      string
-	Mode       string
 	Permission string
 	// TurnTimeout is the per-turn deadline enforced at the worker boundary
 	// (O-F09b); 0 disables it.
@@ -55,7 +54,6 @@ func optionsFromConfig(cfg runtime.AdapterConfig) Options {
 		Env:                envSlice(cfg.Execution.Env),
 		WorkDir:            cfg.WorkspaceDir,
 		Model:              cfg.Execution.DefaultModel,
-		Mode:               "default",
 		TurnTimeout:        cfg.Execution.TurnTimeout,
 		Permission:         cfg.Execution.Permission,
 		InjectSystemPrompt: cfg.Execution.InjectSystemPrompt,
@@ -108,7 +106,7 @@ func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.
 	session, err := start(ctx, native.Options{
 		Command: append([]string(nil), a.opts.Command...),
 		Env:     append([]string(nil), a.opts.Env...), WorkDir: a.opts.WorkDir,
-		Model: a.opts.Model, Mode: a.opts.Mode, Permission: a.opts.Permission, ResumeID: resumeID,
+		Model: a.opts.Model, Permission: a.opts.Permission, ResumeID: resumeID,
 	})
 	if err != nil {
 		return nil, err

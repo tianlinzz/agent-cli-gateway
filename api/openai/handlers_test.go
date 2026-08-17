@@ -2601,3 +2601,24 @@ func TestTurnTimeout_WorkerReportedUnsettledDeadline_OF09b(t *testing.T) {
 		t.Fatalf("error code = %q, want turn_timeout", ae.Code)
 	}
 }
+
+// TestConstantTimeEqualHidesLength_U2 covers the auth comparison primitive:
+// equal strings match, and different lengths still run a full digest compare
+// instead of short-circuiting (the raw subtle.ConstantTimeCompare leaks
+// length equality; authenticateCaller relies on the hash-first form).
+func TestConstantTimeEqualHidesLength_U2(t *testing.T) {
+	if !constantTimeEqual("secret-token", "secret-token") {
+		t.Fatal("equal tokens must compare equal")
+	}
+	if constantTimeEqual("secret-token", "secret-tokens") {
+		t.Fatal("different-length tokens must not compare equal")
+	}
+	if constantTimeEqual("secret-token", "secret-tokex") {
+		t.Fatal("different tokens must not compare equal")
+	}
+	// The primitive compares digests, so empty==empty matches; callers reject
+	// empty tokens before reaching it (authMiddleware requires a bearer token).
+	if !constantTimeEqual("", "") {
+		t.Fatal("identical empty strings must compare equal at the primitive level")
+	}
+}

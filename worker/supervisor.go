@@ -41,8 +41,6 @@ type Config struct {
 	RuntimeDir string
 	// WorkerExec is the worker child executable spawned inside the jail.
 	WorkerExec string
-	// WorkerArgs are extra argv passed to the worker child.
-	WorkerArgs []string
 	// Agents contains trusted per-agent execution settings keyed by model ID.
 	Agents map[string]runtime.AgentExecutionConfig
 	// StartTimeout bounds the socket + handshake. Default 30s.
@@ -379,7 +377,6 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 		nsjailBinary: s.cfg.Isolation.BinaryPath,
 		profilePath:  profilePath,
 		workerExe:    s.cfg.WorkerExec,
-		workerArgs:   s.cfg.WorkerArgs,
 		env:          env,
 		logPath:      filepath.Join(sessionDir, "worker.log"),
 	}
@@ -518,10 +515,14 @@ func (s *Supervisor) Close(ctx context.Context) error {
 	}
 	wg.Wait()
 	close(errCh)
+	// Aggregate instead of returning the first error: every session's teardown
+	// result matters for leak diagnostics, and one failing child must not hide
+	// the rest.
+	var errs []error
 	for err := range errCh {
-		return err
+		errs = append(errs, err)
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (s *Supervisor) reapIdleLoop() {

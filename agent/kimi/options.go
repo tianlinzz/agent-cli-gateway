@@ -10,7 +10,6 @@ type Options struct {
 	Env        []string
 	WorkDir    string
 	Model      string
-	Mode       string
 	Permission string
 	ResumeID   string
 	// CloseTimeout bounds how long Abort and Close wait for an in-flight
@@ -25,14 +24,6 @@ func NormalizeOptions(opts Options) Options {
 		opts.Command = []string{"kimi"}
 	} else {
 		opts.Command = append([]string(nil), opts.Command...)
-	}
-	switch strings.ToLower(strings.TrimSpace(opts.Mode)) {
-	case "plan":
-		opts.Mode = "plan"
-	case "quiet":
-		opts.Mode = "quiet"
-	default:
-		opts.Mode = "default"
 	}
 	switch strings.ToLower(strings.TrimSpace(opts.Permission)) {
 	case "ask":

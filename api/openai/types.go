@@ -533,7 +533,13 @@ func (h *Handler) authenticateCaller(token string) (string, bool) {
 	var callerID string
 	found := 0
 	for candidate, caller := range h.callerTokens {
-		match := subtle.ConstantTimeCompare([]byte(candidate), []byte(token))
+		// Compare digests, not raw tokens: constantTimeEqual hashes both sides
+		// first so a length mismatch cannot short-circuit (the raw
+		// subtle.ConstantTimeCompare leaks candidate length equality).
+		match := 0
+		if constantTimeEqual(candidate, token) {
+			match = 1
+		}
 		if match == 1 {
 			callerID = caller
 		}

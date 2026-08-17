@@ -17,8 +17,6 @@ type spawnSpec struct {
 	profilePath string
 	// workerExe is the worker child executable.
 	workerExe string
-	// workerArgs are extra argv passed to the worker child.
-	workerArgs []string
 	// env is the environment for the spawned process.
 	env []string
 	// logPath is the per-session file worker stdout/stderr is written to.
@@ -48,16 +46,14 @@ func defaultSpawner(cfg Config) spawnFunc {
 // in ONCE mode (-Mo): one nsjail process per session, one jail, lifecycle 1:1
 // with the session. nsjail itself is never part of the RPC contract — this
 // argv is a worker-side startup detail.
-func buildNsjailCommand(nsjailBinary, profilePath, workerExe string, workerArgs []string) []string {
-	argv := []string{nsjailBinary, "-Mo", "--config", profilePath, "--", workerExe}
-	return append(argv, workerArgs...)
+func buildNsjailCommand(nsjailBinary, profilePath, workerExe string) []string {
+	return []string{nsjailBinary, "-Mo", "--config", profilePath, "--", workerExe}
 }
 
 // buildDirectCommand assembles the argv for a direct (test-only, isolation
 // disabled) spawn.
-func buildDirectCommand(workerExe string, workerArgs []string) []string {
-	argv := []string{workerExe}
-	return append(argv, workerArgs...)
+func buildDirectCommand(workerExe string) []string {
+	return []string{workerExe}
 }
 
 // spawnDirect starts the worker directly, without nsjail. It is a fail-closed
@@ -70,7 +66,7 @@ func spawnDirect(ctx context.Context, spec spawnSpec) (*exec.Cmd, error) {
 	if spec.isolated {
 		return nil, fmt.Errorf("worker: spawn: refusing unsandboxed direct spawn: session requires nsjail isolation")
 	}
-	return startCommand(ctx, buildDirectCommand(spec.workerExe, spec.workerArgs), spec.env, spec.logPath)
+	return startCommand(ctx, buildDirectCommand(spec.workerExe), spec.env, spec.logPath)
 }
 
 // startCommand is defined in the platform files:

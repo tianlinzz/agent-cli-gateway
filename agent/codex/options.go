@@ -12,7 +12,6 @@ type Options struct {
 	WorkDir            string
 	Model              string
 	ReasoningEffort    string
-	Mode               string
 	Permission         string
 	ResumeID           string
 	BaseURL            string
@@ -29,7 +28,6 @@ func NormalizeOptions(opts Options) Options {
 	} else {
 		opts.Command = append([]string(nil), opts.Command...)
 	}
-	opts.Mode = normalizeMode(opts.Mode)
 	opts.Permission = normalizePermission(opts.Permission)
 	opts.ReasoningEffort = normalizeEffort(opts.ReasoningEffort)
 	if opts.CloseTimeout <= 0 {
@@ -46,19 +44,6 @@ func normalizePermission(raw string) string {
 		return "deny"
 	default:
 		return "auto"
-	}
-}
-
-func normalizeMode(raw string) string {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "auto-edit", "autoedit", "auto_edit", "edit":
-		return "auto-edit"
-	case "full-auto", "fullauto", "full_auto", "auto":
-		return "full-auto"
-	case "yolo", "bypass", "dangerously-bypass":
-		return "yolo"
-	default:
-		return "suggest"
 	}
 }
 

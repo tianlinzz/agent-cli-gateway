@@ -50,6 +50,8 @@ type SessionRecord struct {
 	// worker resolves to a controlled directory.
 	WorkspaceID string
 	// WorkerID and NodeID identify the execution that serves this session.
+	// Reserved for the cross-node deployment (Phase 4/5); the single-node
+	// in-memory backend does not populate them yet.
 	WorkerID string
 	NodeID   string
 

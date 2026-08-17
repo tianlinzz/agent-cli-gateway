@@ -428,7 +428,7 @@ func TestSupervisor_DevProfileUsesNsjailWrapper(t *testing.T) {
 		mu.Lock()
 		specs = append(specs, spec)
 		mu.Unlock()
-		return startCommand(ctx, buildNsjailCommand(spec.nsjailBinary, spec.profilePath, spec.workerExe, spec.workerArgs), spec.env, spec.logPath)
+		return startCommand(ctx, buildNsjailCommand(spec.nsjailBinary, spec.profilePath, spec.workerExe), spec.env, spec.logPath)
 	}))
 
 	ws, err := sup.StartSession(context.Background(), testRequest("dev-1"))
@@ -509,13 +509,13 @@ func assertEnvMissing(t *testing.T, env []string, key string) {
 }
 
 func TestSupervisor_NsjailCommandLine(t *testing.T) {
-	got := buildNsjailCommand("/usr/bin/nsjail", "/profiles/s1.conf", "/bin/worker", []string{"--flag"})
-	want := []string{"/usr/bin/nsjail", "-Mo", "--config", "/profiles/s1.conf", "--", "/bin/worker", "--flag"}
+	got := buildNsjailCommand("/usr/bin/nsjail", "/profiles/s1.conf", "/bin/worker")
+	want := []string{"/usr/bin/nsjail", "-Mo", "--config", "/profiles/s1.conf", "--", "/bin/worker"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("nsjail argv = %v, want %v", got, want)
 	}
-	gotDirect := buildDirectCommand("/bin/worker", []string{"a"})
-	if want := []string{"/bin/worker", "a"}; !reflect.DeepEqual(gotDirect, want) {
+	gotDirect := buildDirectCommand("/bin/worker")
+	if want := []string{"/bin/worker"}; !reflect.DeepEqual(gotDirect, want) {
 		t.Errorf("direct argv = %v, want %v", gotDirect, want)
 	}
 }
@@ -564,7 +564,7 @@ func TestSupervisor_JailLaunchFailureFailsClosed(t *testing.T) {
 		c.Isolation.Required = true
 		c.Isolation.BinaryPath = badNsjail
 	}, WithSpawner(func(ctx context.Context, spec spawnSpec) (*exec.Cmd, error) {
-		return startCommand(ctx, buildNsjailCommand(spec.nsjailBinary, spec.profilePath, spec.workerExe, spec.workerArgs), spec.env, spec.logPath)
+		return startCommand(ctx, buildNsjailCommand(spec.nsjailBinary, spec.profilePath, spec.workerExe), spec.env, spec.logPath)
 	}))
 	_, err := sup.StartSession(context.Background(), testRequest("bad-jail"))
 	if err == nil {
@@ -813,7 +813,7 @@ func TestSupervisor_NsjailWrapperCrashReapsGroup(t *testing.T) {
 		c.Isolation.Required = true
 		c.Isolation.BinaryPath = fakeNsjail
 	}, WithSpawner(func(ctx context.Context, spec spawnSpec) (*exec.Cmd, error) {
-		return startCommand(ctx, buildNsjailCommand(spec.nsjailBinary, spec.profilePath, spec.workerExe, spec.workerArgs), spec.env, spec.logPath)
+		return startCommand(ctx, buildNsjailCommand(spec.nsjailBinary, spec.profilePath, spec.workerExe), spec.env, spec.logPath)
 	}))
 
 	ws, err := sup.StartSession(context.Background(), testRequest("wrap-1"))
