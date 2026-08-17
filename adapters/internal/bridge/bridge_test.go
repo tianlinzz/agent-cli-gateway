@@ -253,10 +253,18 @@ type deadlineNative struct {
 	fakeNative
 	aborted chan struct{}
 	onAbort func()
+	sendErr error
 }
 
 func newDeadlineNative() *deadlineNative {
 	return &deadlineNative{fakeNative: fakeNative{src: make(chan events.Event, 8)}, aborted: make(chan struct{}, 4)}
+}
+
+func (d *deadlineNative) Send(ctx context.Context, input events.Input) error {
+	if d.sendErr != nil {
+		return d.sendErr
+	}
+	return d.fakeNative.Send(ctx, input)
 }
 
 func (d *deadlineNative) Abort(ctx context.Context) error {
@@ -352,6 +360,90 @@ func TestTurnDeadlineNoTimeoutMeansNoWatcher_OF09b(t *testing.T) {
 		t.Fatalf("no event expected without a deadline, got %#v", ev)
 	case <-native.aborted:
 		t.Fatal("abort ran without a configured deadline")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// abortFailingNative aborts with an error while still emitting a native
+// terminal — the code-review Phase 3 P1 combination: the interrupt failed
+// (escalated), yet a terminal arrives.
+type abortFailingNative struct {
+	deadlineNative
+}
+
+func (d *abortFailingNative) Abort(ctx context.Context) error {
+	d.deadlineNative.Abort(ctx)
+	return errors.New("interrupt failed: escalated to process kill")
+}
+
+// TestSendFailureRollsBackDeadlineWatch_CRPhase3 pins the P1 fix: a Send the
+// native session REJECTED must not leave an armed deadline watch. Otherwise
+// the timer would abort an idle session after the API already answered with a
+// send failure, and the resulting sentinel would poison the NEXT turn's
+// stream. After the fix: no abort, no synthesized events, and a subsequent
+// successful turn on the same wrapper completes normally.
+func TestSendFailureRollsBackDeadlineWatch_CRPhase3(t *testing.T) {
+	native := newDeadlineNative()
+	native.sendErr = errors.New("native: session is closed")
+	session := Wrap(native, WrapOptions{Adapter: "codex", TurnTimeout: 50 * time.Millisecond})
+	session.settleBound = 50 * time.Millisecond
+
+	if err := session.Send(context.Background(), runtime.Input{Messages: []runtime.Message{{Role: "user", Content: "work"}}}); err == nil {
+		t.Fatal("Send must propagate the native failure")
+	}
+
+	// Wait past the would-be deadline and settle bound: no abort, no events.
+	select {
+	case ev := <-session.Events():
+		t.Fatalf("stale event after failed Send: %#v", ev)
+	case <-native.aborted:
+		t.Fatal("deadline watcher aborted an idle session after Send failed")
+	case <-time.After(300 * time.Millisecond):
+		// clean: the watch was rolled back
+	}
+
+	// A subsequent successful turn must complete normally, with no stale
+	// sentinel ahead of it.
+	native.sendErr = nil
+	native.onAbort = func() { native.src <- events.Event{Kind: events.EventFinish, FinishReason: "cancelled"} }
+	if err := session.Send(context.Background(), runtime.Input{Messages: []runtime.Message{{Role: "user", Content: "again"}}}); err != nil {
+		t.Fatal(err)
+	}
+	native.src <- events.Event{Kind: events.EventText, Text: "answer"}
+	native.src <- events.Event{Kind: events.EventFinish, FinishReason: "end_turn"}
+	if ev := <-session.Events(); ev.Type != runtime.EventText || ev.Text != "answer" {
+		t.Fatalf("first event = %#v, want the turn's text", ev)
+	}
+	if ev := <-session.Events(); ev.Type != runtime.EventFinish || ev.FinishReason != "end_turn" {
+		t.Fatalf("terminal = %#v, want native end_turn (no stale sentinel)", ev)
+	}
+}
+
+// TestDeadlineAbortFailureWithTerminalIsUnknownOutcome_CRPhase3 pins the P1
+// fix: when the deadline abort FAILS (e.g. it escalated to a process kill) but
+// a native terminal still arrives, the wrapper must emit the
+// runtime.TurnDeadlineExceeded sentinel — the completion outcome is unknown —
+// and never rewrite the terminal into a settled finish(timeout) that the API
+// would record as RunTimedOut.
+func TestDeadlineAbortFailureWithTerminalIsUnknownOutcome_CRPhase3(t *testing.T) {
+	native := &abortFailingNative{deadlineNative: *newDeadlineNative()}
+	native.onAbort = func() {
+		native.src <- events.Event{Kind: events.EventFinish, FinishReason: "cancelled"}
+	}
+	session := Wrap(native, WrapOptions{Adapter: "codex", TurnTimeout: 50 * time.Millisecond})
+
+	if err := session.Send(context.Background(), runtime.Input{Messages: []runtime.Message{{Role: "user", Content: "work"}}}); err != nil {
+		t.Fatal(err)
+	}
+	ev := <-session.Events()
+	if ev.Type != runtime.EventError || ev.Error != runtime.TurnDeadlineExceeded {
+		t.Fatalf("event = %#v, want the unknown-outcome sentinel %q (a failed abort must never become a confirmed timeout)", ev, runtime.TurnDeadlineExceeded)
+	}
+	// The suppressed native terminal must NOT be forwarded either: the stream
+	// carries exactly one synthesized terminal.
+	select {
+	case extra := <-session.Events():
+		t.Fatalf("unexpected extra terminal after sentinel: %#v", extra)
 	case <-time.After(100 * time.Millisecond):
 	}
 }

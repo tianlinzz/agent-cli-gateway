@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"testing"
 )
 
@@ -18,9 +17,10 @@ func TestCommandSpecAcceptsArgvArray(t *testing.T) {
 		}
 	}
 
-	t.Run("array is canonical", func(t *testing.T) {
+	t.Run("array is canonical and the only argument-capable form", func(t *testing.T) {
 		write(t, `
 mode = "test"
+
 [agents.codex]
 enabled = false
 command = ["/opt/agent tools/codex", "app-server", "--listen", "stdio://"]
@@ -39,12 +39,13 @@ command = ["/opt/agent tools/codex", "app-server", "--listen", "stdio://"]
 		}
 	})
 
-	t.Run("legacy string splits shell-like and stays accepted", func(t *testing.T) {
+	t.Run("legacy string is one executable token, not shell syntax", func(t *testing.T) {
 		write(t, `
 mode = "test"
+
 [agents.codex]
 enabled = false
-command = "/opt/agent\\ tools/codex --quiet"
+command = "codex --flag"
 `)
 		cfg, err := LoadGateway(path)
 		if err != nil {
@@ -54,27 +55,38 @@ command = "/opt/agent\\ tools/codex --quiet"
 		if !command.IsLegacyString() {
 			t.Fatal("string form must be flagged legacy for the deprecation warning")
 		}
-		want := []string{"/opt/agent tools/codex", "--quiet"}
+		// The whole string — spaces and all — is a single executable path.
+		// It will fail the availability probe unless an executable with that
+		// literal name exists, which is the point: arguments must migrate to
+		// the array form (roadmap Phase 3.3, code-review Phase 3 P1).
+		want := []string{"codex --flag"}
 		if !reflect.DeepEqual(command.Argv(), want) {
-			t.Fatalf("argv = %#v, want %#v", command.Argv(), want)
+			t.Fatalf("argv = %#v, want the whole string as ONE executable token %#v", command.Argv(), want)
 		}
 	})
 
-	t.Run("unterminated quote fails config load", func(t *testing.T) {
+	t.Run("legacy string with spaces stays one token", func(t *testing.T) {
 		write(t, `
 mode = "test"
+
 [agents.codex]
 enabled = false
-command = 'codex --flag "oops'
+command = "/opt/agent tools/codex"
 `)
-		if _, err := LoadGateway(path); err == nil || !strings.Contains(err.Error(), "unterminated") {
-			t.Fatalf("err = %v, want unterminated quote failure", err)
+		cfg, err := LoadGateway(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"/opt/agent tools/codex"}
+		if !reflect.DeepEqual(cfg.Agents["codex"].Command.Argv(), want) {
+			t.Fatalf("argv = %#v, want %#v (single executable path)", cfg.Agents["codex"].Command.Argv(), want)
 		}
 	})
 
 	t.Run("non-string array element rejected", func(t *testing.T) {
 		write(t, `
 mode = "test"
+
 [agents.codex]
 enabled = false
 command = ["codex", 3]
@@ -83,43 +95,19 @@ command = ["codex", 3]
 			t.Fatal("numeric command element must fail config load")
 		}
 	})
-}
 
-func TestSplitCommandString(t *testing.T) {
-	cases := []struct {
-		name    string
-		command string
-		want    []string
-		wantErr bool
-	}{
-		{name: "plain", command: "codex app-server", want: []string{"codex", "app-server"}},
-		{name: "extra whitespace", command: "  codex\t--flag\n value  ", want: []string{"codex", "--flag", "value"}},
-		{name: "double quoted path with spaces", command: `"/opt/agent tools/codex" --quiet`, want: []string{"/opt/agent tools/codex", "--quiet"}},
-		{name: "single quoted path with spaces", command: `'/opt/agent tools/codex' --quiet`, want: []string{"/opt/agent tools/codex", "--quiet"}},
-		{name: "backslash escape", command: `/opt/agent\ tools/codex --quiet`, want: []string{"/opt/agent tools/codex", "--quiet"}},
-		{name: "escaped quote inside double quotes", command: `"say \"hi\""`, want: []string{`say "hi"`}},
-		{name: "empty string", command: "", want: nil},
-		{name: "unterminated double quote", command: `"codex`, wantErr: true},
-		{name: "unterminated single quote", command: `'codex`, wantErr: true},
-		{name: "trailing backslash", command: `codex \`, wantErr: true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := SplitCommandString(tc.command)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("SplitCommandString(%q) = %#v, want error", tc.command, got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("SplitCommandString(%q): %v", tc.command, err)
-			}
-			if !reflect.DeepEqual(got, tc.want) {
-				t.Fatalf("SplitCommandString(%q) = %#v, want %#v", tc.command, got, tc.want)
-			}
-		})
-	}
+	t.Run("numeric command rejected", func(t *testing.T) {
+		write(t, `
+mode = "test"
+
+[agents.codex]
+enabled = false
+command = 3
+`)
+		if _, err := LoadGateway(path); err == nil {
+			t.Fatal("numeric command must fail config load")
+		}
+	})
 }
 
 // TestLoadGatewayWarnsOnLegacyCommandString_OF14 asserts the deprecation
@@ -146,5 +134,30 @@ command = "kimi"
 	}
 	if !reflect.DeepEqual(cfg.Agents["kimi"].Command.Argv(), []string{"kimi"}) {
 		t.Fatalf("argv = %#v", cfg.Agents["kimi"].Command.Argv())
+	}
+}
+
+// TestLoadGateway_LegacyStringIsNotTokenized guards against the removed
+// shell-like splitter creeping back: a quoted legacy string is ONE literal
+// executable token with no quote processing.
+func TestLoadGateway_LegacyStringIsNotTokenized(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gw.toml")
+	if err := os.WriteFile(path, []byte(`
+mode = "test"
+
+[agents.codex]
+enabled = false
+command = 'codex --flag "quoted"'
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadGateway(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{`codex --flag "quoted"`}
+	if got := cfg.Agents["codex"].Command.Argv(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("argv = %#v, want the literal string as one token %#v (no shell tokenization)", got, want)
 	}
 }

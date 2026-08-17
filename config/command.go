@@ -6,16 +6,16 @@ import (
 	"strings"
 )
 
-// CommandSpec is an agent CLI command in argv form (O-F14). The canonical
-// TOML representation is an array:
+// CommandSpec is an agent CLI command in argv form (O-F14). The canonical —
+// and only argument-capable — TOML representation is an array:
 //
 //	command = ["/opt/agent tools/codex", "app-server"]
 //
-// A plain string is still accepted for one deprecation window so existing
-// deployments keep working, but it is tokenized with a shell-like splitter
-// (whitespace separation with single/double-quote grouping and backslash
-// escapes) instead of naive whitespace splitting, so quoted paths with spaces
-// survive. A future release rejects the string form.
+// A plain string is accepted for one deprecation window and interpreted as
+// ONE executable path (the whole string becomes argv[0]), never as shell
+// syntax: `"codex --flag"` names an executable literally called
+// `codex --flag`, which will not resolve — arguments must be migrated to the
+// array form. A future release rejects the string form outright.
 type CommandSpec struct {
 	argv []string
 	// legacyString records that the TOML value was the deprecated string
@@ -34,17 +34,16 @@ func (c CommandSpec) IsLegacyString() bool { return c.IsSet() && c.legacyString 
 // IsSet reports whether a command was configured at all.
 func (c CommandSpec) IsSet() bool { return len(c.argv) > 0 }
 
-// UnmarshalTOML accepts either an argv array of strings (canonical) or a
-// single string (deprecated; split shell-like). Any other shape is a config
-// error.
+// UnmarshalTOML accepts either an argv array of strings (canonical, the only
+// form that can carry arguments) or a single string (deprecated; the whole
+// string is one executable path). Any other shape is a config error.
 func (c *CommandSpec) UnmarshalTOML(value any) error {
 	switch typed := value.(type) {
 	case string:
-		argv, err := SplitCommandString(typed)
-		if err != nil {
+		if err := validateArgv([]string{typed}); err != nil {
 			return fmt.Errorf("config: command %q: %w", typed, err)
 		}
-		c.argv = argv
+		c.argv = []string{typed}
 		c.legacyString = true
 		return nil
 	case []any:
@@ -75,7 +74,7 @@ func (c *CommandSpec) UnmarshalTOML(value any) error {
 		c.legacyString = false
 		return nil
 	default:
-		return fmt.Errorf("config: command must be an argv array of strings or a single string, got %T", value)
+		return fmt.Errorf("config: command must be an argv array of strings or a single executable path, got %T", value)
 	}
 }
 
@@ -84,7 +83,7 @@ func validateArgv(argv []string) error {
 		return nil
 	}
 	if strings.TrimSpace(argv[0]) == "" {
-		return fmt.Errorf("config: command executable must not be empty")
+		return fmt.Errorf("config: command executable must not be empty or whitespace")
 	}
 	return nil
 }
@@ -92,68 +91,6 @@ func validateArgv(argv []string) error {
 // warnLegacyCommand emits the one-time deprecation warning for an agent still
 // configured with the string command form.
 func warnLegacyCommand(agent string, command CommandSpec) {
-	slog.Warn("config: agents.<id>.command as a single string is deprecated; use an argv array (quoted paths with spaces stay one token)",
-		"agent", agent, "argv", strings.Join(command.Argv(), " "))
-}
-
-// SplitCommandString tokenizes a legacy single-string command the way a
-// POSIX shell would split a command line (without command substitution or
-// variable expansion): whitespace separates tokens, single quotes preserve
-// everything literally, double quotes preserve everything except backslash
-// escapes, and a backslash escapes the next character. Unlike
-// strings.Fields, a quoted path with spaces stays a single token.
-func SplitCommandString(command string) ([]string, error) {
-	var (
-		argv     []string
-		token    strings.Builder
-		inToken  bool
-		quote    rune
-		escaped  bool
-		balanced = true
-	)
-	flush := func() {
-		if inToken {
-			argv = append(argv, token.String())
-			token.Reset()
-			inToken = false
-		}
-	}
-	for _, r := range command {
-		switch {
-		case escaped:
-			token.WriteRune(r)
-			escaped = false
-		case quote != 0:
-			switch {
-			case r == '\\' && quote == '"':
-				escaped = true
-			case r == quote:
-				quote = 0
-			default:
-				token.WriteRune(r)
-			}
-		case r == '\\':
-			escaped = true
-			inToken = true
-		case r == '\'' || r == '"':
-			quote = r
-			inToken = true
-		case r == ' ' || r == '\t' || r == '\n' || r == '\r':
-			flush()
-		default:
-			token.WriteRune(r)
-			inToken = true
-		}
-	}
-	if quote != 0 || escaped {
-		balanced = false
-	}
-	flush()
-	if !balanced {
-		return nil, fmt.Errorf("unterminated quote or escape")
-	}
-	if err := validateArgv(argv); err != nil {
-		return nil, err
-	}
-	return argv, nil
+	slog.Warn("config: agents.<id>.command as a single string is deprecated; the string is interpreted as ONE executable path (not shell syntax) — migrate arguments to the argv array form",
+		"agent", agent, "executable", command.Argv()[0])
 }

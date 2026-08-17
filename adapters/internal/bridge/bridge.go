@@ -13,12 +13,16 @@
 // crosses the API boundary.
 //
 // Turn deadline (O-F09b): when WrapOptions.TurnTimeout is positive, every
-// Send starts a deadline watcher. On expiry the watcher aborts the native
-// turn; if the native terminal settles within the settle bound the wrapper
-// synthesizes finish(timeout) in place of the native terminal, otherwise it
-// emits the runtime.TurnDeadlineExceeded error sentinel (outcome unknown).
-// This is the single enforcement point shared by ALL agents — native abort
-// differences stay inside each agent/<name> Session.
+// accepted Send arms a deadline watch. On expiry the watcher aborts the native
+// turn; the outcome is decided by the abort result — an abort whose native
+// terminal drained synthesizes finish(timeout), while a FAILED abort (or an
+// undrained terminal) emits the runtime.TurnDeadlineExceeded sentinel so the
+// API records RunOutcomeUnknown, never a confirmed timeout (the Phase 2
+// terminal-state rule). A Send the native session rejected rolls the watch
+// back atomically: the timer can neither abort an idle session nor inject a
+// stale terminal into a later turn's stream. This is the single enforcement
+// point shared by ALL agents — native abort differences stay inside each
+// agent/<name> Session.
 package bridge
 
 import (
@@ -96,11 +100,14 @@ type Session struct {
 	settleBound time.Duration
 }
 
-// turnWatch tracks the active turn for deadline enforcement.
+// turnWatch tracks the active turn for deadline enforcement. terminal holds
+// the suppressed native terminal (written by the forwarder, read by the
+// watcher, both under turnMu before/after the done channel close).
 type turnWatch struct {
-	done  chan struct{}
-	timer *time.Timer
-	fired bool // deadline fired (guarded by turnMu)
+	done     chan struct{}
+	timer    *time.Timer
+	fired    bool         // deadline fired (guarded by turnMu)
+	terminal events.Event // native terminal suppressed because fired (guarded by turnMu)
 }
 
 // Wrap starts the event forwarder around native and returns the runtime
@@ -122,7 +129,9 @@ func Wrap(native NativeSession, opts WrapOptions) *Session {
 		defer s.endTurnSilently()
 		for event := range native.Events() {
 			if isTerminal(event) {
-				s.emitEvent(s.terminalEvent(event))
+				if mapped, forward := s.terminalEvent(event); forward {
+					s.emitEvent(mapped)
+				}
 				continue
 			}
 			s.emitEvent(MapEvent(event, opts.Adapter))
@@ -137,7 +146,15 @@ func (s *Session) Send(ctx context.Context, input runtime.Input) error {
 	if s.turnTimeout > 0 {
 		s.beginTurn()
 	}
-	return s.native.Send(ctx, events.Input{Prompt: PromptForNative(input, s.injectSystem)})
+	err := s.native.Send(ctx, events.Input{Prompt: PromptForNative(input, s.injectSystem)})
+	if err != nil && s.turnTimeout > 0 {
+		// The native session rejected the turn, so no terminal will ever arrive
+		// for it. Undo the watch atomically: otherwise the timer would later
+		// abort an idle session and inject a stale sentinel into the next
+		// turn's event stream (code-review Phase 3 P1).
+		s.endTurnSilently()
+	}
+	return err
 }
 
 func (s *Session) Events() <-chan runtime.Event    { return s.events }
@@ -178,32 +195,49 @@ func (s *Session) endTurnSilently() {
 	s.clearTurnLocked()
 }
 
-// terminalEvent maps the turn's terminal native event. When the deadline
-// fired, the native terminal is only the abort's confirmation and is replaced
-// by the synthesized finish(timeout).
-func (s *Session) terminalEvent(event events.Event) runtime.Event {
+// terminalEvent handles the turn's terminal native event under turnMu. When
+// the deadline has NOT fired, the native terminal is forwarded as-is. When it
+// HAS fired, the native terminal is suppressed and recorded for the watcher:
+// only the watcher knows whether its abort succeeded, and it alone decides
+// between the settled finish(timeout) synthesis and the unknown-outcome
+// sentinel (a failed abort must never be rewritten into a confirmed timeout —
+// code-review Phase 3 P1).
+func (s *Session) terminalEvent(event events.Event) (runtime.Event, bool) {
 	s.turnMu.Lock()
 	t := s.turn
 	if t == nil {
 		s.turnMu.Unlock()
-		return MapEvent(event, s.adapter)
+		return MapEvent(event, s.adapter), true
 	}
 	s.turn = nil
 	fired := t.fired
 	if !fired {
 		t.timer.Stop()
 	}
+	if fired {
+		t.terminal = event
+	}
 	close(t.done)
 	s.turnMu.Unlock()
 	if fired {
-		return runtime.Event{Type: runtime.EventFinish, FinishReason: runtime.FinishReasonTimeout}
+		return runtime.Event{}, false // suppressed; the watcher decides
 	}
-	return MapEvent(event, s.adapter)
+	return MapEvent(event, s.adapter), true
 }
 
-// watchTurn enforces the deadline for one turn: on expiry it aborts the
-// native turn (which settles or escalates internally), waits for the
-// terminal, and only declares an unsettled deadline via the sentinel error.
+// watchTurn enforces the deadline for one turn. On expiry it aborts the native
+// turn (each agent settles or escalates internally), then decides the outcome
+// from the abort result and the suppressed native terminal:
+//
+//   - abort succeeded + native terminal drained → synthesize finish(timeout)
+//     (a CONFIRMED timeout; the suppressed terminal is only the interrupt's
+//     acknowledgement);
+//   - abort failed (possibly after escalation) or the terminal never drained
+//     within the settle bound → emit runtime.TurnDeadlineExceeded: the
+//     completion outcome is unknown and the API must record
+//     RunOutcomeUnknown, never RunTimedOut;
+//   - the turn was abandoned without a terminal (Send rolled back, or the
+//     native stream ended) → emit nothing.
 func (s *Session) watchTurn(t *turnWatch) {
 	defer t.timer.Stop()
 	select {
@@ -225,29 +259,34 @@ func (s *Session) watchTurn(t *turnWatch) {
 
 	settle := time.NewTimer(s.settleBound)
 	defer settle.Stop()
+	var doneClosed bool
 	select {
 	case <-t.done:
-		// The forwarder handled the terminal and emitted finish(timeout).
-		return
+		doneClosed = true
 	case <-settle.C:
 	}
-
 	s.turnMu.Lock()
-	if s.turn != t {
-		s.turnMu.Unlock()
-		return
-	}
-	s.turn = nil
-	close(t.done)
+	terminal := t.terminal
 	s.turnMu.Unlock()
 
-	if abortErr != nil {
-		slog.Warn("bridge: turn deadline abort failed", "adapter", s.adapter, "error", abortErr)
+	// A turn abandoned without a terminal (Send rollback or stream end):
+	// nothing to synthesize.
+	if terminal.Kind == "" && doneClosed {
+		return
 	}
-	// The turn's true completion outcome is unknown; surface the sentinel so
-	// the API records RunOutcomeUnknown and presents the unified timeout
-	// error.
-	s.emitEvent(runtime.Event{Type: runtime.EventError, Error: runtime.TurnDeadlineExceeded})
+	if abortErr != nil || terminal.Kind == "" {
+		if abortErr != nil {
+			slog.Warn("bridge: turn deadline abort failed", "adapter", s.adapter, "error", abortErr)
+		}
+		// The deadline abort could not be confirmed. The native Abort has
+		// already escalated to a process kill on failure paths, so the
+		// execution ends here and cannot be reused; surface the sentinel so
+		// the API records RunOutcomeUnknown and presents the unified timeout
+		// error.
+		s.emitEvent(runtime.Event{Type: runtime.EventError, Error: runtime.TurnDeadlineExceeded})
+		return
+	}
+	s.emitEvent(runtime.Event{Type: runtime.EventFinish, FinishReason: runtime.FinishReasonTimeout})
 }
 
 func isTerminal(event events.Event) bool {

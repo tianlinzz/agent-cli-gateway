@@ -108,6 +108,11 @@ func (a *fakeAdapter) Start(context.Context, runtime.StartRequest) (runtime.Sess
 
 func registerFake(t *testing.T, reg *runtime.Registry, name, display string) {
 	t.Helper()
+	for _, existing := range reg.List() {
+		if existing == name {
+			return // a real adapter was registered for this name; keep it
+		}
+	}
 	if err := reg.Register(name, func(ctx context.Context, n string, cfg runtime.AdapterConfig) (runtime.AgentAdapter, error) {
 		return &fakeAdapter{desc: runtime.Descriptor{
 			ModelID:       name,
@@ -137,6 +142,15 @@ type harness struct {
 }
 
 func newHarness(t *testing.T, mutCfg func(*worker.Config)) *harness {
+	t.Helper()
+	return newHarnessExt(t, mutCfg, nil, nil)
+}
+
+// newHarnessExt is newHarness with hooks: regHook registers additional (or
+// real) adapters for model discovery, optHook mutates the API handler
+// options. The real-worker deadline test uses both to run the actual codex
+// adapter and bridge instead of the Describe-only fakes.
+func newHarnessExt(t *testing.T, mutCfg func(*worker.Config), regHook func(*runtime.Registry), optHook func(*openai.Options)) *harness {
 	t.Helper()
 
 	wsRoot := t.TempDir()
@@ -168,11 +182,16 @@ func newHarness(t *testing.T, mutCfg func(*worker.Config)) *harness {
 	sup := backend.Supervisor()
 
 	reg := runtime.NewRegistry()
+	// The hook runs first so a test can register the REAL adapter for an
+	// agent; the Describe-only fakes fill the remaining names.
+	if regHook != nil {
+		regHook(reg)
+	}
 	registerFake(t, reg, "codex", "Codex")
 	registerFake(t, reg, "claude-code", "Claude Code")
 	registerFake(t, reg, "kimi", "Kimi")
 
-	h := openai.NewHandler(openai.Options{
+	opts := openai.Options{
 		Registry:     reg,
 		Store:        runtime.NewMemorySessionStore(),
 		Backend:      backend,
@@ -180,7 +199,11 @@ func newHarness(t *testing.T, mutCfg func(*worker.Config)) *harness {
 		TurnTimeout:  15 * time.Second,
 		UsageGrace:   40 * time.Millisecond,
 		Enabled:      func(name string) bool { return true },
-	})
+	}
+	if optHook != nil {
+		optHook(&opts)
+	}
+	h := openai.NewHandler(opts)
 	ts := httptest.NewServer(h.Routes())
 
 	t.Cleanup(func() {

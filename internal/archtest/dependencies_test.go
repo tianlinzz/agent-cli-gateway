@@ -270,6 +270,30 @@ func TestActiveDocumentation(t *testing.T) {
 			}
 		}
 	}
+
+	// The rewrite boundary must hold in the contributor-facing documents too
+	// (code-review Phase 3 P2): CONTRIBUTING.md and the root CHANGELOG must
+	// not describe cc-connect's IM-platform capabilities or point contributors
+	// at the upstream repo as if it were this project. Pre-rewrite history is
+	// archived under docs/ with an explicit provenance header.
+	for _, relative := range []string{"CONTRIBUTING.md", "CHANGELOG.md"} {
+		data, err := os.ReadFile(filepath.Join(root, relative))
+		if err != nil {
+			t.Errorf("read %s: %v", relative, err)
+			continue
+		}
+		content := string(data)
+		for _, forbidden := range []string{
+			"Contributing to cc-connect",
+			"chenhg5/cc-connect",
+			"Feishu", "Telegram", "Discord", "WeChat", "Weixin", "Matrix",
+			"Reasonix",
+		} {
+			if strings.Contains(content, forbidden) {
+				t.Errorf("%s still documents the pre-rewrite IM project: contains %q (archive under docs/ instead)", relative, forbidden)
+			}
+		}
+	}
 }
 
 func moduleRoot(t *testing.T) string {

@@ -2,9 +2,11 @@ package claudecode
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"github.com/tianlinzz/agent-cli-gateway/adapters/internal/bridge"
+	"github.com/tianlinzz/agent-cli-gateway/adapters/internal/bridge/testcorpus"
 	native "github.com/tianlinzz/agent-cli-gateway/agent/claudecode"
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
 )
@@ -214,4 +216,36 @@ func slicesEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestAdapterParity_claudecode runs the shared cross-adapter fixture corpus
+// (D3 roadmap requirement: table-driven parity tests before/after helper
+// extraction). The SAME corpus runs in all three adapter packages, so any
+// drift between adapters or regression in the shared bridge fails identically
+// here.
+func TestAdapterParity_Claudecode(t *testing.T) {
+	for _, tc := range testcorpus.EventCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			native := newFakeNativeSession()
+			session := bridge.Wrap(native, bridge.WrapOptions{Adapter: "claudecode"})
+			native.events <- tc.Native
+			got := <-session.Events()
+			want := tc.Want("claudecode")
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("mapped event = %#v, want %#v", got, want)
+			}
+		})
+	}
+	for _, tc := range testcorpus.PromptCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			native := newFakeNativeSession()
+			session := bridge.Wrap(native, bridge.WrapOptions{Adapter: "claudecode", InjectSystemPrompt: tc.InjectSystem})
+			if err := session.Send(context.Background(), tc.Input); err != nil {
+				t.Fatal(err)
+			}
+			if native.input.Prompt != tc.Want {
+				t.Fatalf("prompt = %q, want %q", native.input.Prompt, tc.Want)
+			}
+		})
+	}
 }

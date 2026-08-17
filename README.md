@@ -219,13 +219,17 @@ See [`config.example.toml`](config.example.toml) for a full annotated example.
 | `[isolation.user_namespace]` | `enabled`, `uid`, `gid` | `true`, `65532`, `65532` | Unprivileged user namespace |
 | `[isolation.seccomp]` | `policy` | `kafel` | `kafel` or `off` (test only); policy arch is selected from `GOARCH` |
 | `[agents.<id>]` | `enabled` | `false` | Whether the agent is available (see "Installing and enabling an agent") |
-| `[agents.<id>]` | `command` | *(empty)* | CLI command as an argv array (`command = ["codex"]`), executed verbatim (no shell); the executable is probed before the agent is advertised. A plain string is accepted for one deprecation window |
+| `[agents.<id>]` | `command` | *(empty)* | CLI command as an argv array (`command = ["codex"]`), executed verbatim (no shell); the executable is probed before the agent is advertised. A plain string is accepted for one deprecation window as ONE executable path (not shell syntax) |
 | `[agents.<id>]` | `permission` | `auto` | `auto` / `ask` / `deny` |
 | `[agents.<id>]` | `timeout` | *(falls back to `server.turn_timeout`)* | Per-agent turn deadline; honored by every adapter at the worker boundary |
 | `[agents.<id>]` | `inject_system_prompt` | `false` | Forward caller `system` role messages into the native prompt each turn |
 
 Agent settings are passed to the single-session worker over the canonical RPC
-contract; provider secrets remain worker/container environment configuration.
+contract as TYPED, operator-owned configuration (`runtime.AdapterConfig`) —
+never through environment variables and never from client request data.
+`agents.<id>.env` is trusted deployment config (merged into that agent CLI's
+child environment only); a client can never influence it. Provider credentials
+belong in `agents.<id>.env` or the container environment, not in requests.
 
 ## Installing and enabling an agent
 

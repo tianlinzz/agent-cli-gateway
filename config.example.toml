@@ -128,9 +128,9 @@ policy = "kafel"
 # The gateway probes the executable (exec.LookPath on argv[0]) before
 # advertising it. The command is executed verbatim — never through a shell —
 # so paths with spaces and extra flags are expressed as array elements. A
-# single string is still accepted for one deprecation window (split
-# shell-like, quoted paths stay one token) but will be rejected in a future
-# release.
+# single string is still accepted for one deprecation window, interpreted as
+# ONE executable path (the whole string is argv[0], never shell syntax —
+# arguments must migrate to the array form); a future release rejects it.
 
 [agents.codex]
 enabled = false
