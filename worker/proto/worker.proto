@@ -54,6 +54,26 @@ message HealthResponse {
   string version = 2;
   // pid is the worker process's own PID.
   int32 pid = 3;
+  // worker_id identifies the worker process. In the one-worker-per-session
+  // model it equals the gateway session id (GW_WORKER_SESSION_ID).
+  string worker_id = 4;
+  // node_id identifies the host node the worker runs on (os.Hostname() in the
+  // single-node deployment).
+  string node_id = 5;
+  // protocol_version is the handshake protocol version the worker speaks
+  // (worker.ProtocolVersion). The supervisor compares it against its own and
+  // rejects the session (fail-closed) on any mismatch.
+  int32 protocol_version = 6;
+  // arch is the worker binary's runtime.GOARCH.
+  string arch = 7;
+  // sandbox_capabilities advertises the isolation features in effect for this
+  // worker (e.g. "nsjail" when the process is jailed).
+  repeated string sandbox_capabilities = 8;
+  // adapters lists the adapter names registered in this worker process. CLI
+  // versions are deliberately NOT advertised: in the per-session process model
+  // the supervisor probes CLI availability locally instead of trusting worker
+  // self-reports.
+  repeated string adapters = 9;
 }
 
 message StartSessionRequest {

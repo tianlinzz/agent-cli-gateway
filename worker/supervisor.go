@@ -711,7 +711,11 @@ type workerSession struct {
 	cmd       *exec.Cmd
 	outerPID  int // immutable after construction: nsjail PID when isolated, worker PID when direct
 	workerPID int // guarded by mu: worker PID reported at handshake
-	pgid      int // immutable after construction: process group of the spawned child (= outerPID with Setpgid)
+	// workerID and nodeID are guarded by mu: the worker identity reported in
+	// the Health handshake (SessionRecord.WorkerID/NodeID sources).
+	workerID string
+	nodeID   string
+	pgid     int // immutable after construction: process group of the spawned child (= outerPID with Setpgid)
 
 	sessionDir  string
 	socketDir   string
@@ -733,6 +737,16 @@ func (ws *workerSession) snapshotClient() (*client, int) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	return ws.client, ws.workerPID
+}
+
+// WorkerIdentity reports the worker/node identity captured in the Health
+// handshake. It is the optional ExecutionHandle capability the API layer uses
+// to populate SessionRecord.WorkerID/NodeID; handles that do not implement it
+// leave the record fields empty.
+func (ws *workerSession) WorkerIdentity() (workerID, nodeID string) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	return ws.workerID, ws.nodeID
 }
 
 // clearClient closes c and nils the cached client under the lock. Used by
@@ -1008,10 +1022,10 @@ func (ws *workerSession) heartbeat() {
 				cancel()
 				continue
 			}
-			_, pid, err := cl.Health(ctx)
+			health, err := cl.Health(ctx)
 			cancel()
-			if err == nil && int(pid) != expectedPID {
-				err = fmt.Errorf("worker pid changed from %d to %d", expectedPID, pid)
+			if err == nil && int(health.PID) != expectedPID {
+				err = fmt.Errorf("worker pid changed from %d to %d", expectedPID, health.PID)
 			}
 			if err == nil {
 				failures = 0
@@ -1295,13 +1309,26 @@ dial:
 	var lastErr error
 	for {
 		hctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		version, pid, herr := c.Health(hctx)
+		health, herr := c.Health(hctx)
 		cancel()
 		if herr == nil {
+			// Version negotiation is fail-closed: a worker speaking a different
+			// handshake protocol is never started — mixed-version pairs must
+			// fail loudly here, not drift mid-session.
+			if health.ProtocolVersion != ProtocolVersion {
+				ws.clearClient(c)
+				return fmt.Errorf("protocol version mismatch: worker %d, supervisor %d", health.ProtocolVersion, ProtocolVersion)
+			}
 			ws.mu.Lock()
-			ws.workerPID = int(pid)
+			ws.workerPID = int(health.PID)
+			ws.workerID = health.WorkerID
+			ws.nodeID = health.NodeID
 			ws.mu.Unlock()
-			slog.Debug("worker: handshake ok", "session", ws.req.SessionID, "version", version, "worker_pid", pid)
+			slog.Debug("worker: handshake ok", "session", ws.req.SessionID,
+				"version", health.Version, "worker_pid", health.PID,
+				"worker_id", health.WorkerID, "node_id", health.NodeID,
+				"arch", health.Arch, "sandbox", health.SandboxCapabilities,
+				"adapters", health.Adapters)
 			break
 		}
 		lastErr = herr

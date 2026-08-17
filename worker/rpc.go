@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	goruntime "runtime"
 	"time"
 	"unicode/utf8"
 
@@ -147,13 +148,38 @@ func (c *client) Close() error {
 	return c.conn.Close()
 }
 
-// Health performs the handshake and returns the worker version and PID.
-func (c *client) Health(ctx context.Context) (version string, pid int32, err error) {
+// WorkerHealth is the worker's handshake report: its identity (worker/node),
+// the handshake protocol version it speaks, and its self-described build and
+// sandbox shape. The supervisor consumes it during the handshake; the
+// protocol version is a hard compatibility gate (fail-closed on mismatch),
+// everything else is recorded for observability and future placement.
+type WorkerHealth struct {
+	Version             string
+	PID                 int32
+	WorkerID            string
+	NodeID              string
+	ProtocolVersion     int32
+	Arch                string
+	SandboxCapabilities []string
+	Adapters            []string
+}
+
+// Health performs the handshake and returns the worker's health report.
+func (c *client) Health(ctx context.Context) (WorkerHealth, error) {
 	resp, err := c.c.Health(ctx, &workerpb.HealthRequest{})
 	if err != nil {
-		return "", 0, err
+		return WorkerHealth{}, err
 	}
-	return resp.Version, resp.Pid, nil
+	return WorkerHealth{
+		Version:             resp.Version,
+		PID:                 resp.Pid,
+		WorkerID:            resp.WorkerId,
+		NodeID:              resp.NodeId,
+		ProtocolVersion:     resp.ProtocolVersion,
+		Arch:                resp.Arch,
+		SandboxCapabilities: resp.SandboxCapabilities,
+		Adapters:            resp.Adapters,
+	}, nil
 }
 
 // StartSession starts the session and returns the adapter's lifecycle mode.
@@ -268,16 +294,67 @@ type workerServer struct {
 	h Handler
 }
 
+// AdapterLister is an optional Handler capability that reports the adapter
+// names registered in the worker process. The real worker child implements it
+// from the process-wide runtime registry; handlers that do not simply leave
+// the adapters handshake field empty.
+type AdapterLister interface {
+	// RegisteredAdapters returns the adapter names registered in this worker
+	// process.
+	RegisteredAdapters() []string
+}
+
 func (s *workerServer) Health(ctx context.Context, _ *workerpb.HealthRequest) (*workerpb.HealthResponse, error) {
 	version, err := s.h.Health(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return &workerpb.HealthResponse{
-		Status:  "ok",
-		Version: version,
-		Pid:     int32(os.Getpid()),
-	}, nil
+	resp := &workerpb.HealthResponse{
+		Status:              "ok",
+		Version:             version,
+		Pid:                 int32(os.Getpid()),
+		WorkerId:            workerID(),
+		NodeId:              nodeID(),
+		ProtocolVersion:     ProtocolVersion,
+		Arch:                goruntime.GOARCH,
+		SandboxCapabilities: sandboxCapabilities(),
+	}
+	if lister, ok := s.h.(AdapterLister); ok {
+		resp.Adapters = lister.RegisteredAdapters()
+	}
+	return resp, nil
+}
+
+// workerID derives the worker-process identity for the handshake. In the
+// one-worker-per-session model the supervisor sets GW_WORKER_SESSION_ID, so
+// the worker id equals the gateway session id; the fallback keeps the field
+// non-empty for workers started outside the supervisor (dev/debug).
+func workerID() string {
+	if id := os.Getenv("GW_WORKER_SESSION_ID"); id != "" {
+		return id
+	}
+	return fmt.Sprintf("worker-%d", os.Getpid())
+}
+
+// nodeID identifies the host node the worker runs on. The single-node
+// deployment uses the OS hostname; a config-driven node id is deliberately
+// deferred to the cross-node phase.
+func nodeID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		return "unknown"
+	}
+	return host
+}
+
+// sandboxCapabilities reports the isolation features in effect for this
+// worker process. The supervisor sets GW_AGENT_HOME only for jailed workers,
+// which doubles as the in-jail marker.
+func sandboxCapabilities() []string {
+	if os.Getenv("GW_AGENT_HOME") != "" {
+		return []string{"nsjail"}
+	}
+	return nil
 }
 
 func (s *workerServer) StartSession(ctx context.Context, req *workerpb.StartSessionRequest) (*workerpb.StartSessionResponse, error) {

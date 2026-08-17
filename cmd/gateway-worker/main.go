@@ -62,6 +62,12 @@ func (h *adapterHandler) Health(context.Context) (string, error) {
 	return "gateway-worker-1.0", nil
 }
 
+// RegisteredAdapters implements worker.AdapterLister so the Health handshake
+// advertises which adapters this worker process can serve.
+func (h *adapterHandler) RegisteredAdapters() []string {
+	return h.reg.List()
+}
+
 func (h *adapterHandler) StartSession(ctx context.Context, req worker.StartSessionReq) (string, error) {
 	agentConfig := req.AgentConfig
 	if req.ProviderModel != "" {

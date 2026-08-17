@@ -49,9 +49,11 @@ type SessionRecord struct {
 	// WorkspaceID is the opaque client-supplied workspace identifier the
 	// worker resolves to a controlled directory.
 	WorkspaceID string
-	// WorkerID and NodeID identify the execution that serves this session.
-	// Reserved for the cross-node deployment (Phase 4/5); the single-node
-	// in-memory backend does not populate them yet.
+	// WorkerID and NodeID identify the execution that serves this session
+	// (reported by the worker in the Health handshake; node = os.Hostname()
+	// in the single-node deployment). The API layer fills them best-effort
+	// when the execution handle exposes its worker identity; they remain
+	// empty for backends that do not.
 	WorkerID string
 	NodeID   string
 

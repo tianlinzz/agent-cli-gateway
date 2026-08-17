@@ -79,7 +79,27 @@ type HealthResponse struct {
 	// version identifies the worker implementation.
 	Version string `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
 	// pid is the worker process's own PID.
-	Pid           int32 `protobuf:"varint,3,opt,name=pid,proto3" json:"pid,omitempty"`
+	Pid int32 `protobuf:"varint,3,opt,name=pid,proto3" json:"pid,omitempty"`
+	// worker_id identifies the worker process. In the one-worker-per-session
+	// model it equals the gateway session id (GW_WORKER_SESSION_ID).
+	WorkerId string `protobuf:"bytes,4,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	// node_id identifies the host node the worker runs on (os.Hostname() in the
+	// single-node deployment).
+	NodeId string `protobuf:"bytes,5,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	// protocol_version is the handshake protocol version the worker speaks
+	// (worker.ProtocolVersion). The supervisor compares it against its own and
+	// rejects the session (fail-closed) on any mismatch.
+	ProtocolVersion int32 `protobuf:"varint,6,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
+	// arch is the worker binary's runtime.GOARCH.
+	Arch string `protobuf:"bytes,7,opt,name=arch,proto3" json:"arch,omitempty"`
+	// sandbox_capabilities advertises the isolation features in effect for this
+	// worker (e.g. "nsjail" when the process is jailed).
+	SandboxCapabilities []string `protobuf:"bytes,8,rep,name=sandbox_capabilities,json=sandboxCapabilities,proto3" json:"sandbox_capabilities,omitempty"`
+	// adapters lists the adapter names registered in this worker process. CLI
+	// versions are deliberately NOT advertised: in the per-session process model
+	// the supervisor probes CLI availability locally instead of trusting worker
+	// self-reports.
+	Adapters      []string `protobuf:"bytes,9,rep,name=adapters,proto3" json:"adapters,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -133,6 +153,48 @@ func (x *HealthResponse) GetPid() int32 {
 		return x.Pid
 	}
 	return 0
+}
+
+func (x *HealthResponse) GetWorkerId() string {
+	if x != nil {
+		return x.WorkerId
+	}
+	return ""
+}
+
+func (x *HealthResponse) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *HealthResponse) GetProtocolVersion() int32 {
+	if x != nil {
+		return x.ProtocolVersion
+	}
+	return 0
+}
+
+func (x *HealthResponse) GetArch() string {
+	if x != nil {
+		return x.Arch
+	}
+	return ""
+}
+
+func (x *HealthResponse) GetSandboxCapabilities() []string {
+	if x != nil {
+		return x.SandboxCapabilities
+	}
+	return nil
+}
+
+func (x *HealthResponse) GetAdapters() []string {
+	if x != nil {
+		return x.Adapters
+	}
+	return nil
 }
 
 type StartSessionRequest struct {
@@ -1243,11 +1305,17 @@ var File_worker_proto_worker_proto protoreflect.FileDescriptor
 const file_worker_proto_worker_proto_rawDesc = "" +
 	"\n" +
 	"\x19worker/proto/worker.proto\x12\x0egateway.worker\x1a\x1cgoogle/protobuf/struct.proto\"\x0f\n" +
-	"\rHealthRequest\"T\n" +
+	"\rHealthRequest\"\x98\x02\n" +
 	"\x0eHealthResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x12\x10\n" +
-	"\x03pid\x18\x03 \x01(\x05R\x03pid\"\xc3\x03\n" +
+	"\x03pid\x18\x03 \x01(\x05R\x03pid\x12\x1b\n" +
+	"\tworker_id\x18\x04 \x01(\tR\bworkerId\x12\x17\n" +
+	"\anode_id\x18\x05 \x01(\tR\x06nodeId\x12)\n" +
+	"\x10protocol_version\x18\x06 \x01(\x05R\x0fprotocolVersion\x12\x12\n" +
+	"\x04arch\x18\a \x01(\tR\x04arch\x121\n" +
+	"\x14sandbox_capabilities\x18\b \x03(\tR\x13sandboxCapabilities\x12\x1a\n" +
+	"\badapters\x18\t \x03(\tR\badapters\"\xc3\x03\n" +
 	"\x13StartSessionRequest\x12\x19\n" +
 	"\bmodel_id\x18\x01 \x01(\tR\amodelId\x12\x1d\n" +
 	"\n" +
