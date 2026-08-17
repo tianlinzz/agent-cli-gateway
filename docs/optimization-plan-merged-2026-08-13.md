@@ -174,7 +174,27 @@ Phase 3 — typed 配置与去重（对应 ROADMAP Phase 3 + AUDIT Tranche D）
  20. U2 死代码清理
 
 Phase 4 — 持久化与幂等（ROADMAP Phase 4 原样保留）
+  **状态（2026-08-17 实施完成）**：持久化后端采用 bbolt 嵌入式（用户决策替代 PG/Redis，
+  见 §5 待决策项 6 的口径更新）。已落地：`store/` 包（bbolt SessionStore/RunStore/
+  IdempotencyStore，bucket sessions/runs/idempotency）、`[store]` 配置段
+  （driver=memory|bbolt，默认 memory 零破坏）、启动 reconcile（starting/running run →
+  outcome_unknown + `gateway_restart`，绝不重放；turn_active session → active，保留
+  NativeSessionID 支撑重启后 resume）、Idempotency-Key 幂等（409 in_progress/conflict、
+  非流式终态字节重放、SSE 不可重放 409 状态引用、outcome_unknown 不隐式重跑、
+  idempotency_ttl 默认 24h）。
+  **如实声明的局限**：bbolt 单文件单写者，ROADMAP §9 出口标准中「两个 API 副本不能并发
+  获取同一 session turn」的多副本 CAS 不适用于本后端，需 PG/Redis 时才成立。
+
 Phase 5 — 远程执行与横向扩展（ROADMAP Phase 5 原样保留）
+  **状态（2026-08-17 部分完成，口径降级经用户批准）**：仅落地「契约与本地兼容」——
+  Worker 握手注册字段（worker_id/node_id/protocol_version/arch/sandbox_capabilities/
+  adapters，见 `worker/proto/worker.proto` HealthResponse）、ProtocolVersion 版本协商
+  fail-closed（`worker/version.go` 单一来源常量，握手不匹配即拒启动）、
+  SessionRecord.WorkerID/NodeID 本地后端填充、ExecutionBackend 可换实现的回归测试
+  （`api/openai/backend_contract_test.go`）、设计文档 `docs/phase5-contracts-2026-08-17.md`
+  （workspace 策略选定共享持久文件系统）。
+  **未做（留待后续设计评审）**：远程调度、lease/CAS 跨节点仲裁、节点亲和、drain、
+  容量广告、workspace 共享挂载的实际落地。
 ```
 
 依赖关系（显式标注外互不阻塞）：D2 ← D1；O-B5 消解 ← O-A3；Phase 5 ← Phase 4。
@@ -188,7 +208,7 @@ Phase 5 — 远程执行与横向扩展（ROADMAP Phase 5 原样保留）
 3. **O-F09a 止血形态**：统一由 worker 边界执行 turn timeout（首选）vs kimi-only 改名 + 其余拒绝（备选）。实施计划时二选一，不允许 silent。
 4. **D2 时机**：L 级、触及 codex/kimi 核心，回报是收敛已漂移行为。Phase 3 立即做 vs 推迟到新 Agent 接入时。
 5. **执行粒度**：按 Phase 顺序逐 PR 推进 vs 先挑低风险高回报子集（U1 + O-A2 + O-B1/B2/B3 + O-F09a）。
-6. **（ROADMAP 原有，仍有效）** Phase 4 选型 PostgreSQL vs Redis、Phase 5 workspace 策略，届时单独设计评审。
+6. **（已决 2026-08-17）Phase 4/5 选型**：Phase 4 持久化后端 = bbolt 嵌入式（替代 PG/Redis；多副本 CAS 需求出现时再换后端，接口已隔离）；Phase 5 本轮仅做契约与本地兼容，远程调度另起设计评审；workspace 策略选定共享持久文件系统（仅文档化）。
 7. **（已决 2026-08-14）O-F04 探针口径**：Phase 1 验收口径降级为「命令存在且可执行（`exec.LookPath`，带超时）」。版本/健康/readiness 探针正式推迟到 Phase 5 §5.1（worker 广告 native CLI 版本）。依据：不变量 #2「API 进程永不启动 Agent CLI」——版本探针需真实 `exec` CLI，必须放 worker 侧。
 
 ---

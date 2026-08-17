@@ -24,6 +24,7 @@ import (
 	"github.com/tianlinzz/agent-cli-gateway/config"
 	"github.com/tianlinzz/agent-cli-gateway/metrics"
 	"github.com/tianlinzz/agent-cli-gateway/runtime"
+	"github.com/tianlinzz/agent-cli-gateway/store"
 	"github.com/tianlinzz/agent-cli-gateway/worker"
 	"github.com/tianlinzz/agent-cli-gateway/worker/nsjail"
 )
@@ -227,10 +228,56 @@ func main() {
 	// gate; session record caps are enforced atomically by the capped store.
 	// The workers callback is a fast max_workers precheck backed by the
 	// supervisor's live worker count.
-	sessionStore := runtime.NewCappedMemorySessionStore(runtime.SessionLimits{
-		MaxTotal:     cfg.Limits.MaxSessions,
-		MaxPerCaller: cfg.Limits.MaxSessionsPerCaller,
-	})
+	//
+	// The metadata stores are either volatile (memory, the default) or
+	// persistent (bbolt, one embedded DB file serving both stores). With
+	// bbolt the gateway survives restarts: session records (and their native
+	// session IDs) and run records are on disk, and the reconcile pass below
+	// repairs state left by the previous process.
+	var sessionStore runtime.SessionStore
+	var runStore runtime.RunStore
+	var idemStore runtime.IdempotencyStore
+	closeStore := func() {}
+	if cfg.Store.Driver == config.StoreDriverBbolt {
+		if err := os.MkdirAll(filepath.Dir(cfg.Store.Path), 0o700); err != nil {
+			slog.Error("create metadata store dir", "path", cfg.Store.Path, "error", err)
+			os.Exit(1)
+		}
+		boltStore, err := store.OpenBolt(cfg.Store.Path, runtime.SessionLimits{
+			MaxTotal:     cfg.Limits.MaxSessions,
+			MaxPerCaller: cfg.Limits.MaxSessionsPerCaller,
+		})
+		if err != nil {
+			slog.Error("open metadata store", "path", cfg.Store.Path, "error", err)
+			os.Exit(1)
+		}
+		sessionStore = boltStore
+		runStore = boltStore.Runs()
+		idemStore = boltStore.Idempotency()
+		closeStore = func() {
+			if err := boltStore.Close(); err != nil {
+				slog.Warn("close metadata store", "error", err)
+			}
+		}
+	} else {
+		sessionStore = runtime.NewCappedMemorySessionStore(runtime.SessionLimits{
+			MaxTotal:     cfg.Limits.MaxSessions,
+			MaxPerCaller: cfg.Limits.MaxSessionsPerCaller,
+		})
+		runStore = runtime.NewMemoryRunStore()
+		idemStore = runtime.NewMemoryIdempotencyStore()
+	}
+
+	// Restart recovery (ROADMAP §4.3): sessions stuck in turn_active return to
+	// active (their native session IDs are preserved for resume); runs stuck
+	// in starting/running are marked outcome_unknown and never replayed. For
+	// the memory driver this is a no-op over empty stores. A reconcile failure
+	// is fatal: starting half-reconciled would wedge affected sessions.
+	if _, err := reconcileStores(context.Background(), sessionStore, runStore, time.Now()); err != nil {
+		slog.Error("reconcile metadata stores", "error", err)
+		os.Exit(1)
+	}
+
 	admit := openai.NewAdmissionController(openai.AdmissionLimits{
 		MaxActiveRuns:             cfg.Limits.MaxActiveRuns,
 		MaxActiveRunsPerCaller:    cfg.Limits.MaxActiveRunsPerCaller,
@@ -246,7 +293,9 @@ func main() {
 		SessionRecordTTL: cfg.Sessions.RecordTTL,
 		RunRecordTTL:     cfg.Sessions.RunRecordTTL,
 		PruneInterval:    cfg.Sessions.ReapInterval,
-		Runs:             runtime.NewMemoryRunStore(),
+		Runs:             runStore,
+		Idempotency:      idemStore,
+		IdempotencyTTL:   cfg.Store.IdempotencyTTL,
 		Logger:           logger,
 		Metrics:          metricsReg,
 		Admission:        admit,
@@ -285,6 +334,7 @@ func main() {
 		"nsjail_version", cfg.Isolation.NsjailVersion,
 		"nsjail_source", cfg.Isolation.NsjailSource,
 		"worker_exec", *workerExec,
+		"store_driver", cfg.Store.Driver,
 		"auth_enabled", len(callerTokens) > 0,
 		"adapters", reg.List(),
 	)
@@ -322,6 +372,7 @@ func main() {
 	if err := backend.Supervisor().Close(workerCtx); err != nil {
 		slog.Warn("gateway supervisor close", "error", err)
 	}
+	closeStore()
 	slog.Info("gateway stopped")
 }
 

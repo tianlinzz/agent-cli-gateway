@@ -32,6 +32,9 @@ cmd/gateway  (API process + worker Supervisor)
   ├── runtime        canonical contract: descriptors, events, session store,
   │                  registry, execution backend
   ├── config         TOML config (config.GatewayConfig)
+  ├── store          bbolt-backed persistent SessionStore/RunStore/
+  │                  IdempotencyStore ([store] driver="bbolt") + startup
+  │                  restart reconcile
   └── worker
       ├── supervisor   forks/reaps one nsjail-wrapped worker per session
       ├── rpc          gRPC Worker contract over per-session Unix sockets
@@ -60,12 +63,13 @@ them and names from config are wired into the process-wide registry
 
 **Dependency direction:**
 ```
-cmd/gateway → config/, runtime/, api/openai/, worker/
+cmd/gateway → config/, runtime/, api/openai/, worker/, store/
 cmd/gateway-worker → adapters/*, runtime/
 api/openai → runtime/   (never adapters/, worker/, or config/)
 adapters/<name> → agent/<name>, runtime/ (never api/, worker/, or another agent)
 agent/<name> → agent/events, agent/process, agent/protocol, agent/rpcsession, stdlib only
 worker/     → runtime/, workspace/, config/ (never adapters/ or api/)
+store/      → runtime/, go.etcd.io/bbolt (never adapters/, worker/, or api/)
 workspace/  → stdlib only
 runtime/    → stdlib only
 ```

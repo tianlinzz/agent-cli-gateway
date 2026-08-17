@@ -50,6 +50,11 @@ type fakeHandle struct {
 	onAbort func(h *fakeHandle)
 	events  chan runtime.Event
 
+	// workerID/nodeID back the optional identityHandle capability; empty means
+	// the handle reports no worker identity (the record fields stay empty).
+	workerID string
+	nodeID   string
+
 	abortOnce sync.Once
 	aborted   chan struct{}
 	closeOnce sync.Once
@@ -137,6 +142,13 @@ func (h *fakeHandle) Aborted() <-chan struct{} { return h.aborted }
 // terminatingHandle capability the watcher in registerHandle listens for.
 func (h *fakeHandle) Done() <-chan struct{} { return h.closed }
 
+// WorkerIdentity implements the optional identityHandle capability.
+func (h *fakeHandle) WorkerIdentity() (workerID, nodeID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.workerID, h.nodeID
+}
+
 func (h *fakeHandle) setOnAbort(onAbort func(h *fakeHandle)) {
 	h.mu.Lock()
 	h.onAbort = onAbort
@@ -155,6 +167,9 @@ type fakeBackend struct {
 	startErr     error
 	preflightErr error
 	script       func(h *fakeHandle) // script handed to every created handle
+	// workerID/nodeID are stamped on every created handle (identityHandle).
+	workerID string
+	nodeID   string
 }
 
 func (b *fakeBackend) Start(ctx context.Context, req runtime.StartRequest) (runtime.ExecutionHandle, error) {
@@ -164,6 +179,7 @@ func (b *fakeBackend) Start(ctx context.Context, req runtime.StartRequest) (runt
 		return nil, b.startErr
 	}
 	h := newFakeHandle(b.script)
+	h.workerID, h.nodeID = b.workerID, b.nodeID
 	b.handles[req.SessionID] = h
 	b.started = append(b.started, req)
 	return h, nil

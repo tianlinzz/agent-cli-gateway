@@ -115,6 +115,16 @@ type Options struct {
 	// Runs is the run metadata store for individual Agent turns. Defaults to
 	// an in-memory store.
 	Runs runtime.RunStore
+	// Idempotency is the Idempotency-Key metadata store (ROADMAP §4.2). When
+	// nil, the Idempotency-Key header is ignored and requests behave exactly
+	// as before. When set, a chat-completions request carrying the header is
+	// deduplicated per caller+endpoint+key: a duplicate is never admitted as
+	// a second turn.
+	Idempotency runtime.IdempotencyStore
+	// IdempotencyTTL is how long an idempotency record is retained before it
+	// expires (and is reaped by the prune loop). Zero uses the default (24h).
+	// Only meaningful when Idempotency is set.
+	IdempotencyTTL time.Duration
 	// Logger is the structured logger for request/run lifecycle events.
 	// Defaults to slog.Default().
 	Logger *slog.Logger
@@ -146,6 +156,9 @@ type Handler struct {
 	logger  *slog.Logger
 	metrics runtime.Metrics
 	admit   *AdmissionController
+
+	idempotency runtime.IdempotencyStore
+	idemTTL     time.Duration
 
 	activeRuns atomic.Int64 // in-flight turns, published as gateway_active_runs
 	queuedRuns atomic.Int64 // turns waiting for a settling predecessor, published as gateway_queued_runs
@@ -382,13 +395,18 @@ func NewHandler(opts Options) *Handler {
 		h.metrics = runtime.NoopMetrics{}
 	}
 	h.admit = opts.Admission
+	h.idempotency = opts.Idempotency
+	h.idemTTL = opts.IdempotencyTTL
+	if h.idempotency != nil && h.idemTTL <= 0 {
+		h.idemTTL = 24 * time.Hour
+	}
 	h.catalog = &modelCatalog{reg: opts.Registry, enabled: opts.Enabled, models: opts.Models, commands: opts.Commands}
 	// stop is always created so Close can signal every background goroutine
 	// (prune loop + handle-termination watchers) even when record expiry is off.
 	h.stop = make(chan struct{})
-	// The prune loop bounds both session records and terminal run records; it
-	// runs when either expiry is enabled.
-	if (h.recordTTL > 0 || h.runTTL > 0) && opts.PruneInterval > 0 {
+	// The prune loop bounds session records, terminal run records, and
+	// idempotency records; it runs when any of them needs reaping.
+	if (h.recordTTL > 0 || h.runTTL > 0 || h.idempotency != nil) && opts.PruneInterval > 0 {
 		h.pruneLoopDone = make(chan struct{})
 		go h.pruneLoop(opts.PruneInterval)
 	}
@@ -409,9 +427,9 @@ func (h *Handler) Close() {
 }
 
 // pruneLoop periodically evicts expired session records (dropping their cached
-// execution handles) and terminal run records so neither grows unbounded over
-// the process lifetime. Active turns are exempt (see SessionStore.Prune);
-// non-terminal runs are never pruned (see RunStore.Prune).
+// execution handles), terminal run records, and expired idempotency records so
+// none grows unbounded over the process lifetime. Active turns are exempt (see
+// SessionStore.Prune); non-terminal runs are never pruned (see RunStore.Prune).
 func (h *Handler) pruneLoop(interval time.Duration) {
 	defer close(h.pruneLoopDone)
 	ticker := time.NewTicker(interval)
@@ -439,6 +457,16 @@ func (h *Handler) pruneLoop(interval time.Duration) {
 				}
 				if removed > 0 {
 					slog.Debug("openai: pruned run records", "count", removed)
+				}
+			}
+			if h.idempotency != nil {
+				removed, err := h.idempotency.Prune(context.Background(), h.now())
+				if err != nil {
+					slog.Warn("openai: prune idempotency records", "error", err)
+					continue
+				}
+				if removed > 0 {
+					slog.Debug("openai: pruned idempotency records", "count", removed)
 				}
 			}
 		}

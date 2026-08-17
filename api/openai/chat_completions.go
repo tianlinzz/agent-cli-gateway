@@ -258,6 +258,27 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	sessionID := strings.TrimSpace(firstNonEmpty(r.Header.Get(h.sessionHeader), metaString(req.Metadata, "session_id")))
 	workspaceID := strings.TrimSpace(firstNonEmpty(r.Header.Get(h.workspaceHeader), metaString(req.Metadata, "workspace_id")))
 
+	// Assign the server-owned run id up front: an idempotency claim references
+	// it before admission, and the response header is set below (before the
+	// stream/non-stream branch: streamTurn calls WriteHeader before the first
+	// SSE frame).
+	runID := h.newRunID()
+
+	// Idempotency-Key admission (ROADMAP §4.2): claim the key BEFORE session
+	// resolution/admission so a duplicate request is never admitted as a
+	// second turn. sessionID/workspaceID here are exactly as the client
+	// supplied them (sessionID may still be empty, meaning "generate one").
+	// When the feature is off or no key is present this is a no-op.
+	idem, duplicate := h.beginIdempotency(w, r, callerID, req, sessionID, workspaceID, runID, input)
+	if duplicate {
+		return
+	}
+	// Registered before every other defer below so it runs LAST: it is the
+	// safety net that settles the claimed key on any path that returns before
+	// completeIdem (release if never delivered; complete without a body once
+	// the turn may have reached an execution).
+	defer h.settleIdempotency(idem)
+
 	// Resolve the session. Absent gateway session id -> the gateway generates
 	// one. A caller may also provide a stable business-conversation id on its
 	// first request; an unknown id is created for that caller, while an existing
@@ -325,10 +346,6 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	// Echo the gateway session id so the client can resume the session on a
 	// later request.
 	w.Header().Set(h.sessionHeader, sessionID)
-	// Assign a server-owned run id for this turn. The header MUST be set before
-	// the stream/non-stream branch: streamTurn calls WriteHeader before the
-	// first SSE frame.
-	runID := h.newRunID()
 	w.Header().Set(h.runHeader, runID)
 
 	// Admission control: check active-run limits before acquiring the turn
@@ -471,6 +488,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		handle = h.registerHandle(sessionID, handle)
+		h.recordWorkerIdentity(r.Context(), sessionID, callerID, handle)
 	}
 
 	// Deliver the turn. A Send failure on a handle whose worker/CLI died while
@@ -478,6 +496,13 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	// dropped and a FRESH execution is started for the session. Without this, a
 	// dead handle stays in the map and every later request to that session fails
 	// with "failed to send turn" until the gateway restarts.
+	//
+	// From here on the turn may have reached an execution even when an error
+	// comes back (a Send failure is ambiguous), so the idempotency key must
+	// never be released for reuse on this path.
+	if idem != nil {
+		idem.delivered = true
+	}
 	handle, err = h.deliverTurn(turnCtx, sessionID, handle, startReq, input)
 	if err != nil {
 		failed = true
@@ -486,6 +511,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		// or an unbounded wait.
 		if errors.Is(err, runtime.ErrCapacityExceeded) {
 			h.finishRun(runID, route.AdapterID, reqID, traceID, sessionID, callerID, workspaceID, workerStateOf(handle), runStartedAt, runtime.RunFailed, nil, "agent_capacity")
+			h.completeIdem(idem, runtime.RunFailed, nil)
 			writeRateLimited(w, rateLimited(string(ScopeAgent), "max_concurrency"))
 			return
 		}
@@ -496,6 +522,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			status = runtime.RunOutcomeUnknown
 		}
 		h.finishRun(runID, route.AdapterID, reqID, traceID, sessionID, callerID, workspaceID, workerStateOf(handle), runStartedAt, status, nil, "send_failed")
+		h.completeIdem(idem, status, nil)
 		if r.Context().Err() != nil {
 			return // the client is gone; nothing to write
 		}
@@ -517,11 +544,53 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
 		status := h.streamTurn(w, r, turnCtx, req.Model, route.AdapterID, sessionID, callerID, handle, includeUsage)
 		h.finishRun(runID, route.AdapterID, reqID, traceID, sessionID, callerID, workspaceID, workerStateOf(handle), runStartedAt, status, nil, "")
+		// SSE streams are never replayable: the key completes with the terminal
+		// status reference only (no body).
+		h.completeIdem(idem, status, nil)
 		return
 	}
 	res := h.aggregateTurn(turnCtx, sessionID, callerID, route.AdapterID, handle)
-	h.writeCompletion(w, r, req.Model, res)
-	h.finishRun(runID, route.AdapterID, reqID, traceID, sessionID, callerID, workspaceID, workerStateOf(handle), runStartedAt, runStatusFromTurnResult(res), res.usage, "")
+	body, written := h.writeCompletion(w, r, req.Model, res)
+	status := runStatusFromTurnResult(res)
+	h.finishRun(runID, route.AdapterID, reqID, traceID, sessionID, callerID, workspaceID, workerStateOf(handle), runStartedAt, status, res.usage, "")
+	// Only a confirmed success stores its exact response bytes for replay. A
+	// failed/timed-out/outcome-unknown turn completes the key without a body:
+	// duplicates get a 409 status reference and are never implicitly re-run.
+	if !written || status != runtime.RunSucceeded {
+		body = nil
+	}
+	h.completeIdem(idem, status, body)
+}
+
+// identityHandle is the optional capability an ExecutionHandle implements to
+// report which worker process and node serve the session. workerSession
+// implements it from the Health handshake; the identity is recorded on the
+// session record so WorkerID/NodeID are populated end to end on the local
+// path, ready for the cross-node deployment.
+type identityHandle interface {
+	// WorkerIdentity returns the worker and node identity of the execution.
+	WorkerIdentity() (workerID, nodeID string)
+}
+
+// recordWorkerIdentity copies the execution's worker identity onto the
+// session record. Best-effort: a handle without the capability or a store
+// error never fails the request — the fields are observability metadata, not
+// admission state.
+func (h *Handler) recordWorkerIdentity(ctx context.Context, sessionID, callerID string, handle runtime.ExecutionHandle) {
+	ih, ok := handle.(identityHandle)
+	if !ok {
+		return
+	}
+	workerID, nodeID := ih.WorkerIdentity()
+	if workerID == "" && nodeID == "" {
+		return
+	}
+	if _, err := h.store.Update(ctx, sessionID, callerID, func(rec *runtime.SessionRecord) {
+		rec.WorkerID = workerID
+		rec.NodeID = nodeID
+	}); err != nil {
+		h.logger.Warn("openai: record worker identity", "session", sessionID, "error", err)
+	}
 }
 
 // closedHandle is the optional capability an ExecutionHandle implements to
@@ -573,6 +642,7 @@ func (h *Handler) deliverTurn(ctx context.Context, sessionID string, handle runt
 		return nil, fmt.Errorf("restart execution for session %s: %w", sessionID, err)
 	}
 	fresh = h.registerHandle(sessionID, fresh)
+	h.recordWorkerIdentity(ctx, sessionID, startReq.CallerID, fresh)
 	if err := fresh.Send(ctx, input); err != nil {
 		return fresh, err
 	}
@@ -969,17 +1039,21 @@ type chatCompletionMessage struct {
 // HTTP 504 with the unified turn_timeout code (O-F09b) — the same error shape
 // the streaming surface emits as an SSE error frame, and never a fake
 // finish_reason:"length" completion.
-func (h *Handler) writeCompletion(w http.ResponseWriter, r *http.Request, model string, res turnResult) {
+//
+// It returns the exact response bytes it wrote and whether that was the
+// success completion (HTTP 200); the idempotency layer stores those bytes for
+// a byte-exact duplicate replay. Error/abort paths return (nil, false).
+func (h *Handler) writeCompletion(w http.ResponseWriter, r *http.Request, model string, res turnResult) ([]byte, bool) {
 	if res.aborted {
-		return // the client is gone or the turn was aborted; nothing to send
+		return nil, false // the client is gone or the turn was aborted; nothing to send
 	}
 	if res.failed {
 		writeError(w, http.StatusInternalServerError, serverError(res.errMsg))
-		return
+		return nil, false
 	}
 	if res.timedOut {
 		writeError(w, http.StatusGatewayTimeout, turnTimeoutError())
-		return
+		return nil, false
 	}
 
 	finish := mapFinishReason(res.finishReason)
@@ -1002,7 +1076,17 @@ func (h *Handler) writeCompletion(w http.ResponseWriter, r *http.Request, model 
 	if res.usage != nil {
 		resp.Usage = res.usage
 	}
-	writeJSON(w, http.StatusOK, resp)
+	// Marshal once so the same bytes serve the client and the idempotency
+	// record. A marshaling failure here is a programming error (the response
+	// holds only plain values); like writeJSON we fail best-effort.
+	body, err := json.Marshal(resp)
+	if err != nil {
+		return nil, false
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+	return body, true
 }
 
 // mapFinishReason converts native Agent completion reasons into OpenAI model

@@ -98,6 +98,48 @@ request starts a new Worker and passes the saved native thread/session ID so
 the Agent can resume, but the Gateway never retries a turn whose completion is
 unknown.
 
+Session and run metadata is kept in memory by default and dies with the
+process. With `[store] driver = "bbolt"` the metadata lives in one embedded
+bbolt database file and survives a gateway restart: on boot the gateway
+reconciles the previous process's damage — sessions stuck in `turn_active`
+return to `active` (their native session IDs are preserved for resume) and
+runs stuck in `starting`/`running` are marked `outcome_unknown` with error
+code `gateway_restart`. Such runs are **never replayed**. bbolt allows exactly
+one writer process per file, so this is single-node persistence, not
+multi-replica coordination: there is no cross-replica compare-and-swap (that
+requires a PostgreSQL/Redis-class backend and is deliberately out of scope).
+
+### Idempotency-Key
+
+`POST /v1/chat/completions` honors an optional `Idempotency-Key` request
+header (max 255 bytes). The key is scoped to the authenticated caller and the
+endpoint; a request fingerprint (SHA-256 over the model, the supplied
+session/workspace ids, and the normalized messages/tools) binds the key to one
+exact request. The guarantee is **duplicate-admission prevention plus result
+lookup — not exactly-once side effects**:
+
+- Same key + same payload, original still in flight → `409` with
+  `{"error": {... "code": "idempotency_in_progress"}, "run_id", "status":
+  "in_progress"}`; no second turn is started.
+- Same key + same payload, original completed non-streaming → the stored
+  response is replayed byte-for-byte with an `Idempotency-Replayed: true`
+  header (and the original `X-Gateway-Session-Id`/`X-Gateway-Run-Id`).
+- Same key + same payload, original completed as a **streaming** request →
+  `409` with code `idempotency_not_replayable` and a run status reference.
+  **SSE streams are never stored or replayed.**
+- Same key + same payload, original ended `failed`/`cancelled`/`timed_out`/
+  `outcome_unknown` → `409` `idempotency_not_replayable` with the recorded
+  status. An `outcome_unknown` turn is **never implicitly re-run**; inspect
+  the referenced run and retry with a NEW key if you decide to.
+- Same key + different payload → `409` with code `idempotency_conflict`.
+- No key → the request behaves exactly as without the feature.
+
+A request rejected before any execution was admitted (validation, admission
+429, session-busy 409) releases its key, so the identical retry is allowed.
+Keys are retained for `[store] idempotency_ttl` (default 24h); after expiry
+the key may be claimed again. With the bbolt store driver the records survive
+a gateway restart (bucket `idempotency` in the same database file).
+
 Each completion is one complete autonomous Agent turn. Claude Code, Codex, and
 Kimi execute their own native tools inside the worker; those internal tool
 events are not returned as OpenAI `tool_calls`. Emitting them as model tool
@@ -211,6 +253,8 @@ See [`config.example.toml`](config.example.toml) for a full annotated example.
 | `[sessions]` | `idle_timeout` / `reap_interval` | `2h` / `1m` | Idle Worker reclamation; conversation/native session identity is retained |
 | `[auth]` | `callers` | *(empty)* | Bearer token to caller ID mappings |
 | `[workspace]` | `root` | `workspaces` | Root all workspace ids resolve under |
+| `[store]` | `driver` / `path` | `memory` / *(empty)* | Session/run metadata backend: `memory` (volatile) or `bbolt` (persists across restarts; `path` required, one writer process per file) |
+| `[store]` | `idempotency_ttl` | `24h` | Idempotency-Key record retention; after expiry a key may be claimed again |
 | `[isolation]` | `required` | `true` | Must be true outside the test profile |
 | `[isolation]` | `nsjail_version` / `nsjail_source` | `3.6` / upstream URL | Pinned build provenance |
 | `[isolation]` | `binary_path` | `/usr/local/bin/nsjail` | nsjail executable |
@@ -294,6 +338,8 @@ cmd/gateway  (API process + worker Supervisor)
   ├── runtime        canonical contract: descriptors, events, session store,
   │                  registry, execution backend
   ├── config         TOML config (gateway.toml)
+  ├── store          bbolt-backed persistent SessionStore/RunStore + startup
+  │                  restart reconcile
   └── worker
       ├── supervisor   forks/reaps one nsjail-wrapped worker per session
       ├── rpc          gRPC Worker contract over per-session Unix sockets
