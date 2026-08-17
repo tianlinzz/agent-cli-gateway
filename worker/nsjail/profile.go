@@ -35,8 +35,7 @@ type SessionLayout struct {
 	// identical socket path.
 	SocketDir string
 	// KeepEnv lists environment variables passed through to the jailed worker.
-	// When empty the defaults (PATH, HOME, GW_WORKER_SOCKET,
-	// GW_WORKER_SESSION_ID) are used.
+	// When empty the defaults (defaultKeepEnv) are used.
 	KeepEnv []string
 }
 
@@ -48,9 +47,14 @@ type Profile struct {
 	Config string
 }
 
-// defaultKeepEnv mirrors the env vars the worker supervisor relies on plus the
-// basics a CLI needs.
-var defaultKeepEnv = []string{"PATH", "HOME", "GW_WORKER_SOCKET", "GW_WORKER_SESSION_ID"}
+// defaultKeepEnv mirrors every env var the worker supervisor sets for the
+// jailed worker (see supervisor.go: GW_WORKER_SOCKET, GW_WORKER_SESSION_ID,
+// GW_WORKSPACE_DIR, GW_AGENT_HOME) plus the basics a CLI needs. nsjail's
+// keep_env filters out unlisted variables, so any var the supervisor adds
+// here MUST be listed or the worker reads it as empty — the worker resolves
+// its workspace/agent-home placement from GW_WORKSPACE_DIR/GW_AGENT_HOME and
+// reports its jailed status via GW_AGENT_HOME.
+var defaultKeepEnv = []string{"PATH", "HOME", "GW_WORKER_SOCKET", "GW_WORKER_SESSION_ID", "GW_WORKSPACE_DIR", "GW_AGENT_HOME"}
 
 // Build assembles an nsjail config file for one session from the isolation
 // config and the session's real host paths. It is fail-closed: mount sources

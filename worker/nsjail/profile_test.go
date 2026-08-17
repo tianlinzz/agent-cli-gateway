@@ -58,6 +58,9 @@ func TestBuildProfile_KafelDefaults(t *testing.T) {
 		`mount: { dst: "/tmp"; fstype: "tmpfs"; options: "size=256m"; rw: true; mandatory: true; };`,
 		`mount: { dst: "/proc"; fstype: "proc"; rw: false; mandatory: true; } ;`,
 		`keep_env: "GW_WORKER_SOCKET";`,
+		`keep_env: "GW_WORKER_SESSION_ID";`,
+		`keep_env: "GW_WORKSPACE_DIR";`,
+		`keep_env: "GW_AGENT_HOME";`,
 		`env: { key: "HOME"; value: "/agent-home"; };`,
 		`cwd: "/workspace";`,
 	} {
@@ -135,6 +138,27 @@ func TestBuildProfile_MountsScopedToThisSession(t *testing.T) {
 	}
 	if !strings.Contains(c, "clone_newroot: true") {
 		t.Fatal("profile must create a private root filesystem")
+	}
+}
+
+// TestBuildProfile_KeepEnvCoversWorkerPlacementVars is the regression test for
+// the missing-keep_env bug: the supervisor passes the worker its placement
+// (GW_WORKSPACE_DIR, GW_AGENT_HOME) and identity (GW_WORKER_SOCKET,
+// GW_WORKER_SESSION_ID) through the process environment, and nsjail's
+// keep_env drops every unlisted variable — so the default profile must list
+// all four or the jailed worker reads them as empty (empty WorkspaceDir /
+// AgentHome in the adapter config, and sandbox_capabilities losing its
+// "nsjail" marker which is keyed off GW_AGENT_HOME).
+func TestBuildProfile_KeepEnvCoversWorkerPlacementVars(t *testing.T) {
+	iso := config.DefaultGatewayConfig().Isolation
+	p, err := Build(iso, testLayout(t), "sess-keepenv")
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, v := range []string{"GW_WORKER_SOCKET", "GW_WORKER_SESSION_ID", "GW_WORKSPACE_DIR", "GW_AGENT_HOME"} {
+		if want := `keep_env: "` + v + `";`; !strings.Contains(p.Config, want) {
+			t.Errorf("profile missing %s (jailed worker would read %s as empty)", want, v)
+		}
 	}
 }
 

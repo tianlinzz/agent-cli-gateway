@@ -12,6 +12,8 @@
 #   3. Per-jail PID namespace: killing the nsjail wrapper reaps its entire
 #      process tree (the O-A3 regression — a CLI that escaped into its own
 #      process group still dies with the wrapper).
+#   4. keep_env: GW_WORKSPACE_DIR/GW_AGENT_HOME are listed in the profile and
+#      verifiably survive into the jailed process.
 #
 # Usage: docker/nsjail-smoke.sh   (must run inside the runtime image, or on a
 # Linux host with nsjail + gateway on PATH).
@@ -34,6 +36,17 @@ echo "== generate the real nsjail profile =="
 grep -q 'seccomp_string: "POLICY ' "$SMOKE_DIR/profile.conf"
 grep -q 'clone_newpid: true;' "$SMOKE_DIR/profile.conf"
 grep -q 'mount: { dst: "/proc"; fstype: "proc"' "$SMOKE_DIR/profile.conf"
+
+echo "== keep_env passes the worker placement vars into the jail =="
+# Regression for the missing-keep_env bug: nsjail drops every env var not in
+# keep_env, so GW_WORKSPACE_DIR/GW_AGENT_HOME must be listed AND must actually
+# survive into the jailed process (the worker resolves its workspace/agent
+# home from them and keys its nsjail sandbox capability off GW_AGENT_HOME).
+grep -q 'keep_env: "GW_WORKSPACE_DIR";' "$SMOKE_DIR/profile.conf"
+grep -q 'keep_env: "GW_AGENT_HOME";' "$SMOKE_DIR/profile.conf"
+GW_WORKSPACE_DIR=/workspace GW_AGENT_HOME=/agent-home \
+  "$NSJAIL_BIN" -Mo --config "$SMOKE_DIR/profile.conf" -- \
+  /bin/sh -c 'test "$GW_WORKSPACE_DIR" = /workspace && test "$GW_AGENT_HOME" = /agent-home'
 
 echo "== minimal jail with the real profile =="
 "$NSJAIL_BIN" -Mo --config "$SMOKE_DIR/profile.conf" -- /bin/true
