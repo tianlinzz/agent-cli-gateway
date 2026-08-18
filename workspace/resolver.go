@@ -28,14 +28,15 @@ var (
 // Resolver maps opaque workspace IDs to controlled absolute directories under
 // a fixed root. It is safe for concurrent use.
 //
-// Layout: <root>/workspaces/<workspace-key>. Keys are stable hashes so
-// external IDs never leak into paths and can never collide with the sibling
-// .agent-homes tree (the CLIs' persistent homes) that shares the root. The
-// layout is deliberately FLAT — one shared tree for every authenticated
-// caller: collaboration (a group of people, a Feishu group chat) simply means
-// sending the same workspace_id; per-user isolation, when wanted, is by id
-// convention ("alice-proj" — ids reject path separators, so the composition
-// stays one flat token).
+// Layout: <root>/<workspace-key>. Keys are stable hashes so external IDs
+// never leak into paths. The layout is deliberately FLAT — one shared tree
+// for every authenticated caller: collaboration (a group of people, a Feishu
+// group chat) simply means sending the same workspace_id; per-user
+// isolation, when wanted, is by id convention ("alice-proj" — ids reject
+// path separators, so the composition stays one flat token). Each workspace
+// directory also holds its CLIs' persistent home (the .agent/ subdir
+// selected by the worker's agent_home_policy), so a workspace is one
+// self-contained prune/backup unit.
 //
 // Symlink policy (fail-closed): the root is canonicalized (EvalSymlinks) once
 // at construction. At resolve time the lexical candidate is verified against
@@ -101,7 +102,6 @@ func (r *Resolver) Resolve(workspaceID string) (string, error) {
 
 	candidate := filepath.Join(
 		r.root,
-		"workspaces",
 		pathKey("workspace", workspaceID),
 	)
 	if err := ensureInside(r.root, candidate); err != nil {

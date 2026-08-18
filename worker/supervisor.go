@@ -681,11 +681,11 @@ func shortID(s string) string {
 //
 // The "session" policy gives each gateway session a fresh ephemeral home
 // under the runtime dir (strictest isolation, no cross-session memory). The
-// "workspace" policy gives every workspace one persistent home under
-// "<workspace root>/.agent-homes/<owner-scoped workspace path>": memory and
-// login state survive sessions and restarts, stay inside the workspace's
-// existing trust domain, and the cwd-keyed project buckets the CLIs keep
-// never mix workspaces. The gateway never reads or writes inside the home.
+// "workspace" policy keeps one persistent home per workspace at
+// <workspace-dir>/.agent: a workspace's artifacts and its CLI memory live
+// and die as ONE directory (one volume, one prune, one backup), shared by
+// every session of that workspace, and the gateway never reads or writes
+// inside.
 func resolveAgentHomeDir(policy, workspaceRoot, wsDir, sessionDir string) (string, error) {
 	switch policy {
 	case "", "session":
@@ -697,10 +697,7 @@ func resolveAgentHomeDir(policy, workspaceRoot, wsDir, sessionDir string) (strin
 			filepath.IsAbs(rel) {
 			return "", fmt.Errorf("agent home: workspace dir %q escapes root %q", wsDir, workspaceRoot)
 		}
-		// Key the home by the workspace's hashed directory name (the resolver
-		// layout is <root>/workspaces/<workspace-key>), so .agent-homes stays
-		// a flat sibling of the workspace tree.
-		return filepath.Join(workspaceRoot, ".agent-homes", filepath.Base(rel)), nil
+		return filepath.Join(wsDir, ".agent"), nil
 	default:
 		return "", fmt.Errorf("agent home: unknown agent_home_policy %q", policy)
 	}

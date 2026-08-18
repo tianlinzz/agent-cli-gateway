@@ -401,13 +401,14 @@ See the `Dockerfile` header for the k8s `securityContext` and Linux-CI
 validation hooks.
 
 Deployment mounts exactly three things: `/srv/workspaces` (session
-workspaces — and, with `agent_home_policy = "workspace"`, the CLIs'
-persistent per-workspace homes under `.agent-homes/`, so their memory,
-session history, and login state survive restarts inside the workspace's
-trust domain; the gateway never reads or writes there), `/var/lib/agent-gateway`
-(the bbolt records via `[store]`), and the config at
-`/etc/gateway/gateway.toml`. Inside the jail HOME is the mounted
-`/home/agent`, and the adapters set each CLI's official directory override
+workspaces — and, with `agent_home_policy = "workspace"`, each workspace's
+persistent `.agent/` dir holding its CLIs' `.claude`/`.codex`/`.kimi-code`,
+so memory, session history, and login state live and die with the workspace:
+one dir, one prune, one backup; the gateway never reads or writes there),
+`/var/lib/agent-gateway` (the bbolt records via `[store]`), and the config
+at `/etc/gateway/gateway.toml`. Inside the jail the workspace is mounted at
+`/workspace` and its `.agent` dir at `/home/agent` (HOME), and the adapters
+set each CLI's official directory override
 (`CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`KIMI_CODE_HOME`) into it. Credentials and
 base URLs ride `agents.<id>.env` in that one config file — including kimi's
 official `KIMI_API_KEY`/`KIMI_BASE_URL`.

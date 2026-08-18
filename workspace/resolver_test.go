@@ -90,9 +90,8 @@ func TestResolverFlatSharedLayout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvalSymlinks(%q): %v", root, err)
 	}
-	workspacesDir := filepath.Join(canonicalRoot, "workspaces")
-	if !strings.HasPrefix(a, workspacesDir+string(filepath.Separator)) {
-		t.Fatalf("resolved path %q is not under <root>/workspaces/", a)
+	if !strings.HasPrefix(a, canonicalRoot+string(filepath.Separator)) || strings.Count(a, string(filepath.Separator)) != strings.Count(canonicalRoot, string(filepath.Separator))+1 {
+		t.Fatalf("resolved path %q is not a direct child of the root", a)
 	}
 
 	b, err := r.Resolve("other")
@@ -248,18 +247,6 @@ func TestResolverRejectsSymlinkEscape(t *testing.T) {
 	}
 	if _, err := r.Resolve("evil"); err == nil {
 		t.Fatal("Resolve through a workspace symlink escaped the root and was not rejected")
-	}
-
-	// Symlink escape via the parent workspaces/ component.
-	parent := filepath.Dir(seed)
-	if err := os.RemoveAll(parent); err != nil {
-		t.Fatalf("remove workspaces dir: %v", err)
-	}
-	if err := os.Symlink(outside, parent); err != nil {
-		t.Skipf("symlink unsupported: %v", err)
-	}
-	if _, err := r.Resolve("ws1"); err == nil {
-		t.Fatal("Resolve through the workspaces-dir symlink escaped the root and was not rejected")
 	}
 }
 

@@ -8,7 +8,7 @@ import (
 func TestResolveAgentHomeDirSessionPolicyUsesEphemeralHome(t *testing.T) {
 	sessionDir := filepath.Join("gateway-run", "sessions", "abc123")
 	for _, policy := range []string{"", "session"} {
-		got, err := resolveAgentHomeDir(policy, "/srv/workspaces", "/srv/workspaces/alice/proj", sessionDir)
+		got, err := resolveAgentHomeDir(policy, "/srv/workspaces", "/srv/workspaces/workspaces/workspace-x", sessionDir)
 		if err != nil {
 			t.Fatalf("policy %q: %v", policy, err)
 		}
@@ -25,8 +25,8 @@ func TestResolveAgentHomeDirWorkspacePolicyKeysHomeByWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := filepath.Join(root, ".agent-homes", "workspace-abc123"); got != want {
-		t.Fatalf("agent home = %q, want %q (one persistent home keyed by the workspace)", got, want)
+	if want := filepath.Join(wsDir, ".agent"); got != want {
+		t.Fatalf("agent home = %q, want %q (one .agent dir inside the workspace)", got, want)
 	}
 }
 
@@ -39,7 +39,7 @@ func TestResolveAgentHomeDirWorkspacePolicyRejectsEscapingWorkspaceDir(t *testin
 }
 
 func TestResolveAgentHomeDirRejectsUnknownPolicy(t *testing.T) {
-	if _, err := resolveAgentHomeDir("global", "/srv/workspaces", "/srv/workspaces/a", "/s"); err == nil {
+	if _, err := resolveAgentHomeDir("global", "/srv/workspaces", "/srv/workspaces/workspaces/workspace-x", "/s"); err == nil {
 		t.Fatal("unknown agent_home_policy must be rejected")
 	}
 }
