@@ -236,6 +236,45 @@ PID-namespace tree-kill assertion. An arm64 runner runs the same smoke so the
 aarch64 seccomp policy is exercised against real arm64 syscalls, not just a
 cross-build.
 
+### Restricted hosts (root-run compat mode)
+
+Some managed platforms cannot grant the security context above. Two host-side
+policies break the strict non-root deployment, with a distinctive startup
+signature (`nsjail: preflight: minimal jail failed ... mount(...): Permission
+denied`):
+
+- Ubuntu ≥ 23.10/24.04 hosts with
+  `kernel.apparmor_restrict_unprivileged_userns=1` (or an equivalent LSM
+  policy) deny `mount()` inside user namespaces created by **non-root**
+  processes — user namespaces created by root keep working.
+- Runtimes that mask `/proc` (overmounts on `/proc/kcore` & co — the
+  docker/K8s default) refuse a fresh procfs instance inside a user namespace:
+  the kernel requires a fully visible `/proc`, so the mount fails with EPERM
+  regardless of who created the namespace.
+
+The clean fix is host-side and keeps the strict posture: ask for
+`--security-opt apparmor=unconfined` (k8s: `appArmorProfile: Unconfined`)
+**and** `maskedPaths: []` (docker: `--security-opt systempaths=unmasked`).
+When the platform grants neither, deploy in compat mode — run the gateway as
+root inside the container while every jail still de-privileges its agent:
+
+1. Run the container as root (the image default; do **not** set
+   `runAsUser: 65532`). Root-created user namespaces bypass the
+   unprivileged-userns restriction; nsjail still maps the jail to the
+   unprivileged uid/gid 65532.
+2. Set `[isolation.mounts] proc_mount = "bind"` — the jail bind-mounts the
+   container's existing `/proc` read-only instead of mounting a fresh procfs.
+3. Nothing else: the gateway chowns every directory the jail must traverse or
+   write (workspace/runtime roots and per-session dirs) to the jail uid/gid
+   automatically, and preflight validates the exact same profile shape.
+
+Tradeoffs: the gateway process itself runs as root (still caps-limited — no
+`CAP_SYS_ADMIN` is needed or granted), and a bind-mounted `/proc` exposes the
+container-wide process list to jailed CLIs. Within the one-gateway-per-team
+deployment model — sessions of one trust group sharing a workspace — this
+stays inside the trust boundary; multi-tenant gateways should prefer the
+strict non-root posture.
+
 ## Configuration
 
 `gateway -config gateway.toml`. Keys absent from the file retain defaults.
@@ -259,6 +298,7 @@ See [`config.example.toml`](config.example.toml) for a full annotated example.
 | `[isolation]` | `nsjail_version` / `nsjail_source` | `3.6` / upstream URL | Pinned build provenance |
 | `[isolation]` | `binary_path` | `/usr/local/bin/nsjail` | nsjail executable |
 | `[isolation.mounts]` | `workspace_dir` / `agent_home_dir` / `tmp_dir` | `/workspace` / `/home/agent` / `/tmp` | Sandbox mount layout |
+| `[isolation.mounts]` | `proc_mount` | `fresh` | `/proc` provisioning: `fresh` (new procfs for the jail's PID ns) or `bind` (compat for masked-/proc hosts; see "Restricted hosts") |
 | `[isolation]` | `clone_newpid` | `true` | Per-jail PID namespace (PID 1 = worker; a namespaced `/proc` is mounted) |
 | `[isolation.user_namespace]` | `enabled`, `uid`, `gid` | `true`, `65532`, `65532` | Unprivileged user namespace |
 | `[isolation.seccomp]` | `policy` | `kafel` | `kafel` or `off` (test only); policy arch is selected from `GOARCH` |

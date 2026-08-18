@@ -3,6 +3,21 @@
 ## Unreleased
 
 ### Added
+- **Restricted-host compat mode (`proc_mount = "bind"` + root-run
+  ownership)**: hosts whose LSM denies mounts in NON-root-created user
+  namespaces (Ubuntu ≥ 24.04 `apparmor_restrict_unprivileged_userns`) and
+  whose runtime masks `/proc` cannot run the strict non-root deployment —
+  the nsjail preflight fails on the first bind mount (EACCES) / the fresh
+  procfs mount (EPERM). New `[isolation.mounts] proc_mount` selects how
+  `/proc` is provided inside the jail: `fresh` (default, unchanged — a new
+  procfs for the jail's PID namespace) or `bind` (bind-mount the container's
+  existing `/proc` read-only). When the gateway runs as root inside the
+  container (compat deployment), it now chowns every directory the jail must
+  traverse or write — workspace/runtime roots, per-session workspace, agent
+  home, and socket dirs, plus the preflight's own dirs — to the configured
+  jail uid/gid (`nsjail.EnsureJailOwnership`; no-op for the default non-root
+  deployment). The jail still de-privileges agents to uid/gid 65532. See
+  README "Restricted hosts (root-run compat mode)".
 - **Unified turn-deadline contract (O-F09b)**: `server.turn_timeout` (default
   10m, `0` = disabled) plus `agents.<id>.timeout` now bound every agent's
   turns. The deadline is enforced at the worker boundary (the adapter bridge

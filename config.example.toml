@@ -130,6 +130,13 @@ clone_newpid = true
 # Per-session tmpfs size for the jail's /tmp (MiB). Default 256; bounds each
 # session's /tmp usage independently.
 # tmpfs_size_mib = 256
+# How /proc is provided inside the jail. "fresh" (default) mounts a new procfs
+# instance for the jail's PID namespace — the jail sees only its own
+# processes. "bind" bind-mounts the container's existing /proc read-only: the
+# compat mode for hosts whose runtime masks /proc (a fresh procfs instance
+# inside a user namespace then fails with EPERM); the jail sees the
+# container-wide process list. See README "Restricted hosts".
+# proc_mount = "fresh"
 workspace_dir = "/workspace"
 agent_home_dir = "/home/agent"
 # Where the agent CLIs' own home directories (memory, session records, login

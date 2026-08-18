@@ -48,6 +48,19 @@ const (
 	AgentHomePolicyWorkspace = "workspace"
 )
 
+// /proc mount modes for MountsConfig.ProcMount.
+const (
+	// ProcMountFresh mounts a new procfs instance bound to the jail's PID
+	// namespace (default; strictest — the jail sees only its own processes).
+	ProcMountFresh = "fresh"
+	// ProcMountBind bind-mounts the container's existing /proc read-only.
+	// Compat mode for hosts whose runtime masks /proc (maskedPaths overmounts):
+	// the kernel refuses a new procfs instance inside a user namespace unless
+	// the existing /proc is fully visible, so "fresh" fails with EPERM there.
+	// Tradeoff: the jail sees the container-wide process list.
+	ProcMountBind = "bind"
+)
+
 // GatewayConfig is the agent-gateway configuration. Clients only ever submit
 // an opaque workspace_id; the server resolves it to a directory under
 // Workspace.Root. There is deliberately no client-controllable workDir anywhere
@@ -263,6 +276,12 @@ type MountsConfig struct {
 	// 256 (MiB). This is the hard per-session cap on /tmp usage — a session
 	// cannot exhaust host /tmp.
 	TmpfsSizeMiB int `toml:"tmpfs_size_mib"`
+	// ProcMount selects how /proc is provided inside the jail (only mounted
+	// when the per-jail PID namespace is enabled). "fresh" (default) mounts a
+	// new procfs instance reflecting the jail's PID namespace. "bind"
+	// bind-mounts the container's existing /proc read-only — the compat mode
+	// for hosts whose container runtime masks /proc (see ProcMountBind).
+	ProcMount string `toml:"proc_mount"`
 }
 
 // RlimitsConfig configures per-process resource limits inside the jail.
@@ -403,6 +422,7 @@ func DefaultGatewayConfig() GatewayConfig {
 				AgentHomePolicy: AgentHomePolicySession,
 				TmpDir:          "/tmp",
 				TmpfsSizeMiB:    256,
+				ProcMount:       ProcMountFresh,
 			},
 			Rlimits: RlimitsConfig{
 				MaxOpenFiles: 1024,
@@ -571,6 +591,11 @@ func (c *GatewayConfig) Validate() error {
 	}
 	if c.Isolation.Mounts.TmpfsSizeMiB < 0 {
 		return fmt.Errorf("config: isolation.mounts.tmpfs_size_mib must not be negative")
+	}
+	switch c.Isolation.Mounts.ProcMount {
+	case "", ProcMountFresh, ProcMountBind:
+	default:
+		return fmt.Errorf("config: isolation.mounts.proc_mount %q invalid (want %q or %q)", c.Isolation.Mounts.ProcMount, ProcMountFresh, ProcMountBind)
 	}
 	if c.Limits.MaxWorkers < 0 || c.Limits.MaxActiveRuns < 0 ||
 		c.Limits.MaxSessionsPerCaller < 0 || c.Limits.MaxSessions < 0 ||

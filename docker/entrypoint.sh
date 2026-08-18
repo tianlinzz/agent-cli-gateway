@@ -24,6 +24,17 @@ CONFIG_PATH="${GATEWAY_CONFIG:-/etc/gateway/gateway.toml}"
 
 mkdir -p "$WORKSPACE_ROOT" "$RUNTIME_DIR"
 
+# Root-run compat deployments (hosts whose LSM denies mounts created by
+# non-root user namespaces; see README "Restricted hosts"): the jail maps the
+# configured uid, so the roots it must traverse/bind-mount are chowned to it.
+# No-op when the container already runs as that non-root user.
+JAIL_UID="${GATEWAY_JAIL_UID:-65532}"
+JAIL_GID="${GATEWAY_JAIL_GID:-65532}"
+if [ "$(id -u)" = "0" ]; then
+  chown "$JAIL_UID:$JAIL_GID" "$WORKSPACE_ROOT" "$RUNTIME_DIR" 2>/dev/null ||
+    echo "[entrypoint] WARN: chown of runtime dirs to $JAIL_UID:$JAIL_GID failed (mounts may fail if they are root-owned)" >&2
+fi
+
 # Write a default config when the deployment did not mount one. The default
 # requires nsjail (fail-closed) at /usr/local/bin/nsjail and pins the same
 # version the image was built from; deployments override by mounting their own

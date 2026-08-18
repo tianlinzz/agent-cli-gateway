@@ -159,11 +159,24 @@ func Build(iso config.IsolationConfig, layout SessionLayout, sessionID string) (
 			fmt.Fprintf(&b, "mount: { src: %q; dst: %q; is_bind: true; rw: false; mandatory: true; } ;\n", f, f)
 		}
 	}
-	// A private PID namespace requires a namespaced /proc: many CLIs read
+	// A private PID namespace wants a namespaced /proc: many CLIs read
 	// /proc/self/*, and with clone_newpid the proc pseudo-fs must reflect the
-	// jail's PID namespace rather than the host's. Mounted read-only.
+	// jail's PID namespace rather than the host's. Two modes:
+	//   "fresh" (default) — mount a new procfs instance for the jail's PID
+	//     namespace. Strictest: the jail sees only its own processes.
+	//   "bind" — bind-mount the container's existing /proc read-only. Compat
+	//     mode for runtimes that mask /proc (overmounts on /proc/kcore & co):
+	//     the kernel refuses a NEW procfs instance inside a user namespace
+	//     unless the existing /proc is fully visible, which fails with EPERM
+	//     on such hosts. Tradeoff: the jail sees the container-wide process
+	//     list (acceptable within one gateway = one trust group).
+	// Mounted read-only in both modes.
 	if iso.CloneNewPID {
-		fmt.Fprintf(&b, "mount: { dst: %q; fstype: \"proc\"; rw: false; mandatory: true; } ;\n", "/proc")
+		if mounts.ProcMount == config.ProcMountBind {
+			fmt.Fprintf(&b, "mount: { src: %q; dst: %q; is_bind: true; rw: false; mandatory: true; } ;\n", "/proc", "/proc")
+		} else {
+			fmt.Fprintf(&b, "mount: { dst: %q; fstype: \"proc\"; rw: false; mandatory: true; } ;\n", "/proc")
+		}
 	}
 	// The per-session tmpfs at TmpDir is size-bounded so one session cannot
 	// exhaust host /tmp (default 256 MiB, configurable).

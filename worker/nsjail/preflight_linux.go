@@ -39,6 +39,15 @@ func minimalJail(ctx context.Context, iso config.IsolationConfig) error {
 	if err := os.MkdirAll(ws, 0o700); err != nil {
 		return fmt.Errorf("nsjail: preflight: mkdir workspace: %w", err)
 	}
+	// Root-run compat deployments: the minimal jail resolves and mounts these
+	// sources as the mapped uid, so the preflight dirs must be owned by it —
+	// root-owned 0700 dirs would fail the very bind mounts under test with
+	// EACCES. No-op unless the gateway runs as root.
+	for _, d := range []string{tmp, ws} {
+		if err := EnsureJailOwnership(d, iso); err != nil {
+			return fmt.Errorf("nsjail: preflight: %w", err)
+		}
+	}
 
 	prof, err := Build(iso, SessionLayout{
 		WorkspaceDir: ws,

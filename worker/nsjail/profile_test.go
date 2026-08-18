@@ -267,6 +267,42 @@ func TestBuildProfile_EtcMountNarrowed(t *testing.T) {
 	}
 }
 
+// TestBuildProfile_ProcMountModes covers both /proc provisioning modes.
+// "fresh" (default) mounts a new procfs for the jail's PID namespace; "bind"
+// bind-mounts the container's existing /proc — the compat mode for hosts
+// whose runtime masks /proc (a fresh procfs instance inside a user namespace
+// requires a fully visible /proc and fails with EPERM there). The regression
+// this pins: the restricted-host deployment must be able to switch modes by
+// config alone, with the strict default unchanged.
+func TestBuildProfile_ProcMountModes(t *testing.T) {
+	layout := testLayout(t)
+
+	fresh := config.DefaultGatewayConfig().Isolation
+	p, err := Build(fresh, layout, "sess-proc-fresh")
+	if err != nil {
+		t.Fatalf("Build fresh: %v", err)
+	}
+	if !strings.Contains(p.Config, `dst: "/proc"; fstype: "proc"`) {
+		t.Errorf("fresh mode must mount a new procfs at /proc:\n%s", p.Config)
+	}
+	if strings.Contains(p.Config, `src: "/proc"`) {
+		t.Errorf("fresh mode must not bind-mount the container /proc:\n%s", p.Config)
+	}
+
+	bind := config.DefaultGatewayConfig().Isolation
+	bind.Mounts.ProcMount = config.ProcMountBind
+	p, err = Build(bind, layout, "sess-proc-bind")
+	if err != nil {
+		t.Fatalf("Build bind: %v", err)
+	}
+	if !strings.Contains(p.Config, `src: "/proc"; dst: "/proc"; is_bind: true; rw: false`) {
+		t.Errorf("bind mode must bind-mount the container /proc read-only:\n%s", p.Config)
+	}
+	if strings.Contains(p.Config, `fstype: "proc"`) {
+		t.Errorf("bind mode must not mount a fresh procfs:\n%s", p.Config)
+	}
+}
+
 func TestBuildProfile_SeccompOffOmitted(t *testing.T) {
 	iso := config.DefaultGatewayConfig().Isolation
 	iso.Seccomp.Policy = config.SeccompOff

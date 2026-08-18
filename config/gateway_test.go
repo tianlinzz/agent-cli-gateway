@@ -307,6 +307,25 @@ func TestGatewayConfig_InvalidPermissionRejected(t *testing.T) {
 	}
 }
 
+// TestGatewayConfig_ProcMountValues covers isolation.mounts.proc_mount: the
+// compat "bind" mode (masked-/proc hosts) is valid, the default is "fresh",
+// and unknown values fail closed.
+func TestGatewayConfig_ProcMountValues(t *testing.T) {
+	if d := DefaultGatewayConfig().Isolation.Mounts.ProcMount; d != ProcMountFresh {
+		t.Errorf("default proc_mount = %q, want %q", d, ProcMountFresh)
+	}
+	c := DefaultGatewayConfig()
+	c.Mode = ModeTest // bypass the prod auth-caller requirement
+	c.Isolation.Mounts.ProcMount = ProcMountBind
+	if err := c.Validate(); err != nil {
+		t.Errorf("proc_mount=%q must be valid: %v", ProcMountBind, err)
+	}
+	c.Isolation.Mounts.ProcMount = "banana"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "proc_mount") {
+		t.Errorf("invalid proc_mount: want error mentioning proc_mount, got %v", err)
+	}
+}
+
 // TestGatewayConfig_PerAgentTimeoutHonoredByAllAdapters is the O-F09b
 // successor of the O-F09a fail-closed stopgap: the unified turn-deadline
 // contract makes agents.<id>.timeout a bound every adapter honors at the

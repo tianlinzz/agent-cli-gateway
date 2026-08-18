@@ -222,6 +222,13 @@ func NewSupervisor(cfg Config, opts ...Option) (*Supervisor, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Root-run compat deployments (userns created by root; see
+	// nsjail.EnsureJailOwnership) need the workspace root owned by the jail
+	// uid so the nsjail child can traverse it when bind-mounting session
+	// directories. No-op unless the gateway actually runs as root.
+	if err := nsjail.EnsureJailOwnership(cfg.WorkspaceRoot, cfg.Isolation); err != nil {
+		return nil, fmt.Errorf("worker: workspace root ownership: %w", err)
+	}
 	s := &Supervisor{
 		cfg:         cfg,
 		resolver:    resolver,
@@ -324,6 +331,24 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 	}
 	if err := os.MkdirAll(agentHomeDir, 0o700); err != nil {
 		return nil, fmt.Errorf("worker: start session %q: mkdir agent home: %w", req.SessionID, err)
+	}
+	// Root-run compat deployments: the jail resolves the bind-mount sources
+	// and writes workspace/agent-home/socket files as the mapped uid, so every
+	// directory in those chains (runtime root, structural sessions//sockets/
+	// dirs, this session's leaf dirs, the workspace dir) must be owned by it.
+	// No-op unless the gateway runs as root.
+	for _, d := range []string{
+		s.cfg.RuntimeDir,
+		filepath.Join(s.cfg.RuntimeDir, "sessions"),
+		filepath.Join(s.cfg.RuntimeDir, "sockets"),
+		sessionDir,
+		socketDir,
+		agentHomeDir,
+		wsDir,
+	} {
+		if err := nsjail.EnsureJailOwnership(d, s.cfg.Isolation); err != nil {
+			return nil, fmt.Errorf("worker: start session %q: %w", req.SessionID, err)
+		}
 	}
 
 	// Fail-closed isolation setup: the nsjail binary must exist and be

@@ -34,6 +34,19 @@
 #     -v "$PWD/workspaces:/srv/workspaces" \
 #     -p 4096:4096 agent-gateway:dev
 #
+# Run (docker, restricted hosts — compat mode): on hosts whose LSM denies
+# mounts in NON-root-created user namespaces (Ubuntu >= 24.04 userns
+# restriction) and whose runtime masks /proc, run as root and switch the
+# jail's /proc to a bind mount (gateway.toml: [isolation.mounts]
+# proc_mount = "bind"). The jail still de-privileges agents to uid 65532;
+# the gateway chowns the dirs the jail must access. See README "Restricted
+# hosts (root-run compat mode)":
+#   docker run --rm -it \
+#     --user 0:0 \
+#     --cap-drop=ALL \
+#     -v "$PWD/workspaces:/srv/workspaces" \
+#     -p 4096:4096 agent-gateway:dev
+#
 # Run (kubernetes, minimal security context):
 #   securityContext:
 #     runAsNonRoot: true
