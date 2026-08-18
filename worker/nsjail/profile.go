@@ -84,7 +84,7 @@ func Build(iso config.IsolationConfig, layout SessionLayout, sessionID string) (
 		mounts.WorkspaceDir = "/workspace"
 	}
 	if strings.TrimSpace(mounts.AgentHomeDir) == "" {
-		mounts.AgentHomeDir = "/agent-home"
+		mounts.AgentHomeDir = "/home/agent"
 	}
 	if strings.TrimSpace(mounts.TmpDir) == "" {
 		mounts.TmpDir = "/tmp"

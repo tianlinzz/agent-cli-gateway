@@ -3,6 +3,7 @@ package codex
 
 import (
 	"context"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -97,8 +98,12 @@ func (a *Adapter) Describe(context.Context) (runtime.Descriptor, error) {
 func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.Session, error) {
 	resumeID := bridge.ResumeID(req.Metadata)
 	env := append([]string(nil), a.opts.Env...)
+	// Codex's official home override: CODEX_HOME IS the .codex directory
+	// itself (default ~/.codex). It points inside the mounted agent home, so
+	// sessions, AGENTS.md memory, and auth persist per the configured
+	// agent_home_policy.
 	if a.opts.CodexHome != "" {
-		env = append(env, "CODEX_HOME="+a.opts.CodexHome)
+		env = append(env, "CODEX_HOME="+filepath.Join(a.opts.CodexHome, ".codex"))
 	}
 	start := a.start
 	if start == nil {

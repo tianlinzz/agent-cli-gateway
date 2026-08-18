@@ -48,7 +48,9 @@ if [ ! -f "$CONFIG_PATH" ]; then
     printf 'nsjail_source = "https://github.com/google/nsjail"\n'
     printf 'binary_path = "/usr/local/bin/nsjail"\n\n'
     printf '[isolation.mounts]\nworkspace_dir = "/workspace"\n'
-    printf 'agent_home_dir = "/agent-home"\ntmp_dir = "/tmp"\n\n'
+    printf 'agent_home_dir = "/home/agent"\n'
+    printf 'agent_home_policy = "workspace"\n'
+    printf 'tmp_dir = "/tmp"\n\n'
     printf '[isolation.user_namespace]\nenabled = true\nuid = 65532\ngid = 65532\n\n'
     printf '[isolation.seccomp]\npolicy = "kafel"\n'
   } > "$CONFIG_PATH"

@@ -40,6 +40,14 @@ const (
 	StoreDriverBbolt  = "bbolt"
 )
 
+// Agent home policies for MountsConfig.AgentHomePolicy. They decide where the
+// agent CLIs' own home directories (memory, session records, login state)
+// live; see MountsConfig.AgentHomePolicy.
+const (
+	AgentHomePolicySession   = "session"
+	AgentHomePolicyWorkspace = "workspace"
+)
+
 // GatewayConfig is the agent-gateway configuration. Clients only ever submit
 // an opaque workspace_id; the server resolves it to a directory under
 // Workspace.Root. There is deliberately no client-controllable workDir anywhere
@@ -230,9 +238,25 @@ type MountsConfig struct {
 	// WorkspaceDir is the sandbox mount point for the controlled workspace.
 	// Default "/workspace".
 	WorkspaceDir string `toml:"workspace_dir"`
-	// AgentHomeDir is the per-session writable agent home. Default
-	// "/agent-home".
+	// AgentHomeDir is the in-jail mount point that becomes HOME for the
+	// agent CLI. Default "/home/agent".
 	AgentHomeDir string `toml:"agent_home_dir"`
+	// AgentHomePolicy selects where the agent CLI's home (session records,
+	// memory, login state — the CLIs' own fixed directories ~/.claude,
+	// ~/.codex, ~/.kimi-code) lives:
+	//   "session" (default) — a fresh ephemeral home per gateway session
+	//       under the runtime dir. Strictest isolation, but the CLIs' memory
+	//       and login state die with the session.
+	//   "workspace" — one persistent home per (owner, workspace) under
+	//       "<workspace root>/.agent-homes/...": memory, transcripts, and
+	//       login state survive sessions and restarts and are shared only
+	//       within the workspace's existing trust domain. The gateway never
+	//       reads or writes inside; the CLIs manage their own files. This
+	//       also keeps the CLIs' cwd-keyed project buckets per-workspace
+	//       clean (inside the jail every session's cwd is the same
+	//       "/workspace" path, so one global home would mix workspaces'
+	//       memories together).
+	AgentHomePolicy string `toml:"agent_home_policy"`
 	// TmpDir is the per-session tmpfs mount point. Default "/tmp".
 	TmpDir string `toml:"tmp_dir"`
 	// TmpfsSizeMiB bounds the per-session tmpfs mounted at TmpDir. Default
@@ -374,10 +398,11 @@ func DefaultGatewayConfig() GatewayConfig {
 			NsjailSource:  "https://github.com/google/nsjail",
 			BinaryPath:    "/usr/local/bin/nsjail",
 			Mounts: MountsConfig{
-				WorkspaceDir: "/workspace",
-				AgentHomeDir: "/agent-home",
-				TmpDir:       "/tmp",
-				TmpfsSizeMiB: 256,
+				WorkspaceDir:    "/workspace",
+				AgentHomeDir:    "/home/agent",
+				AgentHomePolicy: AgentHomePolicySession,
+				TmpDir:          "/tmp",
+				TmpfsSizeMiB:    256,
 			},
 			Rlimits: RlimitsConfig{
 				MaxOpenFiles: 1024,
@@ -460,6 +485,10 @@ func (c *GatewayConfig) normalize() {
 		c.Store.Driver = StoreDriverMemory
 	}
 	c.Store.Path = strings.TrimSpace(c.Store.Path)
+	c.Isolation.Mounts.AgentHomePolicy = strings.ToLower(strings.TrimSpace(c.Isolation.Mounts.AgentHomePolicy))
+	if c.Isolation.Mounts.AgentHomePolicy == "" {
+		c.Isolation.Mounts.AgentHomePolicy = AgentHomePolicySession
+	}
 	for name, agent := range c.Agents {
 		seen := make(map[string]bool)
 		models := make([]string, 0, len(agent.Models))
@@ -495,6 +524,11 @@ func (c *GatewayConfig) Validate() error {
 	}
 	if !c.Isolation.Required && c.Mode != ModeTest {
 		return fmt.Errorf("config: isolation.required must be true in mode %q; only the test profile may disable nsjail", c.Mode)
+	}
+	switch c.Isolation.Mounts.AgentHomePolicy {
+	case AgentHomePolicySession, AgentHomePolicyWorkspace:
+	default:
+		return fmt.Errorf("config: isolation.mounts.agent_home_policy must be one of %q, %q", AgentHomePolicySession, AgentHomePolicyWorkspace)
 	}
 	if c.Server.DrainTimeout <= 0 {
 		return fmt.Errorf("config: server.drain_timeout must be positive")

@@ -66,7 +66,7 @@ func TestNewConsumesTypedConfigDirectly_OF08(t *testing.T) {
 
 func TestStartMapsCodexHomeAndResumeMetadata(t *testing.T) {
 	capture := &captureStarter{session: newFakeSession("")}
-	adapter := newAdapter(Options{Command: []string{"codex", "--quiet"}, WorkDir: "/workspace", CodexHome: "/agent-home", Model: "gpt-5", Permission: "deny"}, capture.Start)
+	adapter := newAdapter(Options{Command: []string{"codex", "--quiet"}, WorkDir: "/workspace", CodexHome: "/home/agent", Model: "gpt-5", Permission: "deny"}, capture.Start)
 	_, err := adapter.Start(context.Background(), runtime.StartRequest{Metadata: map[string]string{"native_session_id": "thread-1"}})
 	if err != nil {
 		t.Fatal(err)
@@ -74,7 +74,7 @@ func TestStartMapsCodexHomeAndResumeMetadata(t *testing.T) {
 	if capture.options.ResumeID != "thread-1" || capture.options.WorkDir != "/workspace" || capture.options.Model != "gpt-5" || capture.options.Permission != "deny" {
 		t.Fatalf("options = %#v", capture.options)
 	}
-	if !containsValue(capture.options.Env, "CODEX_HOME=/agent-home") {
+	if !containsValue(capture.options.Env, "CODEX_HOME=/home/agent/.codex") {
 		t.Fatalf("env = %#v", capture.options.Env)
 	}
 }

@@ -53,7 +53,7 @@ func TestBuildProfile_KafelDefaults(t *testing.T) {
 		"rlimit_nofile: 1024;",
 		"rlimit_nproc: 256;",
 		`mount: { src: "` + layout.WorkspaceDir + `"; dst: "/workspace"; is_bind: true; rw: true; mandatory: true; };`,
-		`mount: { src: "` + layout.AgentHomeDir + `"; dst: "/agent-home"; is_bind: true; rw: true; mandatory: true; };`,
+		`mount: { src: "` + layout.AgentHomeDir + `"; dst: "/home/agent"; is_bind: true; rw: true; mandatory: true; };`,
 		`mount: { src: "` + layout.SocketDir + `"; dst: "` + layout.SocketDir + `"; is_bind: true; rw: true; mandatory: true; };`,
 		`mount: { dst: "/tmp"; fstype: "tmpfs"; options: "size=256m"; rw: true; mandatory: true; };`,
 		`mount: { dst: "/proc"; fstype: "proc"; rw: false; mandatory: true; } ;`,
@@ -61,7 +61,7 @@ func TestBuildProfile_KafelDefaults(t *testing.T) {
 		`keep_env: "GW_WORKER_SESSION_ID";`,
 		`keep_env: "GW_WORKSPACE_DIR";`,
 		`keep_env: "GW_AGENT_HOME";`,
-		`env: { key: "HOME"; value: "/agent-home"; };`,
+		`env: { key: "HOME"; value: "/home/agent"; };`,
 		`cwd: "/workspace";`,
 	} {
 		if !strings.Contains(c, want) {

@@ -74,6 +74,9 @@ func TestContainerEntrypointGeneratesCallerAuth(t *testing.T) {
 	if !strings.Contains(script, "callers = [{ id = \"container\", tokens = [") {
 		t.Fatal("entrypoint must generate the configured caller-token schema")
 	}
+	if !strings.Contains(script, `agent_home_policy = "workspace"`) {
+		t.Fatal("entrypoint default config must use persistent per-workspace agent homes (CLI memory survives restarts)")
+	}
 	if strings.Contains(script, `printf 'token =`) {
 		t.Fatal("entrypoint must not generate removed auth.token")
 	}

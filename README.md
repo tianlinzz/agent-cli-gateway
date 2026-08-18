@@ -214,7 +214,7 @@ Production and dev profiles require nsjail:
   capabilities; the example k8s security context uses `runAsNonRoot: true`
   with `runAsUser/Group: 65532`.
 - The controlled workspace is bind-mounted read-write at `/workspace`, the
-  per-session agent home at `/agent-home`, and `/tmp` is a per-session tmpfs.
+  per-session agent home at `/home/agent`, and `/tmp` is a per-session tmpfs.
 - Phase 1 keeps the network namespace shared so agents can reach their
   providers; egress is controlled by the container/infrastructure.
 - Each jail gets its own **PID namespace** (`clone_newpid`, default on): the
@@ -258,7 +258,7 @@ See [`config.example.toml`](config.example.toml) for a full annotated example.
 | `[isolation]` | `required` | `true` | Must be true outside the test profile |
 | `[isolation]` | `nsjail_version` / `nsjail_source` | `3.6` / upstream URL | Pinned build provenance |
 | `[isolation]` | `binary_path` | `/usr/local/bin/nsjail` | nsjail executable |
-| `[isolation.mounts]` | `workspace_dir` / `agent_home_dir` / `tmp_dir` | `/workspace` / `/agent-home` / `/tmp` | Sandbox mount layout |
+| `[isolation.mounts]` | `workspace_dir` / `agent_home_dir` / `tmp_dir` | `/workspace` / `/home/agent` / `/tmp` | Sandbox mount layout |
 | `[isolation]` | `clone_newpid` | `true` | Per-jail PID namespace (PID 1 = worker; a namespaced `/proc` is mounted) |
 | `[isolation.user_namespace]` | `enabled`, `uid`, `gid` | `true`, `65532`, `65532` | Unprivileged user namespace |
 | `[isolation.seccomp]` | `policy` | `kafel` | `kafel` or `off` (test only); policy arch is selected from `GOARCH` |
@@ -399,6 +399,18 @@ descendants; the supervisor then
 propagates shutdown API → worker(nsjail) → CLI and reaps the process group.
 See the `Dockerfile` header for the k8s `securityContext` and Linux-CI
 validation hooks.
+
+Deployment mounts exactly three things: `/srv/workspaces` (session
+workspaces — and, with `agent_home_policy = "workspace"`, the CLIs'
+persistent per-workspace homes under `.agent-homes/`, so their memory,
+session history, and login state survive restarts inside the workspace's
+trust domain; the gateway never reads or writes there), `/var/lib/agent-gateway`
+(the bbolt records via `[store]`), and the config at
+`/etc/gateway/gateway.toml`. Inside the jail HOME is the mounted
+`/home/agent`, and the adapters set each CLI's official directory override
+(`CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`KIMI_CODE_HOME`) into it. Credentials and
+base URLs ride `agents.<id>.env` in that one config file — including kimi's
+official `KIMI_API_KEY`/`KIMI_BASE_URL`.
 
 ## Development
 

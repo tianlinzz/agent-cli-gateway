@@ -161,8 +161,8 @@ func TestDefaultGatewayConfig_IsolationRequired(t *testing.T) {
 	if c.Isolation.Mounts.WorkspaceDir != "/workspace" {
 		t.Errorf("Mounts.WorkspaceDir = %q, want %q", c.Isolation.Mounts.WorkspaceDir, "/workspace")
 	}
-	if c.Isolation.Mounts.AgentHomeDir != "/agent-home" {
-		t.Errorf("Mounts.AgentHomeDir = %q, want %q", c.Isolation.Mounts.AgentHomeDir, "/agent-home")
+	if c.Isolation.Mounts.AgentHomeDir != "/home/agent" {
+		t.Errorf("Mounts.AgentHomeDir = %q, want %q", c.Isolation.Mounts.AgentHomeDir, "/home/agent")
 	}
 	if !c.Isolation.UserNamespace.Enabled {
 		t.Error("UserNamespace.Enabled must default to true")

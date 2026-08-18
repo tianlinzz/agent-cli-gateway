@@ -4,6 +4,7 @@ package claudecode
 
 import (
 	"context"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -24,6 +25,7 @@ type Options struct {
 	Command            []string
 	Env                []string
 	WorkDir            string
+	AgentHome          string
 	Model              string
 	ReasoningEffort    string
 	Mode               string
@@ -63,6 +65,7 @@ func optionsFromConfig(cfg runtime.AdapterConfig) Options {
 		Command:            cfg.Execution.Command,
 		Env:                envSlice(cfg.Execution.Env),
 		WorkDir:            cfg.WorkspaceDir,
+		AgentHome:          cfg.AgentHome,
 		Model:              cfg.Execution.DefaultModel,
 		Mode:               "default",
 		Permission:         cfg.Execution.Permission,
@@ -110,13 +113,21 @@ func (a *Adapter) Describe(context.Context) (runtime.Descriptor, error) {
 // Start converts runtime metadata and trusted config into native options.
 func (a *Adapter) Start(ctx context.Context, req runtime.StartRequest) (runtime.Session, error) {
 	resumeID := bridge.ResumeID(req.Metadata)
+	env := append([]string(nil), a.opts.Env...)
+	// Claude Code's official config-directory override: settings, session
+	// history, memory, and credentials live under CLAUDE_CONFIG_DIR instead
+	// of ~/.claude. It points inside the mounted agent home, so state
+	// persists per the configured agent_home_policy.
+	if a.opts.AgentHome != "" {
+		env = append(env, "CLAUDE_CONFIG_DIR="+filepath.Join(a.opts.AgentHome, ".claude"))
+	}
 	start := a.start
 	if start == nil {
 		start = startNative
 	}
 	session, err := start(ctx, native.Options{
 		Command:            append([]string(nil), a.opts.Command...),
-		Env:                append([]string(nil), a.opts.Env...),
+		Env:                env,
 		WorkDir:            a.opts.WorkDir,
 		Model:              a.opts.Model,
 		ReasoningEffort:    a.opts.ReasoningEffort,

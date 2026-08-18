@@ -308,7 +308,10 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 
 	sessionDir := filepath.Join(s.cfg.RuntimeDir, "sessions", shortID(req.SessionID))
 	socketDir := filepath.Join(s.cfg.RuntimeDir, "sockets", shortID(req.SessionID))
-	agentHomeDir := filepath.Join(sessionDir, "agent-home")
+	agentHomeDir, err := resolveAgentHomeDir(s.cfg.Isolation.Mounts.AgentHomePolicy, s.cfg.WorkspaceRoot, wsDir, sessionDir)
+	if err != nil {
+		return nil, fmt.Errorf("worker: start session %q: %w", req.SessionID, err)
+	}
 	socketPath := filepath.Join(socketDir, "w.sock")
 	// Unix socket paths are kernel-limited (~104 bytes on darwin, ~108 on
 	// linux). A deep RuntimeDir combined with the session dir could silently
@@ -368,7 +371,7 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 	if isolated {
 		workerAgentHomeDir := s.cfg.Isolation.Mounts.AgentHomeDir
 		if strings.TrimSpace(workerAgentHomeDir) == "" {
-			workerAgentHomeDir = "/agent-home"
+			workerAgentHomeDir = "/home/agent"
 		}
 		env = append(env,
 			"GW_AGENT_HOME="+workerAgentHomeDir,
@@ -669,6 +672,35 @@ func validateStartRequest(req runtime.StartRequest) error {
 func shortID(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])[:16]
+}
+
+// resolveAgentHomeDir picks the host directory mounted as the jail's agent
+// home (HOME inside the sandbox), where the CLIs keep their own fixed
+// directories (~/.claude, ~/.codex, ~/.kimi-code) with session records,
+// memory, and login state.
+//
+// The "session" policy gives each gateway session a fresh ephemeral home
+// under the runtime dir (strictest isolation, no cross-session memory). The
+// "workspace" policy gives every (owner, workspace) one persistent home under
+// "<workspace root>/.agent-homes/<owner-scoped workspace path>": memory and
+// login state survive sessions and restarts, stay inside the workspace's
+// existing trust domain, and the cwd-keyed project buckets the CLIs keep
+// never mix workspaces. The gateway never reads or writes inside the home.
+func resolveAgentHomeDir(policy, workspaceRoot, wsDir, sessionDir string) (string, error) {
+	switch policy {
+	case "", "session":
+		return filepath.Join(sessionDir, "agent-home"), nil
+	case "workspace":
+		rel, err := filepath.Rel(workspaceRoot, wsDir)
+		if err != nil || rel == "" || rel == "." || rel == ".." ||
+			strings.HasPrefix(rel, ".."+string(filepath.Separator)) ||
+			filepath.IsAbs(rel) {
+			return "", fmt.Errorf("agent home: workspace dir %q escapes root %q", wsDir, workspaceRoot)
+		}
+		return filepath.Join(workspaceRoot, ".agent-homes", rel), nil
+	default:
+		return "", fmt.Errorf("agent home: unknown agent_home_policy %q", policy)
+	}
 }
 
 // ---------------------------------------------------------------------------

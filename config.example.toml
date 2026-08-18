@@ -123,7 +123,16 @@ clone_newpid = true
 # session's /tmp usage independently.
 # tmpfs_size_mib = 256
 workspace_dir = "/workspace"
-agent_home_dir = "/agent-home"
+agent_home_dir = "/home/agent"
+# Where the agent CLIs' own home directories (memory, session records, login
+# state) live. "workspace" gives every (owner, workspace) one persistent home
+# under <workspace root>/.agent-homes/...: mounted as /home/agent (HOME), with
+# each CLI's official directory override pointing inside (CLAUDE_CONFIG_DIR /
+# CODEX_HOME / KIMI_CODE_HOME). The CLIs keep their fixed dirs across
+# sessions and restarts, the gateway never reads or writes inside, and the
+# cwd-keyed project buckets never mix workspaces. "session" (default) = fresh
+# ephemeral home per session (strictest isolation, no cross-session memory).
+agent_home_policy = "workspace"
 tmp_dir = "/tmp"
 
 [isolation.rlimits]
@@ -156,13 +165,19 @@ policy = "kafel"
 # arguments must migrate to the array form); a future release rejects it.
 
 # Credentials and endpoints live in THIS file via `agents.<id>.env` — one
-# place for keys and base URLs, injected into the CLI process environment.
-# No native CLI config/auth files (~/.codex, ~/.claude, ~/.kimi) need to be
-# mounted: each session gets a fresh per-session agent-home automatically and
-# secrets arrive as env vars. Standard env names:
+# place for keys and base URLs, injected into the CLI process environment
+# (claude/codex need no interactive login when an API key is present).
+# Standard env names:
 #   codex:       OPENAI_API_KEY,     OPENAI_BASE_URL
 #   claude-code: ANTHROPIC_API_KEY,  ANTHROPIC_BASE_URL
-#   kimi:        MOONSHOT_API_KEY (base-url env per Kimi Code docs)
+#   kimi:        KIMI_API_KEY,       KIMI_BASE_URL   (officially supported)
+# The CLIs keep their own fixed directories inside the agent home, via their
+# official override variables — the gateway sets CLAUDE_CONFIG_DIR
+# (~/.claude), CODEX_HOME (~/.codex), and KIMI_CODE_HOME (~/.kimi-code)
+# into the jail-mounted /home/agent. With isolation.mounts.
+# agent_home_policy = "workspace" the homes are persistent per workspace:
+# memory, session records, and login state survive restarts with zero
+# gateway involvement.
 # Codex's own sandbox is pinned to danger-full-access by the gateway on
 # purpose: the other codex sandbox modes block network egress, which would cut
 # the agent off from its provider. The nsjail boundary is the real isolation.

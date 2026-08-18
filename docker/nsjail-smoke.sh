@@ -44,9 +44,9 @@ echo "== keep_env passes the worker placement vars into the jail =="
 # home from them and keys its nsjail sandbox capability off GW_AGENT_HOME).
 grep -q 'keep_env: "GW_WORKSPACE_DIR";' "$SMOKE_DIR/profile.conf"
 grep -q 'keep_env: "GW_AGENT_HOME";' "$SMOKE_DIR/profile.conf"
-GW_WORKSPACE_DIR=/workspace GW_AGENT_HOME=/agent-home \
+GW_WORKSPACE_DIR=/workspace GW_AGENT_HOME=/home/agent \
   "$NSJAIL_BIN" -Mo --config "$SMOKE_DIR/profile.conf" -- \
-  /bin/sh -c 'test "$GW_WORKSPACE_DIR" = /workspace && test "$GW_AGENT_HOME" = /agent-home'
+  /bin/sh -c 'test "$GW_WORKSPACE_DIR" = /workspace && test "$GW_AGENT_HOME" = /home/agent'
 
 echo "== minimal jail with the real profile =="
 "$NSJAIL_BIN" -Mo --config "$SMOKE_DIR/profile.conf" -- /bin/true

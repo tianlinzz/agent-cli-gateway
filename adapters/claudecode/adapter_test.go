@@ -3,6 +3,7 @@ package claudecode
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/tianlinzz/agent-cli-gateway/adapters/internal/bridge"
@@ -247,5 +248,33 @@ func TestAdapterParity_Claudecode(t *testing.T) {
 				t.Fatalf("prompt = %q, want %q", native.input.Prompt, tc.Want)
 			}
 		})
+	}
+}
+
+func TestStartSetsClaudeConfigDirFromAgentHome(t *testing.T) {
+	capture := &captureStarter{session: newFakeNativeSession()}
+	adapter := newAdapter(Options{AgentHome: "/home/agent"}, capture.Start)
+	if _, err := adapter.Start(context.Background(), runtime.StartRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	want := "CLAUDE_CONFIG_DIR=/home/agent/.claude"
+	for _, kv := range capture.options.Env {
+		if kv == want {
+			return
+		}
+	}
+	t.Fatalf("env = %#v, want %q (Claude Code's official config-dir override)", capture.options.Env, want)
+}
+
+func TestStartOmitsClaudeConfigDirWithoutAgentHome(t *testing.T) {
+	capture := &captureStarter{session: newFakeNativeSession()}
+	adapter := newAdapter(Options{}, capture.Start)
+	if _, err := adapter.Start(context.Background(), runtime.StartRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, kv := range capture.options.Env {
+		if strings.HasPrefix(kv, "CLAUDE_CONFIG_DIR=") {
+			t.Fatalf("env = %#v, must not set CLAUDE_CONFIG_DIR without an agent home", capture.options.Env)
+		}
 	}
 }

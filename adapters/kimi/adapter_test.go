@@ -266,3 +266,31 @@ func TestAdapterParity_Kimi(t *testing.T) {
 		})
 	}
 }
+
+func TestStartSetsKimiCodeHomeFromAgentHome(t *testing.T) {
+	capture := &captureStarter{session: newFakeSession("")}
+	adapter := newAdapter(Options{AgentHome: "/home/agent"}, capture.Start)
+	if _, err := adapter.Start(context.Background(), runtime.StartRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	want := "KIMI_CODE_HOME=/home/agent/.kimi-code"
+	for _, kv := range capture.options.Env {
+		if kv == want {
+			return
+		}
+	}
+	t.Fatalf("env = %#v, want %q (Kimi Code's official data-dir override)", capture.options.Env, want)
+}
+
+func TestStartOmitsKimiCodeHomeWithoutAgentHome(t *testing.T) {
+	capture := &captureStarter{session: newFakeSession("")}
+	adapter := newAdapter(Options{}, capture.Start)
+	if _, err := adapter.Start(context.Background(), runtime.StartRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, kv := range capture.options.Env {
+		if strings.HasPrefix(kv, "KIMI_CODE_HOME=") {
+			t.Fatalf("env = %#v, must not set KIMI_CODE_HOME without an agent home", capture.options.Env)
+		}
+	}
+}
