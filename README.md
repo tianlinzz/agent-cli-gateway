@@ -294,24 +294,24 @@ advertise their native CLI versions). The three CLIs are Node packages:
 |---|---|---|
 | Codex | `@openai/codex` | `codex` |
 | Claude Code | `@anthropic-ai/claude-code` | `claude` |
-| Kimi | *(pinned per deployment; see `adapters/kimi/SOURCE.md`)* | `kimi` |
+| Kimi | `@moonshot-ai/kimi-code` | `kimi` |
 
-**Path A — bake the CLIs (product image).** Build the base image, then the
-product image on top of it:
+**Path A — the product image (CLIs preinstalled).** The base image
+(`docker/base/Dockerfile`) bakes nginx, Go, Node 22, Python3, nsjail, and the
+three CLIs; the product image (root `Dockerfile`) builds on it:
 
 ```bash
-make image-base
-make image-product CODEX_VERSION=... CLAUDE_VERSION=...
+make image-base      # base: runtimes + nsjail + agent CLIs
+make image-product   # base + gateway/gateway-worker + startup contract
 ```
 
-`docker/Dockerfile.agents` layers Node.js and the pinned npm packages onto the
-base image, then mount (or let the entrypoint write) a config that enables
-them, e.g. `[agents.codex] enabled = true` + `command = ["codex"]`.
+Then mount (or let the entrypoint write) a config that enables the agents,
+e.g. `[agents.codex] enabled = true` + `command = ["codex"]`.
 
-> **The provided product image ships two agents (Codex + Claude Code).** Kimi's
-> published npm package name is not pinned in this repository, so it is not
-> installed by `docker/Dockerfile.agents`. A Kimi deployment must build its own
-> derived image (`FROM agent-gateway:…` then `RUN npm install -g <kimi-cli-package>@<pin>`).
+> CLI versions default to the npm `latest` tag; pass `CODEX_VERSION` /
+> `CLAUDE_VERSION` / `KIMI_VERSION` to pin, or empty to skip a CLI. Docker's
+> layer cache freezes a literal `latest` — pass an explicit version (or
+> `--no-cache`) to pick up newly published releases.
 
 **Path B — derived image or volume.** Extend the image yourself
 (`FROM agent-gateway:…` then `RUN npm install -g …`), or bind-mount a directory
@@ -370,8 +370,14 @@ cmd/gateway-worker   (one per session; the ONLY process that runs agent CLIs)
 
 ## Docker
 
+Two images: a base environment image and the product built on it.
+
 ```bash
-make docker            # docker build -t agent-gateway:dev .
+make image-base        # base: nginx, Go, Node 22, Python3, nsjail, agent CLIs
+                       # (docker build -f docker/base/Dockerfile
+                       #  -t agent-gateway-base:dev .)
+make image-product     # product: base + gateway/gateway-worker + startup
+                       # contract (-t agent-gateway:dev .)
 
 docker run --rm -it \
   --cap-drop=ALL \
@@ -380,10 +386,13 @@ docker run --rm -it \
   agent-gateway:dev
 ```
 
-The image is multi-stage: it compiles `google/nsjail` from a pinned tag
-(autoconf/bison/flex/libprotobuf/libnl), builds the Go binaries, and the
-runtime stage copies the nsjail binary plus its `ldd`-resolved shared libs and
-the agent CLIs the deployment needs. `docker/entrypoint.sh` prepares the
+The base image is a pure environment — no startup command: it installs
+nginx/git/python3 (plus a `python` alias), copies the Go toolchain and Node 22
+from the official images, compiles `google/nsjail` from a pinned tag
+(autoconf/bison/flex/libprotobuf/libnl) and installs its `ldd`-resolved shared
+libs, and `npm install`s the agent CLIs. The product image builds the Go
+binaries and layers them plus the startup contract onto the base:
+`docker/entrypoint.sh` prepares the
 runtime dirs, writes a default config when none is mounted, and `exec`s the
 Gateway beneath Tini. Tini runs as PID 1, forwards signals, and reaps orphaned
 descendants; the supervisor then

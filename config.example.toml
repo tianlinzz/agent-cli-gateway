@@ -96,6 +96,8 @@ root = "/srv/workspaces"
 # Path to the bbolt database file; REQUIRED when driver = "bbolt". The gateway
 # creates the parent directory (0700) and the file (0600).
 # path = "/var/lib/agent-gateway/meta.db"
+# Deployments keep this on a persistent volume (mount /var/lib/agent-gateway):
+# it holds the session/run records that must survive a gateway restart.
 # How long an Idempotency-Key record is retained. While retained, a duplicate
 # chat-completions request with the same key is rejected (409 in-progress /
 # conflict) or replays the stored non-streaming response instead of starting a
@@ -143,7 +145,8 @@ policy = "kafel"
 # The three agents default to DISABLED: the base image ships no agent CLIs, so
 # /v1/models advertises nothing until an operator enables an agent AND provides
 # its CLI. To make an agent available:
-#   1. install its CLI (see docker/Dockerfile.agents or a derived image), then
+#   1. install its CLI (all three ship in the base image — see
+#      docker/base/Dockerfile — or use a derived image), then
 #   2. set `enabled = true` AND `command` to the installed binary (argv array).
 # The gateway probes the executable (exec.LookPath on argv[0]) before
 # advertising it. The command is executed verbatim — never through a shell —
@@ -152,10 +155,25 @@ policy = "kafel"
 # ONE executable path (the whole string is argv[0], never shell syntax —
 # arguments must migrate to the array form); a future release rejects it.
 
+# Credentials and endpoints live in THIS file via `agents.<id>.env` — one
+# place for keys and base URLs, injected into the CLI process environment.
+# No native CLI config/auth files (~/.codex, ~/.claude, ~/.kimi) need to be
+# mounted: each session gets a fresh per-session agent-home automatically and
+# secrets arrive as env vars. Standard env names:
+#   codex:       OPENAI_API_KEY,     OPENAI_BASE_URL
+#   claude-code: ANTHROPIC_API_KEY,  ANTHROPIC_BASE_URL
+#   kimi:        MOONSHOT_API_KEY (base-url env per Kimi Code docs)
+# Codex's own sandbox is pinned to danger-full-access by the gateway on
+# purpose: the other codex sandbox modes block network egress, which would cut
+# the agent off from its provider. The nsjail boundary is the real isolation.
+
 [agents.codex]
 enabled = false
 # command = ["codex"]
 permission = "auto"
+# [agents.codex.env]
+# OPENAI_API_KEY = "sk-..."
+# OPENAI_BASE_URL = "https://your-openai-proxy.example.com/v1"
 # Forward the caller's system role messages into the native prompt each turn.
 # Default false: system messages are ignored so a client cannot pollute the
 # agent's own tool/skill surface. Set true to prepend them before the user turn.

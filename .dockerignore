@@ -6,7 +6,7 @@
 #
 # Source the Dockerfile needs stays included: cmd/, runtime/, worker/, api/,
 # adapters/, config/, workspace/, go.mod, go.sum, Makefile, Dockerfile, docker/
-# (entrypoint.sh).
+# (base Dockerfile + entrypoint.sh).
 
 # VCS / tooling
 .git/

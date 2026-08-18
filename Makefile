@@ -9,6 +9,20 @@ VERSION    := dev
 COMMIT     := $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
 BUILD_TIME := $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 
+# Target platform for image builds. The darwin dev host is arm64 but the
+# deployment targets are amd64; without this, building the base on one arch
+# and FROM-ing it on another fails with "no match for platform in manifest".
+# Override with PLATFORM=linux/arm64 (etc.) when needed.
+PLATFORM ?= linux/amd64
+
+# Agent CLI versions baked into the base image. Default to the
+# npm "latest" tag; pass explicit versions to pin, or empty to skip a CLI.
+# (A literal "latest" is cached by Docker's layer cache — pass an explicit
+# version or --no-cache to pick up newly published releases.)
+CODEX_VERSION  ?= latest
+CLAUDE_VERSION ?= latest
+KIMI_VERSION   ?= latest
+
 LDFLAGS := -s -w \
   -X main.version=$(VERSION) \
   -X main.commit=$(COMMIT) \
@@ -63,22 +77,23 @@ generate:
 	  --go-grpc_out=. --go-grpc_opt=paths=source_relative \
 	  worker/proto/worker.proto
 
-# Build the runtime image (multi-stage: nsjail builder + Go build + runtime).
-# The nsjail stage compiles google/nsjail on Linux; build with buildx when on
-# a darwin host, or in Linux CI. See Dockerfile for the full security model.
-docker:
-	docker build -t agent-gateway:$(VERSION) .
-
-# Build the lean base image (no agent CLIs; every agent disabled by default).
+# Build the base image (nginx + Go + Node 22 + Python3 + the agent CLIs +
+# nsjail; pure environment, no startup command). See docker/base/Dockerfile.
 image-base:
-	docker build -t agent-gateway:$(VERSION) .
-
-# Build the product image on top of the base image (adds Node.js + pinned CLIs
-# for Codex and Claude Code; Kimi is not shipped — see docker/Dockerfile.agents).
-# Override BASE_IMAGE and the per-provider version args as needed.
-image-product: image-base
-	docker build -f docker/Dockerfile.agents \
-	  --build-arg BASE_IMAGE=agent-gateway:$(VERSION) \
+	docker build --platform $(PLATFORM) -f docker/base/Dockerfile \
 	  --build-arg CODEX_VERSION=$(CODEX_VERSION) \
 	  --build-arg CLAUDE_VERSION=$(CLAUDE_VERSION) \
-	  -t agent-gateway:$(VERSION)-agents .
+	  --build-arg KIMI_VERSION=$(KIMI_VERSION) \
+	  -t agent-gateway-base:$(VERSION) .
+
+# Build the product image on top of the base image: adds the
+# gateway/gateway-worker binaries and the startup contract. The nsjail stage
+# in the base compiles on Linux; build with buildx when on a darwin host, or
+# in Linux CI. See Dockerfile for the full security model.
+image-product: image-base
+	docker build --platform $(PLATFORM) \
+	  --build-arg BASE_IMAGE=agent-gateway-base:$(VERSION) \
+	  -t agent-gateway:$(VERSION) .
+
+# Convenience alias for the full product image build.
+docker: image-product

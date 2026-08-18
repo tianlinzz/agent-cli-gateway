@@ -44,3 +44,4 @@
 /.github/                           @chenhg5
 /Makefile                           @chenhg5
 /Dockerfile                         @chenhg5
+/docker/base/Dockerfile              @chenhg5
