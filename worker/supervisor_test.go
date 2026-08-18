@@ -475,7 +475,7 @@ func TestSupervisor_DirectSpawnMapsWorkspaceAndPreservesHostHome(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	wantWorkspace, err := sup.resolver.Resolve("owner-1", "ws-1")
+	wantWorkspace, err := sup.resolver.Resolve("ws-1")
 	if err != nil {
 		t.Fatalf("resolve workspace: %v", err)
 	}

@@ -17,10 +17,6 @@ import (
 
 // Sentinel errors callers can match with errors.Is.
 var (
-	// ErrInvalidCallerID is returned when the owner id is empty or contains
-	// characters that could affect the resolved path (separators, NUL, dot
-	// segments).
-	ErrInvalidCallerID = errors.New("workspace: invalid owner id")
 	// ErrInvalidWorkspaceID is returned when the workspace id is empty or
 	// contains characters that could affect the resolved path.
 	ErrInvalidWorkspaceID = errors.New("workspace: invalid workspace id")
@@ -29,13 +25,17 @@ var (
 	ErrPathEscape = errors.New("workspace: resolved path escapes workspace root")
 )
 
-// Resolver maps (callerID, workspaceID) pairs to controlled absolute
-// directories under a fixed root. It is safe for concurrent use.
+// Resolver maps opaque workspace IDs to controlled absolute directories under
+// a fixed root. It is safe for concurrent use.
 //
-// Layout: <root>/callers/<caller-key>/workspaces/<workspace-key>. Keys are
-// stable, domain-separated hashes so external IDs never leak into paths. The
-// same workspace ID used by two callers resolves to two non-overlapping
-// directories.
+// Layout: <root>/workspaces/<workspace-key>. Keys are stable hashes so
+// external IDs never leak into paths and can never collide with the sibling
+// .agent-homes tree (the CLIs' persistent homes) that shares the root. The
+// layout is deliberately FLAT — one shared tree for every authenticated
+// caller: collaboration (a group of people, a Feishu group chat) simply means
+// sending the same workspace_id; per-user isolation, when wanted, is by id
+// convention ("alice-proj" — ids reject path separators, so the composition
+// stays one flat token).
 //
 // Symlink policy (fail-closed): the root is canonicalized (EvalSymlinks) once
 // at construction. At resolve time the lexical candidate is verified against
@@ -83,27 +83,24 @@ func (r *Resolver) Root() string {
 }
 
 // Resolve maps an opaque workspace_id to the absolute controlled directory
-// under the root, creating it (and the owner directory) on demand with 0700
-// permissions. The returned path is always inside Root and always absolute.
+// under the root, creating it on demand with 0700 permissions. The returned
+// path is always inside Root and always absolute. Every authenticated caller
+// sending the same id resolves to the same directory (the shared,
+// group-collaboration model).
 //
-// callerID and workspaceID are opaque tokens: they must be non-empty, must not
-// contain path separators ('/' or the Windows '\' as a robustness check), must
-// not be "." or "..", and must not contain a NUL byte. URL-encoded traversal
+// workspaceID is an opaque token: it must be non-empty, must not contain
+// path separators ('/' or the Windows '\' as a robustness check), must not
+// be "." or "..", and must not contain a NUL byte. URL-encoded traversal
 // sequences (e.g. "..%2f") are treated as literal characters, never decoded,
-// so they are inert. Containment is verified both lexically (before mkdir) and
-// after symlink resolution (after mkdir).
-func (r *Resolver) Resolve(callerID, workspaceID string) (string, error) {
-	if err := validateToken(callerID, ErrInvalidCallerID); err != nil {
-		return "", err
-	}
+// so they are inert. Containment is verified both lexically (before mkdir)
+// and after symlink resolution (after mkdir).
+func (r *Resolver) Resolve(workspaceID string) (string, error) {
 	if err := validateToken(workspaceID, ErrInvalidWorkspaceID); err != nil {
 		return "", err
 	}
 
 	candidate := filepath.Join(
 		r.root,
-		"callers",
-		pathKey("caller", callerID),
 		"workspaces",
 		pathKey("workspace", workspaceID),
 	)

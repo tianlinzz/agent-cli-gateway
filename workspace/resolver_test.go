@@ -50,9 +50,9 @@ func newTestResolver(t *testing.T) (*workspace.Resolver, string) {
 func TestResolverResolvesValidID(t *testing.T) {
 	r, root := newTestResolver(t)
 
-	got, err := r.Resolve("alice", "my-workspace")
+	got, err := r.Resolve("my-workspace")
 	if err != nil {
-		t.Fatalf("Resolve(alice, my-workspace): %v", err)
+		t.Fatalf("Resolve(my-workspace): %v", err)
 	}
 	assertInsideRoot(t, root, got)
 
@@ -66,7 +66,7 @@ func TestResolverResolvesValidID(t *testing.T) {
 	}
 
 	// Resolving the same ID again must be idempotent.
-	again, err := r.Resolve("alice", "my-workspace")
+	again, err := r.Resolve("my-workspace")
 	if err != nil {
 		t.Fatalf("second Resolve: %v", err)
 	}
@@ -75,21 +75,52 @@ func TestResolverResolvesValidID(t *testing.T) {
 	}
 }
 
-func TestResolverHashesCallerAndWorkspaceIDs(t *testing.T) {
+// TestResolverFlatSharedLayout pins the collaboration model: the layout is one
+// flat shared tree — the same workspace_id always resolves to the same
+// directory (whoever asks), and different ids resolve to distinct,
+// non-overlapping directories under <root>/workspaces/.
+func TestResolverFlatSharedLayout(t *testing.T) {
+	r, root := newTestResolver(t)
+
+	a, err := r.Resolve("group-proj")
+	if err != nil {
+		t.Fatalf("Resolve(group-proj): %v", err)
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", root, err)
+	}
+	workspacesDir := filepath.Join(canonicalRoot, "workspaces")
+	if !strings.HasPrefix(a, workspacesDir+string(filepath.Separator)) {
+		t.Fatalf("resolved path %q is not under <root>/workspaces/", a)
+	}
+
+	b, err := r.Resolve("other")
+	if err != nil {
+		t.Fatalf("Resolve(other): %v", err)
+	}
+	if a == b {
+		t.Fatalf("different ids resolved to the same directory %q", a)
+	}
+	if strings.HasPrefix(b, a+string(filepath.Separator)) || strings.HasPrefix(a, b+string(filepath.Separator)) {
+		t.Fatalf("workspaces overlap: %q and %q", a, b)
+	}
+}
+
+// TestResolverHashesWorkspaceIDs: external identifiers never leak into paths,
+// so a hostile or guessable id can neither traverse nor collide with the
+// sibling .agent-homes tree by name.
+func TestResolverHashesWorkspaceIDs(t *testing.T) {
 	r, _ := newTestResolver(t)
-	got, err := r.Resolve("caller-a", "project-secret-name")
+	got, err := r.Resolve("project-secret-name")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if strings.Contains(got, "caller-a") || strings.Contains(got, "project-secret-name") {
+	if strings.Contains(got, "project-secret-name") {
 		t.Fatalf("resolved path leaks external identifiers: %q", got)
 	}
-	otherCaller, err := r.Resolve("caller-b", "project-secret-name")
-	if err != nil {
-		t.Fatalf("Resolve(other caller): %v", err)
-	}
-	if got == otherCaller {
-		t.Fatalf("different callers resolved to same workspace: %q", got)
+	if strings.Contains(got, ".agent-homes") {
+		t.Fatalf("resolved path %q collides with the agent-homes tree", got)
 	}
 }
 
@@ -97,41 +128,39 @@ func TestResolverRejectsInvalidIDs(t *testing.T) {
 	r, _ := newTestResolver(t)
 
 	cases := []struct {
-		name  string
-		owner string
-		id    string
+		name string
+		id   string
 	}{
 		// Path traversal via relative dot segments.
-		{"dotdot", "alice", ".."},
-		{"dotdot slash", "alice", "../"},
-		{"dotdot with name", "alice", "../etc"},
-		{"nested traversal", "alice", "a/../../etc"},
-		{"trailing traversal", "alice", "ok/.."},
-		{"single dot", "alice", "."},
-		{"dotdot with spaces", "alice", " .. "},
+		{"dotdot", ".."},
+		{"dotdot slash", "../"},
+		{"dotdot with name", "../etc"},
+		{"nested traversal", "a/../../etc"},
+		{"trailing traversal", "ok/.."},
+		{"single dot", "."},
+		{"dotdot with spaces", " .. "},
 
 		// Absolute paths must never be accepted.
-		{"absolute unix", "alice", "/etc"},
-		{"absolute nested", "alice", "/var/tmp/x"},
-		{"double slash", "alice", "//server/share"},
+		{"absolute unix", "/etc"},
+		{"absolute nested", "/var/tmp/x"},
+		{"double slash", "//server/share"},
 
 		// Windows-style separators and drive letters (robustness check).
-		{"windows backslash", "alice", `..\..\etc`},
-		{"windows drive", "alice", `C:\Windows\System32`},
-		{"windows drive lowercase", "alice", `c:/Windows`},
+		{"windows backslash", `..\..\etc`},
+		{"windows drive", `C:\Windows\System32`},
+		{"windows drive lowercase", `c:/Windows`},
 
 		// Embedded NUL must be rejected outright.
-		{"embedded null", "alice", "a\x00b"},
+		{"embedded null", "a\x00b"},
 
 		// Empty IDs are never valid.
-		{"empty owner", "", "ws1"},
-		{"empty workspace", "alice", ""},
-		{"blank workspace", "alice", "   "},
+		{"empty workspace", ""},
+		{"blank workspace", "   "},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := r.Resolve(tc.owner, tc.id); err == nil {
-				t.Fatalf("Resolve(%q, %q) succeeded, want error", tc.owner, tc.id)
+			if _, err := r.Resolve(tc.id); err == nil {
+				t.Fatalf("Resolve(%q) succeeded, want error", tc.id)
 			}
 		})
 	}
@@ -151,9 +180,9 @@ func TestResolverEncodedTraversalStaysInsideRoot(t *testing.T) {
 		"..%252f",
 		"..%00",
 	} {
-		got, err := r.Resolve("alice", id)
+		got, err := r.Resolve(id)
 		if err != nil {
-			t.Fatalf("Resolve(alice, %q): %v", id, err)
+			t.Fatalf("Resolve(%q): %v", id, err)
 		}
 		assertInsideRoot(t, root, got)
 	}
@@ -185,35 +214,9 @@ func TestResolverRejectsEmptyRoot(t *testing.T) {
 	}
 }
 
-// TestResolverScopesByCaller is the caller-binding regression: the same opaque
-// workspace_id under different callers must resolve to different, non-overlapping
-// directories, and both must stay inside the root. No cross-owner collision and
-// no cross-owner path can ever be produced.
-func TestResolverScopesByCaller(t *testing.T) {
-	r, root := newTestResolver(t)
-
-	a, err := r.Resolve("alice", "default")
-	if err != nil {
-		t.Fatalf("Resolve(alice, default): %v", err)
-	}
-	b, err := r.Resolve("bob", "default")
-	if err != nil {
-		t.Fatalf("Resolve(bob, default): %v", err)
-	}
-	assertInsideRoot(t, root, a)
-	assertInsideRoot(t, root, b)
-
-	if a == b {
-		t.Fatalf("different owners resolved to the same directory %q", a)
-	}
-	if strings.HasPrefix(b, a+string(filepath.Separator)) {
-		t.Fatalf("bob's workspace %q lives inside alice's workspace %q", b, a)
-	}
-}
-
 // TestResolverRejectsSymlinkEscape pins the fail-closed symlink policy: a
-// workspace or owner directory that is a symlink pointing outside the root must
-// be rejected at resolve time, so a symlink planted in the root can never be
+// workspace directory that is a symlink pointing outside the root must be
+// rejected at resolve time, so a symlink planted in the root can never be
 // bind-mounted as a host path.
 func TestResolverRejectsSymlinkEscape(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "wsroot")
@@ -232,42 +235,37 @@ func TestResolverRejectsSymlinkEscape(t *testing.T) {
 	}
 
 	// Resolve once to discover the server-generated path, then replace the
-	// leaf/parent with hostile symlinks as an attacker would.
-	seed, err := r.Resolve("alice", "evil")
+	// leaf with a hostile symlink as an attacker would.
+	seed, err := r.Resolve("evil")
 	if err != nil {
 		t.Fatalf("seed resolve: %v", err)
 	}
 	if err := os.Remove(seed); err != nil {
 		t.Fatalf("remove seed: %v", err)
 	}
-	// Symlink escape via the workspace leaf.
 	if err := os.Symlink(outside, seed); err != nil {
 		t.Skipf("symlink unsupported: %v", err)
 	}
-	if _, err := r.Resolve("alice", "evil"); err == nil {
+	if _, err := r.Resolve("evil"); err == nil {
 		t.Fatal("Resolve through a workspace symlink escaped the root and was not rejected")
 	}
 
-	// Symlink escape via the owner component.
-	ownerPath, err := r.Resolve("mallory", "ws1")
-	if err != nil {
-		t.Fatalf("seed owner resolve: %v", err)
+	// Symlink escape via the parent workspaces/ component.
+	parent := filepath.Dir(seed)
+	if err := os.RemoveAll(parent); err != nil {
+		t.Fatalf("remove workspaces dir: %v", err)
 	}
-	callerDir := filepath.Dir(filepath.Dir(ownerPath))
-	if err := os.RemoveAll(callerDir); err != nil {
-		t.Fatalf("remove caller dir: %v", err)
-	}
-	if err := os.Symlink(outside, callerDir); err != nil {
+	if err := os.Symlink(outside, parent); err != nil {
 		t.Skipf("symlink unsupported: %v", err)
 	}
-	if _, err := r.Resolve("mallory", "ws1"); err == nil {
-		t.Fatal("Resolve through an owner symlink escaped the root and was not rejected")
+	if _, err := r.Resolve("ws1"); err == nil {
+		t.Fatal("Resolve through the workspaces-dir symlink escaped the root and was not rejected")
 	}
 }
 
 // TestResolver_RejectsPathEqualToRoot pins the fail-closed rule that a path
 // equal to the root is itself an escape. filepath.Rel(root, root) returns "."
-// (not ".."), so the old containment check missed it: a symlink under <owner>/
+// (not ".."), so the old containment check missed it: a symlink under the tree
 // pointing back at the root resolved to the root directory itself, which would
 // let a bind-mount expose every tenant's workspace. Resolve must reject it.
 func TestResolver_RejectsPathEqualToRoot(t *testing.T) {
@@ -280,7 +278,7 @@ func TestResolver_RejectsPathEqualToRoot(t *testing.T) {
 		t.Fatalf("NewResolver: %v", err)
 	}
 
-	seed, err := r.Resolve("alice", "back-to-root")
+	seed, err := r.Resolve("back-to-root")
 	if err != nil {
 		t.Fatalf("seed resolve: %v", err)
 	}
@@ -292,7 +290,7 @@ func TestResolver_RejectsPathEqualToRoot(t *testing.T) {
 	if err := os.Symlink(root, seed); err != nil {
 		t.Skipf("symlink unsupported: %v", err)
 	}
-	if _, err := r.Resolve("alice", "back-to-root"); !errors.Is(err, workspace.ErrPathEscape) {
+	if _, err := r.Resolve("back-to-root"); !errors.Is(err, workspace.ErrPathEscape) {
 		t.Fatalf("Resolve of a path equal to the root: got %v, want ErrPathEscape", err)
 	}
 }
@@ -308,7 +306,7 @@ func TestResolverConcurrentResolve(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			results[i], errs[i] = r.Resolve("alice", "shared")
+			results[i], errs[i] = r.Resolve("shared")
 		}(i)
 	}
 	wg.Wait()

@@ -78,8 +78,15 @@ callers = [{ id = "example-client", tokens = ["change-me"] }]
 # enforced OUTSIDE the gateway: mount the workspace root on a quota-capable
 # filesystem (project quotas, XFS/ZFS refquota, or per-volume size limits) —
 # the writable bind mount alone cannot bound aggregate disk usage.
-# Directory all opaque workspace_ids resolve under. Only the server owns this
+# Directory all workspace_ids resolve under. Only the server owns this
 # path; clients reference workspaces by opaque ID and can never inject a path.
+# Layout is FLAT and shared: <root>/workspaces/<hashed-id> — every
+# authenticated caller sending the same workspace_id lands in the SAME
+# directory (files and agent memory included), which is the group-collab
+# model (a Feishu group = one workspace_id). Per-user isolation, when
+# wanted, is an id convention: compose the user into the id ("alice-proj");
+# ids reject path separators, so the composition stays one flat token.
+# The sibling <root>/.agent-homes tree holds the CLIs' persistent homes.
 root = "/srv/workspaces"
 
 [store]
@@ -125,7 +132,7 @@ clone_newpid = true
 workspace_dir = "/workspace"
 agent_home_dir = "/home/agent"
 # Where the agent CLIs' own home directories (memory, session records, login
-# state) live. "workspace" gives every (owner, workspace) one persistent home
+# state) live. "workspace" gives every workspace one persistent home
 # under <workspace root>/.agent-homes/...: mounted as /home/agent (HOME), with
 # each CLI's official directory override pointing inside (CLAUDE_CONFIG_DIR /
 # CODEX_HOME / KIMI_CODE_HOME). The CLIs keep their fixed dirs across

@@ -20,12 +20,13 @@ func TestResolveAgentHomeDirSessionPolicyUsesEphemeralHome(t *testing.T) {
 
 func TestResolveAgentHomeDirWorkspacePolicyKeysHomeByWorkspace(t *testing.T) {
 	const root = "/srv/workspaces"
-	got, err := resolveAgentHomeDir("workspace", root, filepath.Join(root, "alice", "proj"), "/runtime/sessions/x")
+	wsDir := filepath.Join(root, "workspaces", "workspace-abc123")
+	got, err := resolveAgentHomeDir("workspace", root, wsDir, "/runtime/sessions/x")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := filepath.Join(root, ".agent-homes", "alice", "proj"); got != want {
-		t.Fatalf("agent home = %q, want %q (one persistent home per owner workspace)", got, want)
+	if want := filepath.Join(root, ".agent-homes", "workspace-abc123"); got != want {
+		t.Fatalf("agent home = %q, want %q (one persistent home keyed by the workspace)", got, want)
 	}
 }
 

@@ -301,7 +301,7 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 	// Resolve the opaque workspace_id to the real controlled directory. The
 	// resolver guarantees the result stays inside the configured root, and the
 	// nsjail mount namespace is the second boundary.
-	wsDir, err := s.resolver.Resolve(req.CallerID, req.WorkspaceID)
+	wsDir, err := s.resolver.Resolve(req.WorkspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("worker: start session %q: resolve workspace: %w", req.SessionID, err)
 	}
@@ -681,7 +681,7 @@ func shortID(s string) string {
 //
 // The "session" policy gives each gateway session a fresh ephemeral home
 // under the runtime dir (strictest isolation, no cross-session memory). The
-// "workspace" policy gives every (owner, workspace) one persistent home under
+// "workspace" policy gives every workspace one persistent home under
 // "<workspace root>/.agent-homes/<owner-scoped workspace path>": memory and
 // login state survive sessions and restarts, stay inside the workspace's
 // existing trust domain, and the cwd-keyed project buckets the CLIs keep
@@ -697,7 +697,10 @@ func resolveAgentHomeDir(policy, workspaceRoot, wsDir, sessionDir string) (strin
 			filepath.IsAbs(rel) {
 			return "", fmt.Errorf("agent home: workspace dir %q escapes root %q", wsDir, workspaceRoot)
 		}
-		return filepath.Join(workspaceRoot, ".agent-homes", rel), nil
+		// Key the home by the workspace's hashed directory name (the resolver
+		// layout is <root>/workspaces/<workspace-key>), so .agent-homes stays
+		// a flat sibling of the workspace tree.
+		return filepath.Join(workspaceRoot, ".agent-homes", filepath.Base(rel)), nil
 	default:
 		return "", fmt.Errorf("agent home: unknown agent_home_policy %q", policy)
 	}

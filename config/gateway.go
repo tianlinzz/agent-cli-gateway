@@ -247,7 +247,7 @@ type MountsConfig struct {
 	//   "session" (default) — a fresh ephemeral home per gateway session
 	//       under the runtime dir. Strictest isolation, but the CLIs' memory
 	//       and login state die with the session.
-	//   "workspace" — one persistent home per (owner, workspace) under
+	//   "workspace" — one persistent home per workspace under
 	//       "<workspace root>/.agent-homes/...": memory, transcripts, and
 	//       login state survive sessions and restarts and are shared only
 	//       within the workspace's existing trust domain. The gateway never
