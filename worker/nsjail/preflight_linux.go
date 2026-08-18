@@ -44,6 +44,8 @@ func minimalJail(ctx context.Context, iso config.IsolationConfig) error {
 		WorkspaceDir: ws,
 		AgentHomeDir: ws,
 		SocketDir:    ws,
+		SocketPath:   filepath.Join(ws, "w.sock"),
+		ParentPath:   os.Getenv("PATH"),
 	}, "preflight")
 	if err != nil {
 		return fmt.Errorf("nsjail: preflight: build minimal profile: %w", err)

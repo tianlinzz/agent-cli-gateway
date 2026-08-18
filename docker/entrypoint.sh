@@ -28,6 +28,10 @@ mkdir -p "$WORKSPACE_ROOT" "$RUNTIME_DIR"
 # requires nsjail (fail-closed) at /usr/local/bin/nsjail and pins the same
 # version the image was built from; deployments override by mounting their own
 # config at GATEWAY_CONFIG.
+if [ -d "$CONFIG_PATH" ]; then
+  echo "[entrypoint] FATAL: $CONFIG_PATH is a directory — the config was mounted as a ConfigMap/Secret directory instead of a file. Mount with subPath (mountPath: $CONFIG_PATH + subPath: gateway.toml) or mount the parent directory instead." >&2
+  exit 1
+fi
 if [ ! -f "$CONFIG_PATH" ]; then
   mkdir -p "$(dirname "$CONFIG_PATH")"
   {

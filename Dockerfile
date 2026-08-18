@@ -81,6 +81,11 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/gateway ./cmd/gateway \
 # /v1/models advertises nothing out of the box.
 FROM ${BASE_IMAGE}
 
+# The gateway process runs from /: the runtime-dir default ("gateway-run"
+# under cwd) must land on the ephemeral container layer, never on the
+# workspace volume. All data locations are absolute, from the config.
+WORKDIR /
+
 # Go binaries: gateway (API + supervisor) and gateway-worker (worker child).
 COPY --from=gobuild /out/gateway /usr/local/bin/gateway
 COPY --from=gobuild /out/gateway-worker /usr/local/bin/gateway-worker

@@ -27,6 +27,8 @@ func testLayout(t *testing.T) SessionLayout {
 		WorkspaceDir: ws,
 		AgentHomeDir: home,
 		SocketDir:    sock,
+		SocketPath:   filepath.Join(sock, "w.sock"),
+		ParentPath:   "/usr/test-bin",
 	}
 }
 
@@ -45,7 +47,6 @@ func TestBuildProfile_KafelDefaults(t *testing.T) {
 		"mode: ONCE;",
 		"time_limit: 0;",
 		"clone_newns: true;",
-		"clone_newroot: true;",
 		"clone_newpid: true;",
 		"clone_newnet: false;",
 		`uidmap: { inside_id: "65532"; outside_id: "65532"; count: 1; };`,
@@ -57,11 +58,13 @@ func TestBuildProfile_KafelDefaults(t *testing.T) {
 		`mount: { src: "` + layout.SocketDir + `"; dst: "` + layout.SocketDir + `"; is_bind: true; rw: true; mandatory: true; };`,
 		`mount: { dst: "/tmp"; fstype: "tmpfs"; options: "size=256m"; rw: true; mandatory: true; };`,
 		`mount: { dst: "/proc"; fstype: "proc"; rw: false; mandatory: true; } ;`,
-		`keep_env: "GW_WORKER_SOCKET";`,
-		`keep_env: "GW_WORKER_SESSION_ID";`,
-		`keep_env: "GW_WORKSPACE_DIR";`,
-		`keep_env: "GW_AGENT_HOME";`,
-		`env: { key: "HOME"; value: "/home/agent"; };`,
+		`envar: "PATH=/usr/test-bin";`,
+		`envar: "HOME=/home/agent";`,
+		`envar: "TMPDIR=/tmp";`,
+		`envar: "GW_WORKER_SOCKET=` + layout.SocketPath + `";`,
+		`envar: "GW_WORKER_SESSION_ID=sess-1";`,
+		`envar: "GW_WORKSPACE_DIR=/workspace";`,
+		`envar: "GW_AGENT_HOME=/home/agent";`,
 		`cwd: "/workspace";`,
 	} {
 		if !strings.Contains(c, want) {
@@ -136,29 +139,37 @@ func TestBuildProfile_MountsScopedToThisSession(t *testing.T) {
 	if got := strings.Count(c, "is_bind: true"); got < 3 {
 		t.Errorf("bind mounts = %d, want at least the three session mounts", got)
 	}
-	if !strings.Contains(c, "clone_newroot: true") {
-		t.Fatal("profile must create a private root filesystem")
+	// The private mount namespace (plus nsjail's chroot handling) is what
+	// walls the jail off from the host filesystem; upstream nsjail has no
+	// clone_newroot field.
+	if !strings.Contains(c, "clone_newns: true") {
+		t.Fatal("profile must create a private mount namespace")
 	}
 }
 
-// TestBuildProfile_KeepEnvCoversWorkerPlacementVars is the regression test for
-// the missing-keep_env bug: the supervisor passes the worker its placement
-// (GW_WORKSPACE_DIR, GW_AGENT_HOME) and identity (GW_WORKER_SOCKET,
-// GW_WORKER_SESSION_ID) through the process environment, and nsjail's
-// keep_env drops every unlisted variable — so the default profile must list
-// all four or the jailed worker reads them as empty (empty WorkspaceDir /
-// AgentHome in the adapter config, and sandbox_capabilities losing its
-// "nsjail" marker which is keyed off GW_AGENT_HOME).
-func TestBuildProfile_KeepEnvCoversWorkerPlacementVars(t *testing.T) {
+// TestBuildProfile_EnvarCoversWorkerPlacementVars is the regression test for
+// the phantom keep_env syntax: nsjail's keep_env is a BOOL (pass the entire
+// parent environment) and its per-variable mechanism is repeated-string
+// `envar: "K=V"`. The old generator emitted `keep_env: "VAR"` name lists and
+// `env: {key,value}` blocks — neither exists in the nsjail schema, so the
+// pinned binary failed preflight with a TextProto parse error and readiness
+// reported 503. The profile must set every placement/identity var the jailed
+// worker reads (GW_WORKSPACE_DIR, GW_AGENT_HOME, GW_WORKER_SOCKET,
+// GW_WORKER_SESSION_ID — sandbox_capabilities keys its "nsjail" marker off
+// GW_AGENT_HOME) via envar entries, and must NOT enable keep_env.
+func TestBuildProfile_EnvarCoversWorkerPlacementVars(t *testing.T) {
 	iso := config.DefaultGatewayConfig().Isolation
 	p, err := Build(iso, testLayout(t), "sess-keepenv")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 	for _, v := range []string{"GW_WORKER_SOCKET", "GW_WORKER_SESSION_ID", "GW_WORKSPACE_DIR", "GW_AGENT_HOME"} {
-		if want := `keep_env: "` + v + `";`; !strings.Contains(p.Config, want) {
-			t.Errorf("profile missing %s (jailed worker would read %s as empty)", want, v)
+		if !strings.Contains(p.Config, `envar: "`+v+`=`) {
+			t.Errorf("profile missing envar for %s (jailed worker would read %s as empty)", v, v)
 		}
+	}
+	if strings.Contains(p.Config, "keep_env") {
+		t.Error("profile must not use keep_env: nsjail's keep_env is a bool that would pass the gateway's whole environment into the jail")
 	}
 }
 
@@ -191,7 +202,7 @@ func TestBuildProfile_CustomMountDirs(t *testing.T) {
 	if !strings.Contains(c, `uidmap: { inside_id: "4242"; outside_id: "4242"; count: 1; };`) {
 		t.Errorf("custom uid mapping missing: %s", c)
 	}
-	if !strings.Contains(c, `env: { key: "HOME"; value: "/var/agent-home"; };`) {
+	if !strings.Contains(c, `envar: "HOME=/var/agent-home";`) {
 		t.Errorf("HOME env must point at the agent home: %s", c)
 	}
 }
@@ -289,8 +300,15 @@ func TestKafelPolicyForArch(t *testing.T) {
 	if !strings.Contains(x86, "POLICY x86_64 {") {
 		t.Errorf("amd64 policy must declare x86_64")
 	}
-	if !strings.Contains(x86, "arch_prctl") || !strings.Contains(x86, "mmap2") {
+	// arch_prctl is the remaining genuinely x86_64-only syscall; the legacy
+	// 32-bit aliases (mmap2, stat64, *32...) are invalid identifiers on every
+	// 64-bit ISA and are gone from both policies (they once broke kafel
+	// compilation with "Undefined identifier").
+	if !strings.Contains(x86, "arch_prctl") {
 		t.Error("x86_64 policy must keep x86-only syscalls")
+	}
+	if strings.Contains(x86, "mmap2") || strings.Contains(x86, "stat64") {
+		t.Error("x86_64 policy must not contain 32-bit-only syscall aliases kafel rejects")
 	}
 
 	arm, err := kafelPolicyForArch("arm64")
@@ -421,5 +439,38 @@ func TestBuild_TmpfsSizeAndFsizeConfigurable(t *testing.T) {
 	}
 	if !strings.Contains(prof.Config, "rlimit_fsize: 67108864;") {
 		t.Errorf("rlimit_fsize missing:\n%s", prof.Config)
+	}
+}
+
+// TestBuildProfileEmitsOnlyNsjailCloneFields is the regression guard for the
+// phantom-field bug: the generator once emitted `clone_newroot`, which does
+// not exist in upstream nsjail (the fresh root comes from clone_newns plus
+// nsjail's chroot handling), so the pinned binary failed preflight with
+// "Message type nsjail.NsJailConfig has no field named clone_newroot" and
+// readiness reported 503. Every clone_new* field the profile emits must be a
+// real field of the nsjail config schema.
+func TestBuildProfileEmitsOnlyNsjailCloneFields(t *testing.T) {
+	allowed := map[string]bool{
+		"clone_newns":   true,
+		"clone_newuser": true,
+		"clone_newpid":  true,
+		"clone_newnet":  true,
+		"clone_newipc":  true,
+		"clone_newuts":  true,
+	}
+	p, err := Build(config.DefaultGatewayConfig().Isolation, testLayout(t), "sess-1")
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, line := range strings.Split(p.Config, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "clone_new") {
+			continue
+		}
+		field := strings.TrimSuffix(strings.TrimSuffix(line, ";"), ": true")
+		field = strings.TrimSuffix(field, ": false")
+		if !allowed[strings.TrimSpace(field)] {
+			t.Fatalf("profile emits %q, not a field of the nsjail config schema (phantom field breaks preflight)", line)
+		}
 	}
 }

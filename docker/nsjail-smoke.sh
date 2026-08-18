@@ -37,15 +37,16 @@ grep -q 'seccomp_string: "POLICY ' "$SMOKE_DIR/profile.conf"
 grep -q 'clone_newpid: true;' "$SMOKE_DIR/profile.conf"
 grep -q 'mount: { dst: "/proc"; fstype: "proc"' "$SMOKE_DIR/profile.conf"
 
-echo "== keep_env passes the worker placement vars into the jail =="
-# Regression for the missing-keep_env bug: nsjail drops every env var not in
-# keep_env, so GW_WORKSPACE_DIR/GW_AGENT_HOME must be listed AND must actually
-# survive into the jailed process (the worker resolves its workspace/agent
-# home from them and keys its nsjail sandbox capability off GW_AGENT_HOME).
-grep -q 'keep_env: "GW_WORKSPACE_DIR";' "$SMOKE_DIR/profile.conf"
-grep -q 'keep_env: "GW_AGENT_HOME";' "$SMOKE_DIR/profile.conf"
-GW_WORKSPACE_DIR=/workspace GW_AGENT_HOME=/home/agent \
-  "$NSJAIL_BIN" -Mo --config "$SMOKE_DIR/profile.conf" -- \
+echo "== envar sets the worker placement vars inside the jail =="
+# Regression for the phantom keep_env syntax: nsjail's keep_env is a bool
+# (pass EVERYTHING) and per-variable selection is repeated-string
+# envar "K=V" entries. GW_WORKSPACE_DIR/GW_AGENT_HOME must be set via envar
+# AND must actually reach the jailed process (the worker resolves its
+# workspace/agent home from them and keys its nsjail sandbox capability off
+# GW_AGENT_HOME).
+grep -q 'envar: "GW_WORKSPACE_DIR=/workspace";' "$SMOKE_DIR/profile.conf"
+grep -q 'envar: "GW_AGENT_HOME=/home/agent";' "$SMOKE_DIR/profile.conf"
+"$NSJAIL_BIN" -Mo --config "$SMOKE_DIR/profile.conf" -- \
   /bin/sh -c 'test "$GW_WORKSPACE_DIR" = /workspace && test "$GW_AGENT_HOME" = /home/agent'
 
 echo "== minimal jail with the real profile =="

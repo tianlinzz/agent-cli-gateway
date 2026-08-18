@@ -334,14 +334,17 @@ func (s *Supervisor) StartSession(ctx context.Context, req runtime.StartRequest)
 		if err := nsjail.ValidateBinary(s.cfg.Isolation.BinaryPath); err != nil {
 			return nil, fmt.Errorf("worker: start session %q: %w", req.SessionID, err)
 		}
-		// KeepEnv is left empty so the profile uses nsjail's defaultKeepEnv as
-		// the single source of truth; the same defaults back the
-		// -print-nsjail-profile diagnostic, so the Linux-CI smoke tests exactly
-		// the keep_env list this spawn relies on.
+		// The profile carries the worker's placement/identity env explicitly
+		// (nsjail clears the child env; keep_env-as-a-bool would leak the
+		// gateway's own environment into the jail). The same layout backs the
+		// -print-nsjail-profile diagnostic, so the Linux-CI smoke tests
+		// exactly the envar set this spawn relies on.
 		prof, err := nsjail.Build(s.cfg.Isolation, nsjail.SessionLayout{
 			WorkspaceDir: wsDir,
 			AgentHomeDir: agentHomeDir,
 			SocketDir:    socketDir,
+			SocketPath:   socketPath,
+			ParentPath:   os.Getenv("PATH"),
 		}, req.SessionID)
 		if err != nil {
 			return nil, fmt.Errorf("worker: start session %q: build nsjail profile: %w", req.SessionID, err)

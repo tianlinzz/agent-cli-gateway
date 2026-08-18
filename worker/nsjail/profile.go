@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -34,9 +33,12 @@ type SessionLayout struct {
 	// same path inside the jail so the worker and the supervisor share one
 	// identical socket path.
 	SocketDir string
-	// KeepEnv lists environment variables passed through to the jailed worker.
-	// When empty the defaults (defaultKeepEnv) are used.
-	KeepEnv []string
+	// SocketPath is the unix socket path (inside SocketDir) the jailed worker
+	// dials; emitted into the profile as GW_WORKER_SOCKET.
+	SocketPath string
+	// ParentPath is the supervisor's PATH, passed into the jail so the CLIs
+	// resolve. Empty falls back to a standard system default.
+	ParentPath string
 }
 
 // Profile is the assembled nsjail configuration for one session.
@@ -104,8 +106,10 @@ func Build(iso config.IsolationConfig, layout SessionLayout, sessionID string) (
 	// namespace is per-jail by default (CloneNewPID): the worker becomes PID 1,
 	// so a killed nsjail wrapper reaps the whole tree and a compromised agent
 	// can no longer signal the gateway or sibling sessions.
+	// The fresh root comes from clone_newns plus nsjail's chroot handling —
+	// upstream nsjail has no clone_newroot field (a phantom field makes the
+	// pinned binary fail preflight with "has no field named").
 	b.WriteString("clone_newns: true;\n")
-	b.WriteString("clone_newroot: true;\n")
 	if iso.CloneNewPID {
 		b.WriteString("clone_newpid: true;\n")
 	} else {
@@ -186,16 +190,28 @@ func Build(iso config.IsolationConfig, layout SessionLayout, sessionID string) (
 	}
 	b.WriteString("\n")
 
-	keepEnv := layout.KeepEnv
-	if len(keepEnv) == 0 {
-		keepEnv = defaultKeepEnv
+	// Environment: nsjail clears the child environment by default. nsjail's
+	// keep_env is a BOOL that passes the ENTIRE parent environment — never
+	// enable it here, it would leak the gateway's own environment (including
+	// auth tokens) into the jail. The real schema selects variables via
+	// repeated-string envar entries ("KEY=VALUE"), so every var the jailed
+	// worker needs is set explicitly: placement/identity (mirroring what the
+	// supervisor injects for non-isolated runs) plus the CLI basics.
+	path := layout.ParentPath
+	if strings.TrimSpace(path) == "" {
+		path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	}
-	for _, k := range dedupe(keepEnv) {
-		fmt.Fprintf(&b, "keep_env: %q;\n", k)
+	for _, kv := range []string{
+		"PATH=" + path,
+		"HOME=" + mounts.AgentHomeDir,
+		"TMPDIR=" + mounts.TmpDir,
+		"GW_WORKER_SOCKET=" + layout.SocketPath,
+		"GW_WORKER_SESSION_ID=" + sessionID,
+		"GW_WORKSPACE_DIR=" + mounts.WorkspaceDir,
+		"GW_AGENT_HOME=" + mounts.AgentHomeDir,
+	} {
+		fmt.Fprintf(&b, "envar: %q;\n", kv)
 	}
-	// HOME points at the per-session agent home inside the jail.
-	fmt.Fprintf(&b, "env: { key: \"HOME\"; value: %q; };\n", mounts.AgentHomeDir)
-	fmt.Fprintf(&b, "env: { key: \"TMPDIR\"; value: %q; };\n", mounts.TmpDir)
 	fmt.Fprintf(&b, "cwd: %q;\n", mounts.WorkspaceDir)
 
 	return Profile{
@@ -270,67 +286,42 @@ func itoa(v int) string {
 	return fmt.Sprintf("%d", v)
 }
 
-func dedupe(in []string) []string {
-	seen := make(map[string]struct{}, len(in))
-	out := make([]string, 0, len(in))
-	for _, s := range in {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			continue
-		}
-		if _, ok := seen[s]; ok {
-			continue
-		}
-		seen[s] = struct{}{}
-		out = append(out, s)
-	}
-	sort.Strings(out)
-	return out
-}
-
 // kafelSyscalls is the base seccomp whitelist shared by every architecture's
 // policy. It is deliberately generous: the first-generation agents run on
 // modern Go/Node runtimes and need the usual process/io/fs/network/time
 // syscalls. The exact whitelist is validated against real agents on Linux CI
 // and refined there.
 var kafelSyscalls = []string{
-	"read", "write", "close", "dup", "dup2", "dup3", "fcntl", "ioctl",
-	"readv", "writev", "pread64", "pwrite64", "preadv", "pwritev",
-	"open", "openat", "openat2", "creat", "close_range", "lseek",
-	"mmap", "mmap2", "munmap", "mprotect", "mremap", "msync", "brk", "madvise",
-	"stat", "lstat", "fstat", "newfstatat", "statx", "stat64", "lstat64", "fstat64",
-	"access", "faccessat", "faccessat2", "readlink", "readlinkat",
-	"unlink", "unlinkat", "mkdir", "mkdirat", "rmdir", "rename", "renameat", "renameat2",
-	"chmod", "fchmod", "fchmodat", "chown", "fchown", "lchown", "fchownat",
-	"chown32", "fchown32", "truncate", "ftruncate",
-	"link", "linkat", "symlink", "symlinkat", "getdents", "getdents64",
-	"utimensat", "futimesat", "futimes", "utime", "utimes",
-	"exit", "exit_group", "fork", "vfork", "clone", "clone3", "execve", "execveat",
-	"wait4", "waitid", "waitpid", "kill", "tkill", "tgkill",
-	"rt_sigaction", "rt_sigprocmask", "rt_sigpending", "rt_sigtimedwait",
-	"rt_sigqueueinfo", "rt_sigsuspend", "rt_sigreturn", "sigaltstack",
-	"getpid", "getppid", "gettid", "getsid", "setsid", "setpgid", "getpgid",
-	"getuid", "getgid", "geteuid", "getegid", "getuid32", "getgid32",
-	"geteuid32", "getegid32", "setuid", "setgid", "setreuid", "setregid",
-	"setresuid", "setresgid", "setuid32", "setgid32", "setreuid32", "setregid32",
-	"setresuid32", "setresgid32", "getgroups", "getgroups32", "setgroups",
-	"prctl", "getrlimit", "setrlimit", "prlimit64", "ugetrlimit", "umask",
-	"uname", "sched_yield", "sched_getaffinity", "sched_setaffinity",
-	"nanosleep", "clock_nanosleep", "clock_gettime", "clock_getres",
-	"gettimeofday", "time", "times", "getitimer", "setitimer",
-	"futex", "futex_waitv", "getrandom", "pipe", "pipe2", "socketpair",
-	"poll", "ppoll", "select", "pselect6",
-	"epoll_create", "epoll_create1", "epoll_ctl", "epoll_wait", "epoll_pwait",
-	"eventfd", "eventfd2", "inotify_init", "inotify_init1",
-	"inotify_add_watch", "inotify_rm_watch",
-	"fdatasync", "fsync", "sync", "syncfs", "sendfile", "copy_file_range",
-	"statfs", "fstatfs", "statfs64", "fstatfs64",
-	"arch_prctl", "set_tid_address", "set_robust_list", "rseq",
+	"read", "write", "close", "dup", "dup2", "dup3",
+	"fcntl", "ioctl", "readv", "writev", "pread64", "pwrite64",
+	"preadv", "pwritev", "open", "openat", "openat2", "creat",
+	"close_range", "lseek", "mmap", "munmap", "mprotect", "mremap",
+	"msync", "brk", "madvise", "newfstatat", "statx", "access",
+	"faccessat", "faccessat2", "readlink", "readlinkat", "unlink", "unlinkat",
+	"mkdir", "mkdirat", "rmdir", "rename", "renameat", "renameat2",
+	"chmod", "fchmod", "fchmodat", "chown", "fchown", "lchown",
+	"fchownat", "truncate", "ftruncate", "link", "linkat", "symlink",
+	"symlinkat", "getdents", "getdents64", "utimensat", "futimesat", "utime",
+	"utimes", "exit", "exit_group", "fork", "vfork", "clone",
+	"clone3", "execve", "execveat", "wait4", "waitid", "kill",
+	"tkill", "tgkill", "rt_sigaction", "rt_sigprocmask", "rt_sigpending", "rt_sigtimedwait",
+	"rt_sigqueueinfo", "rt_sigsuspend", "rt_sigreturn", "sigaltstack", "getpid", "getppid",
+	"gettid", "getsid", "setsid", "setpgid", "getpgid", "getuid",
+	"getgid", "geteuid", "getegid", "setuid", "setgid", "setreuid",
+	"setregid", "setresuid", "setresgid", "getgroups", "setgroups", "prctl",
+	"getrlimit", "setrlimit", "prlimit64", "umask", "sched_yield", "sched_getaffinity",
+	"sched_setaffinity", "nanosleep", "clock_nanosleep", "clock_gettime", "clock_getres", "gettimeofday",
+	"time", "times", "getitimer", "setitimer", "futex", "futex_waitv",
+	"getrandom", "pipe", "pipe2", "socketpair", "poll", "ppoll",
+	"select", "pselect6", "epoll_create", "epoll_create1", "epoll_ctl", "epoll_wait",
+	"epoll_pwait", "eventfd", "eventfd2", "inotify_init", "inotify_init1", "inotify_add_watch",
+	"inotify_rm_watch", "fdatasync", "fsync", "sync", "syncfs", "copy_file_range",
+	"statfs", "fstatfs", "arch_prctl", "set_tid_address", "set_robust_list", "rseq",
 	"getcpu", "getcwd", "chdir", "fchdir", "sysinfo", "alarm",
 	"socket", "bind", "listen", "accept", "accept4", "connect",
-	"getsockname", "getpeername", "getsockopt", "setsockopt",
-	"sendto", "recvfrom", "sendmsg", "recvmsg", "sendmmsg", "recvmmsg", "shutdown",
-	"mlock", "munlock", "mlockall", "munlockall", "mincore", "mlock2",
+	"getsockname", "getpeername", "getsockopt", "setsockopt", "sendto", "recvfrom",
+	"sendmsg", "recvmsg", "sendmmsg", "recvmmsg", "shutdown", "mlock",
+	"munlock", "mlockall", "munlockall", "mincore", "mlock2",
 }
 
 // kafelX86OnlySyscalls are allowed in the x86_64 policy but absent from
@@ -338,27 +329,7 @@ var kafelSyscalls = []string{
 // x86_64-only arch_prctl). The aarch64 policy drops them so the whitelist stays
 // valid for that ISA. The aarch64 allowlist is validated on arm64 CI (O-F06).
 var kafelX86OnlySyscalls = map[string]bool{
-	"mmap2":       true,
-	"stat64":      true,
-	"lstat64":     true,
-	"fstat64":     true,
-	"chown32":     true,
-	"fchown32":    true,
-	"getuid32":    true,
-	"getgid32":    true,
-	"geteuid32":   true,
-	"getegid32":   true,
-	"setuid32":    true,
-	"setgid32":    true,
-	"setreuid32":  true,
-	"setregid32":  true,
-	"setresuid32": true,
-	"setresgid32": true,
-	"getgroups32": true,
-	"ugetrlimit":  true,
-	"statfs64":    true,
-	"fstatfs64":   true,
-	"arch_prctl":  true,
+	"arch_prctl": true,
 }
 
 // kafelPolicyForArch returns the Kafel seccomp policy for a compiled binary's
@@ -381,14 +352,17 @@ func kafelPolicyForArch(goarch string) (string, error) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "POLICY %s {\n", kafelArch)
 	b.WriteString("    ALLOW {\n")
+	// Kafel rejects a trailing comma before the ALLOW block's closing brace
+	// ("syntax error, unexpected '}', expecting IDENTIFIER or SYSCALL"), so
+	// entries are joined with ",\n" and the last line carries no comma.
+	entries := make([]string, 0, len(kafelSyscalls))
 	for _, s := range kafelSyscalls {
 		if dropX86 && kafelX86OnlySyscalls[s] {
 			continue
 		}
-		b.WriteString("        ")
-		b.WriteString(s)
-		b.WriteString(",\n")
+		entries = append(entries, "        "+s)
 	}
-	b.WriteString("    }\n}")
+	b.WriteString(strings.Join(entries, ",\n"))
+	b.WriteString("\n    }\n}")
 	return b.String(), nil
 }

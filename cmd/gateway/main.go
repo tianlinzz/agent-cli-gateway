@@ -144,6 +144,8 @@ func main() {
 			WorkspaceDir: ws,
 			AgentHomeDir: home,
 			SocketDir:    sock,
+			SocketPath:   filepath.Join(sock, "w.sock"),
+			ParentPath:   os.Getenv("PATH"),
 		}, *printProfile)
 		if err != nil {
 			slog.Error("build nsjail profile", "error", err)
